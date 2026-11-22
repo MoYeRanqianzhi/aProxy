@@ -5,7 +5,8 @@
 <script lang="ts">
   import { overlays } from '../lib/overlays.svelte';
   import { ui, type Page } from '../lib/state.svelte';
-  import { store } from '../lib/legacy.svelte';
+  import { refKey, store } from '../lib/store.svelte';
+  import { aliasOf } from '../lib/view';
   import { t } from '../lib/i18n';
   import { pop, fadeOut } from '../lib/motion';
   import Icon, { type IconName } from './Icon.svelte';
@@ -43,11 +44,11 @@
     const q = query.trim().toLowerCase();
     const all: Item[] = [
       ...pages.map(([p, icon]) => ({ id: `p-${p}`, group: 'pages' as const, label: t(`nav.${p}`), icon, run: () => ui.go(p) })),
-      ...store.instances.map((i) => ({
+      ...store.cards.map((i) => ({
         id: `i-${i.port}`,
         group: 'instances' as const,
         label: `${i.port}`,
-        hint: i.alias ?? undefined,
+        hint: aliasOf(i) ?? undefined,
         icon: 'server' as const,
         run: () => ui.go('instance', i.port),
       })),
@@ -67,20 +68,21 @@
       },
     ];
     let found = q ? all.filter((it) => `${it.label} ${it.hint ?? ''}`.toLowerCase().includes(q)) : all;
-    // 输入数字时按请求编号找（aProxy 的请求编号就是实例内的序号）
+    // 输入数字时按请求编号找（aProxy 的请求编号就是实例内的序号）。只找得到最近的 50 条里的，
+    // 更早的要到日志页里往前翻
     const num = q.replace(/^#/, '');
     if (/^\d{2,}$/.test(num)) {
-      const hits = store.logs.filter((e) => String(e.seq).startsWith(num)).slice(-6).reverse();
+      const hits = store.recent.filter((r) => String(r.seq).startsWith(num)).slice(0, 6);
       found = [
         ...found,
-        ...hits.map((e) => ({
-          id: `r-${e.key}`,
+        ...hits.map((r) => ({
+          id: `r-${refKey(r.ref)}`,
           group: 'requests' as const,
-          label: `#${e.seq}  ${e.method} ${e.path.split('?')[0]}`,
-          hint: `${e.port}`,
+          label: `#${r.seq}  ${r.method} ${r.path.split('?')[0]}`,
+          hint: `${r.ref.run.port}`,
           icon: 'list' as const,
           run: () => {
-            ui.selectedLog = e.key;
+            ui.selectedRef = r.ref;
             ui.go('logs');
           },
         })),

@@ -1,92 +1,147 @@
 <!--
-  更新：当前版本（含变体：带界面 / 无界面）、最新版本、更新说明，以及安装进度的六个阶段：
-  下载 → 校验 → 通知实例 → 替换 → 逐个重启 → 完成。
-  版本信息与安装都经 Backend：检查更新是一次请求，安装进度由后端一拍拍推过来（update-progress 事件）。
-  原型的 mock 后端会把整个过程演示一遍（假的计时），用来审核阶段动画。
+  更新：当前版本（含变体：带界面 / 无界面）、可装的最新版本，以及安装进度的几个阶段：
+  下载并校验 → 通知实例 → 替换程序 → 逐个重启 → 确认 → 完成。
+
+  检查更新要联网，所以只在打开这一页、换渠道、或者用户点「再检查一次」时才查。
+  安装由 Rust 交给安装程序去做，进度经 update-progress 事件整份推过来（store.job）：离开本页再回来照样看得到。
+  安装时带回去的是检查时拿到的句柄（check），不是版本号：检查之后可装的版本变了，Rust 会拒绝，界面再查一次。
 -->
 <script lang="ts">
-  import { t, ago } from '../lib/i18n';
+  import { t, ago, bytes } from '../lib/i18n';
   import { ui } from '../lib/state.svelte';
-  import { store } from '../lib/legacy.svelte';
+  import { store } from '../lib/store.svelte';
+  import { overlays } from '../lib/overlays.svelte';
   import { pop } from '../lib/motion';
-  import type { Instance, UpdateInfo, UpdateStage } from '../lib/types';
+  import type { InstallPhase, UpdateInfo } from '../lib/backend/contract';
+  import { toFailure, type Failure } from '../lib/backend/link';
+  import { faultText } from '../lib/faults';
+  import { aliasOf } from '../lib/view';
   import Icon, { type IconName } from '../components/Icon.svelte';
   import MascotView from '../components/MascotView.svelte';
   import { mascots } from '../lib/mascot/registry.svelte';
   import JellyBar from '../components/JellyBar.svelte';
   import Segmented from '../components/Segmented.svelte';
 
-  const stages: { id: UpdateStage; icon: IconName }[] = [
+  /** 界面上的阶段：安装程序的阶段更细，几个合成一个给人看 */
+  type Stage = 'download' | 'notify' | 'swap' | 'restart' | 'verify' | 'done';
+  const stages: { id: Stage; icon: IconName }[] = [
     { id: 'download', icon: 'download' },
-    { id: 'verify', icon: 'shield' },
     { id: 'notify', icon: 'info' },
     { id: 'swap', icon: 'repeat' },
     { id: 'restart', icon: 'restart' },
+    { id: 'verify', icon: 'shield' },
     { id: 'done', icon: 'check' },
   ];
+  const STAGE_OF: Record<InstallPhase, Stage | null> = {
+    marking: 'download',
+    downloading: 'download',
+    downloaded: 'download',
+    broadcasting: 'notify',
+    acked: 'notify',
+    swapping: 'swap',
+    swapped: 'swap',
+    restarting: 'restart',
+    verifying: 'verify',
+    cleaning: 'verify',
+    done: 'done',
+    failed: null,
+    aborted: null,
+    unknown: null,
+  };
 
-  let channel = $state<UpdateInfo['channel']>('stable');
-  let info = $state<UpdateInfo | null>(null);
+  let channel = $state<'auto' | 'pre'>('auto');
+  let info = $state.raw<UpdateInfo | null>(null);
+  let checking = $state(false);
+  let checkFault = $state.raw<Failure | null>(null);
 
-  // 换通道就重新检查一次；还没回来时保留上一次的结果，不闪空白
+  async function check(ch: 'auto' | 'pre') {
+    checking = true;
+    try {
+      const i = await store.checkUpdate(ch);
+      // 换了渠道之后才回来的旧结果不要
+      if (ch === channel) {
+        info = i;
+        checkFault = null;
+      }
+    } catch (raw) {
+      if (ch === channel) checkFault = toFailure(raw);
+    } finally {
+      checking = false;
+    }
+  }
+
+  // 换渠道就重新检查一次；还没回来时保留上一次的结果，不闪空白
   $effect(() => {
-    const ch = channel;
-    let alive = true;
-    store.checkUpdate(ch).then((i) => {
-      if (alive) info = i;
-    });
-    return () => {
-      alive = false;
-    };
+    void check(channel);
   });
 
   // 安装进度在 store 里：离开本页再回来，正在进行的安装照样看得到
-  const progress = $derived(store.updateProgress);
-  const stage = $derived(progress?.stage ?? null);
-  const running = $derived(!!progress && progress.stage !== 'done');
+  const job = $derived(store.job);
+  const running = $derived(!!job && job.end === null && job.fault === null);
+  const stage = $derived<Stage | null>(job?.end ? 'done' : job?.phase ? STAGE_OF[job.phase] : running ? 'download' : null);
   const stageIdx = $derived(stage ? stages.findIndex((s) => s.id === stage) : -1);
-  const stageProgress = $derived(progress?.progress ?? 0);
-  const targets = $derived(
-    (progress?.targets ?? []).map((port) => store.instance(port) ?? ({ port, alias: null } as Pick<Instance, 'port' | 'alias'>)),
-  );
-  const restarted = $derived(progress?.restarted.length ?? 0);
-  const target = $derived(progress?.version ?? info?.latest ?? '');
+  const targets = $derived(job?.targets ?? []);
+  const restarted = $derived(job?.instances.filter((i) => i.outcome === 'restarted').length ?? 0);
+  const target = $derived(job?.end?.version ?? job?.requestedVersion ?? info?.latest ?? '');
+
+  /** 当前阶段走了多少：下载按字节（总量未知时不显示比例），逐个重启按实例；其余阶段没有可量的进度 */
+  const stageProgress = $derived.by(() => {
+    if (!job) return 0;
+    if (stage === 'download') return job.download?.total ? job.download.bytes / job.download.total : job.phase === 'downloaded' ? 1 : 0.5;
+    if (stage === 'restart') return targets.length ? job.instances.length / targets.length : 1;
+    return 1;
+  });
 
   async function install() {
-    if (!info) return;
-    await store.installUpdate(info.latest);
+    if (!info?.check) return;
+    try {
+      const end = await store.installUpdate(info.check);
+      if (end.outcome === 'up-to-date') overlays.toast(t('up.upToDate'));
+    } catch (raw) {
+      const f = toFailure(raw);
+      // 检查之后可装的版本变了：重新查一次，让用户看到新的再决定
+      if (f.code === 'desktop_changed') void check(channel);
+      overlays.toast(faultText(f), 'coral');
+    }
     // 装完再问一次：当前版本这时已经是新版本了
-    info = await store.checkUpdate(channel);
+    void check(channel);
   }
 
-  function detail(s: UpdateStage): string {
+  function detail(s: Stage): string {
+    if (!job) return '';
     switch (s) {
       case 'download':
-        return t('up.d.download', { a: `${(progress?.downloadedMb ?? 0).toFixed(1)} MB`, b: `${progress?.totalMb ?? 0} MB` });
-      case 'verify':
-        return t('up.d.verify');
+        return job.download ? (job.download.total ? t('up.d.download', { a: bytes(job.download.bytes), b: bytes(job.download.total) }) : bytes(job.download.bytes)) : '';
       case 'notify':
         return t('up.d.notify', { n: targets.length });
       case 'swap':
         return t('up.d.swap');
       case 'restart':
         return t('up.d.restart', { done: restarted, total: targets.length });
+      case 'verify':
+        return t('up.d.verify');
       default:
         return '';
     }
   }
 
-  const released = $derived(
-    info ? new Intl.DateTimeFormat(ui.lang, { month: 'long', day: 'numeric' }).format(new Date(info.publishedAt)) : '',
-  );
-  const NOTE_ICON: Record<UpdateInfo['notes'][number]['kind'], IconName> = { feature: 'sparkles', fix: 'check' };
+  function portState(port: number): 'done' | 'failed' | 'active' | 'waiting' {
+    const r = job?.instances.find((i) => i.port === port);
+    if (r) return r.outcome === 'restarted' ? 'done' : 'failed';
+    if (stage !== 'restart') return 'waiting';
+    // 还没有结果的里面，排在最前的那个正在交接
+    const pending = targets.filter((p) => !job?.instances.some((i) => i.port === p));
+    return pending[0] === port ? 'active' : 'waiting';
+  }
+
+  const released = $derived(info?.publishedAt ? new Intl.DateTimeFormat(ui.lang, { month: 'long', day: 'numeric' }).format(new Date(info.publishedAt)) : '');
 </script>
 
 <header class="head">
   <h1>{t('nav.update')}</h1>
   <Segmented
     options={[
-      { value: 'stable', label: t('up.channel.stable') },
+      { value: 'auto', label: t('up.channel.auto') },
       { value: 'pre', label: t('up.channel.pre') },
     ]}
     bind:value={channel}
@@ -95,6 +150,12 @@
   />
 </header>
 
+{#if checkFault && !info}
+  <div class="banner coral"><Icon name="alert" size={16} /><p>{faultText(checkFault)}</p><button class="btn sm" onclick={() => check(channel)}>{t('up.check')}</button></div>
+{:else if !info}
+  <p class="muted">{t('up.checking')}</p>
+{/if}
+
 {#if info}
   <section class="versions">
     <div class="ver current">
@@ -102,26 +163,32 @@
       <span class="v-num">{info.current}</span>
       <span class="chip lilac"><Icon name="monitor" size={12} stroke={2.4} />{t(`up.variant.${info.variant}`)}</span>
     </div>
-    <div class="arrow" aria-hidden="true"><Icon name="arrowRight" size={22} stroke={2.4} /></div>
-    <div class="ver latest" class:done={stage === 'done'}>
-      <span class="v-label">{t('up.latest')}</span>
-      <span class="v-num">{info.latest}</span>
-      <span class="chip butter"><Icon name="sparkles" size={12} stroke={2.4} />{t('up.released', { date: released })}</span>
-    </div>
+    {#if info.updateAvailable && info.latest}
+      <div class="arrow" aria-hidden="true"><Icon name="arrowRight" size={22} stroke={2.4} /></div>
+      <div class="ver latest" class:done={stage === 'done'}>
+        <span class="v-label">{t(info.channel === 'pre' ? 'up.latestPre' : 'up.latest')}</span>
+        <span class="v-num">{info.latest}</span>
+        {#if released}<span class="chip butter"><Icon name="sparkles" size={12} stroke={2.4} />{t('up.released', { date: released })}</span>{/if}
+      </div>
+    {:else}
+      <div class="ver uptodate">
+        <span class="chip mint"><Icon name="check" size={12} stroke={2.6} />{t('up.upToDate')}</span>
+      </div>
+    {/if}
     <div class="cta">
-      {#if stage === 'done'}
-        <button class="btn" onclick={install}><Icon name="restart" size={15} />{t('up.again')}</button>
-      {:else}
+      {#if info.updateAvailable && info.check && stage !== 'done'}
         <button class="btn primary big" disabled={running} onclick={install}>
-          <Icon name="download" size={16} />{running ? t('up.installing', { v: target }) : t('up.install', { v: info.latest })}
+          <Icon name="download" size={16} />{running ? t('up.installing', { v: target }) : t('up.install', { v: info.latest ?? '' })}
         </button>
+      {:else}
+        <button class="btn" disabled={checking || running} onclick={() => check(channel)}><Icon name="restart" size={15} />{t('up.again')}</button>
       {/if}
-      <span class="checked">{t('up.checked', { ago: ago(store.now - info.checkedAt) })}</span>
+      <span class="checked">{checkFault ? faultText(checkFault) : t('up.checked', { ago: ago(store.now - info.checkedAt) })}</span>
     </div>
   </section>
 {/if}
 
-{#if stage}
+{#if job && (stage || job.fault)}
   <section class="progress" in:pop={{ y: 14 }} aria-label={t('up.progress')}>
     <ol class="stepper">
       {#each stages as s, i (s.id)}
@@ -141,16 +208,24 @@
       {/each}
     </ol>
 
-    {#if stage === 'done'}
+    {#if job.fault}
+      <div class="done-box failed" in:pop={{ y: 10, scale: 0.9 }}>
+        {#if mascots.current}<MascotView mood="worried" size="hero" px={96} />{/if}
+        <div>
+          <h2>{t('up.failedTitle', { v: job.requestedVersion })}</h2>
+          <p>{faultText(job.fault)}</p>
+        </div>
+      </div>
+    {:else if stage === 'done'}
       <div class="done-box" in:pop={{ y: 10, scale: 0.9 }}>
         <!-- 装完了：借用「救回」的庆祝（跳一下、撒星星），只播一次 -->
         {#if mascots.current}<MascotView mood="rescued" size="hero" px={96} />{/if}
         <div>
-          <h2>{t('up.doneTitle', { v: target })}</h2>
+          <h2>{job.end?.outcome === 'up-to-date' ? t('up.upToDate') : t('up.doneTitle', { v: target })}</h2>
           <p>{t('up.doneBody')}</p>
         </div>
       </div>
-    {:else}
+    {:else if stage}
       <div class="stage-box">
         <div class="stage-line">
           {#if mascots.current}<MascotView mood="working" size="small" px={40} />{/if}
@@ -158,44 +233,34 @@
           <span class="muted num">{detail(stage)}</span>
         </div>
         <JellyBar value={stageProgress} tone={stage === 'restart' ? 'mint' : 'lilac'} label={t(`up.stage.${stage}`)} />
-        {#if stage === 'restart' || stage === 'notify'}
-          <ul class="targets">
-            {#each targets as inst, i (inst.port)}
-              {@const state = stage === 'notify' ? 'waiting' : i < restarted ? 'done' : i === restarted ? 'active' : 'waiting'}
-              <li class="st-{state}">
-                <span class="t-icon">
-                  {#if state === 'done'}<Icon name="check" size={13} stroke={3} />{:else if state === 'active'}<span class="spin"></span>{:else}<Icon name="clock" size={13} stroke={2.4} />{/if}
-                </span>
-                <span class="mono">{inst.port}</span>
-                <span class="muted">{inst.alias ?? ''}</span>
-                <span class="t-state">
-                  {state === 'done' ? `v${target}` : state === 'active' ? t('up.restartingOne') : t('up.waiting')}
-                </span>
-              </li>
-            {/each}
-          </ul>
-        {/if}
       </div>
+    {/if}
+
+    {#if targets.length && (stage === 'restart' || stage === 'notify' || stage === 'verify' || job.fault)}
+      <ul class="targets">
+        {#each targets as port (port)}
+          {@const state = portState(port)}
+          {@const card = store.card(port)}
+          <li class="st-{state}">
+            <span class="t-icon">
+              {#if state === 'done'}<Icon name="check" size={13} stroke={3} />{:else if state === 'failed'}<Icon name="x" size={13} stroke={3} />{:else if state === 'active'}<span class="spin"></span>{:else}<Icon name="clock" size={13} stroke={2.4} />{/if}
+            </span>
+            <span class="mono">{port}</span>
+            <span class="muted">{card ? (aliasOf(card) ?? '') : ''}</span>
+            <span class="t-state">
+              {state === 'done' ? `v${target}` : state === 'failed' ? t('up.restartFailed') : state === 'active' ? t('up.restartingOne') : t('up.waiting')}
+            </span>
+          </li>
+        {/each}
+      </ul>
     {/if}
   </section>
 {/if}
 
-{#if info}
-  <div class="lower">
-    <section class="panel notes">
-      <h2 class="section-title">{t('up.notes')}<span class="count">{info.latest}</span></h2>
-      <ul>
-        {#each info.notes as note, i (i)}
-          <li><Icon name={NOTE_ICON[note.kind]} size={15} />{note.text[ui.lang] ?? note.text.en}</li>
-        {/each}
-      </ul>
-    </section>
-    <aside class="restart-note">
-      <Icon name="info" size={16} />
-      <p>{t('up.restartNote')}</p>
-    </aside>
-  </div>
-{/if}
+<aside class="restart-note">
+  <Icon name="info" size={16} />
+  <p>{t('up.restartNote')}</p>
+</aside>
 
 <style>
   .head {
@@ -441,34 +506,39 @@
     color: var(--text-2);
   }
 
-  .lower {
-    display: grid;
-    grid-template-columns: 1.4fr 1fr;
-    gap: 16px;
-    margin-top: 22px;
-    align-items: start;
+  /* 实例列表放在阶段框外面：失败与完成之后也要能看到每个实例的结果 */
+  .progress > .targets {
+    margin-top: 14px;
   }
-  .notes {
-    padding: 16px 18px 12px;
+  /* 没有可装的版本时，这一格占掉箭头与最新版本的两格，按钮仍在最右 */
+  .uptodate {
+    grid-column: span 2;
+    align-self: center;
   }
-  .notes ul {
-    list-style: none;
-    margin: 10px 0 0;
-    padding: 0;
+  .done-box.failed h2 {
+    color: var(--coral-deep);
   }
-  .notes li {
+  .targets li.st-failed {
+    color: var(--coral-deep);
+  }
+  .banner {
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 8px 0;
-    border-top: var(--line-w-thin) dashed var(--line-soft);
+    margin-bottom: 16px;
+    padding: 10px 14px;
+    border-radius: var(--r-md);
+    background: var(--coral-soft);
+    color: var(--coral-deep);
   }
-  .notes li :global(svg) {
-    color: var(--lilac-deep);
-    flex: none;
+  .banner p {
+    flex: 1;
+    margin: 0;
   }
   .restart-note {
     display: flex;
+    margin-top: 22px;
+    max-width: 640px;
     gap: 10px;
     padding: 14px 16px;
     border-radius: var(--r-md);

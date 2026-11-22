@@ -38,8 +38,6 @@ class UiState {
   page = $state<Page>('overview');
   /** 实例详情页与配置页当前看的实例 */
   instancePort = $state(12346);
-  /** 日志页打开详情的那一条（key = 端口:序号）；命令面板与总览也会设置它 */
-  selectedLog = $state<string | null>(null);
   /** 日志页打开详情的那一条；总览、实例页、命令面板也会设置它。raw：整个换掉，不深层代理 */
   selectedRef = $state.raw<Ref | null>(null);
   /** 从别处跳到日志页时预设的实例筛选 */

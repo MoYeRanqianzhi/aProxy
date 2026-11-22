@@ -4,71 +4,48 @@
 //! 中断、中断点不留烂摊子。计划全文见 `.agents/plan/install-v1.md`。
 
 mod events;
+#[path = "../i18n/install.rs"]
+mod text;
+use aproxy::install::reason::Cause;
+use aproxy_ipc::i18n::{Lang, current};
 
 use aproxy::cli::InstallArgs;
 use aproxy::install::InstallFailure;
 
-/// 跨版本的 last_error 用英文；给当前用户的处置建议按码选择，不重查可能已变化的实例。
-fn refusal(error: &InstallFailure) -> Option<String> {
-    match error.code.as_str() {
-        "install_unmanaged_instances" => {
-            let (_, rest) = error.message.split_once("(pid ")?;
-            let (pids, _) = rest.split_once(')')?;
-            Some(format!(
-                "这个 home 里有旧版本启动、本次安装管不了的实例还在运行（pid {pids}）。先用启动它们的那个版本执行 aproxy stop all，再重新安装；或者改用 aproxy install --force（会结束全部 aproxy 进程）。"
-            ))
-        }
-        "install_foreground_instances" => {
-            let ports = error.details["ports"].as_array()?;
-            if let [p] = ports.as_slice() {
-                Some(format!(
-                    "端口 {p} 上的实例在前台运行，安装无法替它重启。什么都没有改动：实例照常运行，二进制没换。先停掉它（在启动它的终端里按 Ctrl+C，或执行 aproxy stop {p}；交给服务管理器运行的，用服务管理器停止），再执行 aproxy install，装好之后照原来的方式启动它。"
-                ))
-            } else {
-                let ports = ports
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<_>>()
-                    .join("、");
-                Some(format!(
-                    "端口 {ports} 上的实例在前台运行，安装无法替它们重启。什么都没有改动：实例照常运行，二进制没换。先停掉它们（在各自的终端里按 Ctrl+C，或逐个执行 aproxy stop <端口>；交给服务管理器运行的，用服务管理器停止），再执行 aproxy install，装好之后照原来的方式启动它们。"
-                ))
-            }
-        }
-        "install_precheck_failed" => {
-            let port = error.details["port"].as_u64()?;
-            Some(format!(
-                "安装前的预检没有通过：端口 {port} 的实例按新版本解析配置时出错。什么都没有改动：实例照常运行，二进制没换。"
-            ))
-        }
-        _ => None,
-    }
-}
-
 /// 安装者把原因写给用户，按安装码退出；提前失败时也不伪造安装状态。
 fn fail(error: InstallFailure) -> ! {
-    let localized = refusal(&error);
-    let message = localized.as_deref().unwrap_or(&error.message);
+    let lang = current();
+    let message = error.render(lang);
     eprintln!("[ERROR] {message}");
     if error.code == "install_precheck_failed" {
         if let Some(ds) = error.details["diagnostics"].as_array() {
-            for d in ds {
+            for (i, d) in ds.iter().enumerate() {
+                let rendered = match error.cause.as_deref() {
+                    Some(Cause::Precheck { issues, .. }) => issues.get(i).map(|r| r.render(lang)),
+                    _ => None,
+                };
                 let line = aproxy::ops::start::render_diagnostic_fields(
                     d["file"].as_str().unwrap_or_default(),
                     d["line"].as_u64().and_then(|n| n.try_into().ok()),
                     d["column"].as_u64().and_then(|n| n.try_into().ok()),
                     d["key"].as_str(),
-                    d["message"].as_str().unwrap_or_default(),
+                    rendered
+                        .as_deref()
+                        .or_else(|| d["message"].as_str())
+                        .unwrap_or_default(),
                     d["code"].as_str().unwrap_or_default(),
                 );
                 eprintln!("  {line}");
             }
         }
-        eprintln!("修正上面的问题后重新执行 aproxy install。");
+        eprintln!("{}", text::correct(lang));
     }
     events::result(
         "failed",
-        Some((&error, message.lines().next().unwrap_or(message))),
+        Some((
+            &error,
+            error.message.lines().next().unwrap_or(&error.message),
+        )),
     );
     crate::util::exit(error.exit_code())
 }
@@ -166,7 +143,8 @@ async fn install(args: InstallArgs) {
                 let _ = ExitEvidence::record(
                     &panic_home,
                     &s,
-                    &format!("installer panic at {location}"),
+                    "install_failed",
+                    &Cause::Panic(location),
                 );
             }
             prior(info);
@@ -189,7 +167,12 @@ async fn install(args: InstallArgs) {
                 crate::util::exit(0);
             }
             Err(e) => {
-                if refusal(&e).is_some() {
+                if matches!(
+                    e.code.as_str(),
+                    "install_unmanaged_instances"
+                        | "install_foreground_instances"
+                        | "install_precheck_failed"
+                ) {
                     fail(e);
                 }
                 tracing::error!(error = %e, "install 续作失败（现场已保留，等待下次续作）");
@@ -726,11 +709,16 @@ async fn report_outcome(
         other => other.map(|_| ()),
     };
     if let Err(e) = result {
-        if refusal(&e).is_some() {
+        if matches!(
+            e.code.as_str(),
+            "install_unmanaged_instances"
+                | "install_foreground_instances"
+                | "install_precheck_failed"
+        ) {
             fail(e);
         }
-        let message = format!("安装失败: {e}");
-        eprintln!("[ERROR] {message}");
+        let message = text::failed(Lang::En, &e.message);
+        eprintln!("[ERROR] {}", text::failed(current(), &e.render(current())));
         print_failure_guidance(home);
         events::result(
             "failed",
@@ -767,7 +755,8 @@ struct OwnerExit {
 }
 
 impl OwnerExit {
-    fn observe(&mut self, pid: u32) -> Option<String> {
+    /// 外层 None 表示未观察到退出；已确认退出时，系统不一定能给出退出码。
+    fn observe(&mut self, pid: u32) -> Option<Option<u32>> {
         #[cfg(windows)]
         {
             use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -794,21 +783,18 @@ impl OwnerExit {
                     return None;
                 }
                 let mut code = 0;
-                return Some(if unsafe { GetExitCodeProcess(handle, &mut code) } != 0 {
-                    format!("exit status {code} (0x{code:08x})")
-                } else {
-                    "exit status unavailable".into()
-                });
+                return Some(
+                    (unsafe { GetExitCodeProcess(handle, &mut code) } != 0).then_some(code),
+                );
             }
         }
-        (aproxy::process::process_exited(pid) == Some(true))
-            .then(|| "exit status unavailable".to_owned())
+        (aproxy::process::process_exited(pid) == Some(true)).then_some(None)
     }
 }
 
 async fn wait_for_outcome(
     home: &std::path::Path,
-    mut exited: impl FnMut(u32) -> Option<String>,
+    mut exited: impl FnMut(u32) -> Option<Option<u32>>,
 ) -> Result<(), InstallFailure> {
     use aproxy::install::state::{ExitEvidence, InstallPhase, load_in, state_path_in};
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(HANDOVER_WAIT_SECS);
@@ -833,14 +819,19 @@ async fn wait_for_outcome(
                     }) && exited(s.installer_pid).is_none() => {}
                 InstallPhase::Done => return Ok(()),
                 InstallPhase::Failed => {
-                    return Err(InstallFailure::recorded(
-                        &s,
-                        s.last_error
-                            .clone()
-                            .unwrap_or_else(|| "接手进程报告失败（原因未记录）".to_string()),
-                    ));
+                    return Err(match &s.last_error {
+                        Some(reason) => InstallFailure::recorded(&s, reason.clone()),
+                        None => {
+                            let mut e =
+                                InstallFailure::recorded(&s, Cause::Missing.render(Lang::En));
+                            e.cause = Some(Box::new(Cause::Missing));
+                            e
+                        }
+                    });
                 }
-                InstallPhase::Aborted => return Err("安装已被中止（--abort）".to_string().into()),
+                InstallPhase::Aborted => {
+                    return Err(InstallFailure::because("install_failed", Cause::Aborted));
+                }
                 _ if s.installer_pid != std::process::id()
                     && let Some(status) = exited(s.installer_pid) =>
                 {
@@ -856,21 +847,29 @@ async fn wait_for_outcome(
                         continue;
                     }
                     let reason = ExitEvidence::read(home, &s)
-                        .map(|e| e.reason)
+                        .map(ExitEvidence::cause)
                         .unwrap_or_else(|| {
-                            let reason = format!("no terminal state; {status}");
-                            let _ = ExitEvidence::record(home, &s, &reason);
+                            let reason = Cause::NoTerminal(status);
+                            let _ = ExitEvidence::record(home, &s, "install_failed", &reason);
                             reason
                         });
-                    return Err(format!("接手进程（pid {}）已退出但安装停在 {:?}：{reason}；重新执行 aproxy install 即可接着装完", s.installer_pid, s.phase).into());
+                    return Err(InstallFailure::because(
+                        "install_failed",
+                        Cause::Owner {
+                            pid: s.installer_pid,
+                            phase: s.phase,
+                            reason: Box::new(reason),
+                        },
+                    ));
                 }
                 _ => {}
             },
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "{HANDOVER_WAIT_SECS} 秒内未确认安装完成（可能仍在后台进行）；可用 aproxy status 查看实例版本"
-            ).into());
+            return Err(InstallFailure::because(
+                "install_failed",
+                Cause::Timeout(HANDOVER_WAIT_SECS),
+            ));
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
@@ -969,10 +968,7 @@ mod tests {
         assert_eq!(owner.observe(pid), None);
         c.stdin.take().unwrap().write_all(b"done\r\n").unwrap();
         assert_eq!(c.wait().unwrap().code(), Some(259));
-        assert_eq!(
-            owner.observe(pid).as_deref(),
-            Some("exit status 259 (0x00000103)")
-        );
+        assert_eq!(owner.observe(pid), Some(Some(259)));
         assert_eq!(aproxy::process::process_exited(pid), Some(true));
     }
 
@@ -998,7 +994,7 @@ mod tests {
                         &InstallFailure::new("install_version_not_found", "terminal reason"),
                     );
                 }
-                Some("exited".into())
+                Some(None)
             })
             .await;
             if success {

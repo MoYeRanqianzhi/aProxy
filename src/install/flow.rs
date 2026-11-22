@@ -46,6 +46,7 @@ pub struct InstallPlan {
 /// 从只读台账与实例普查先找管不了的进程，再找不能重启的前台实例；成功时交回计划端口。
 /// 按进程身份辨认台账项，不把退出后被复用的 pid 当作还在跑的旧实例。
 pub async fn check_restartable(home: &Path) -> Result<Vec<u16>, InstallFailure> {
+    use super::reason::Cause;
     use aproxy_ipc::ledger;
     let run_dir = home.join("run");
     // IPC 仍能应答也不能代替磁盘记录：滚动快照只收录本版本能读出的实例文件。
@@ -62,16 +63,9 @@ pub async fn check_restartable(home: &Path) -> Result<Vec<u16>, InstallFailure> 
         .collect();
     pids.sort_unstable();
     if !pids.is_empty() {
-        let pids = pids
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(InstallFailure::new(
+        return Err(InstallFailure::because(
             "install_unmanaged_instances",
-            format!(
-                "live instances started by an older version are in this home (pid {pids}); stop them with the aproxy that started them (aproxy stop all), or run aproxy install --force"
-            ),
+            Cause::Unmanaged(pids),
         ));
     }
     let survey = crate::daemon::survey_instances_in(&run_dir).await;
@@ -97,18 +91,11 @@ pub async fn check_restartable(home: &Path) -> Result<Vec<u16>, InstallFailure> 
     ports.sort_unstable();
     foreground.sort_unstable();
     if !foreground.is_empty() {
-        let ports = foreground
-            .iter()
-            .map(u16::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut error = InstallFailure::new(
+        let mut error = InstallFailure::because(
             "install_foreground_instances",
-            format!(
-                "live foreground instances are in this home (port {ports}); install cannot restart a foreground instance: stop them, run aproxy install again, then start them the way they were started"
-            ),
+            Cause::Foreground(foreground.clone()),
         );
-        error.details = serde_json::json!({"ports": foreground});
+        *error.details = serde_json::json!({"ports": foreground});
         return Err(error);
     }
     Ok(ports)
@@ -219,14 +206,15 @@ fn precheck_snapshot(run_dir: &Path, snapshot: &[String]) -> Result<(), InstallF
                 }
             }
         };
-        let mut error = InstallFailure::new(
+        let port: u16 = port.parse::<u16>().map_err(|e| e.to_string())?;
+        let mut error = InstallFailure::because(
             "install_precheck_failed",
-            format!(
-                "precheck failed for the instance on port {port}: {}",
-                diagnostics[0].message
-            ),
+            super::reason::Cause::Precheck {
+                port,
+                issues: diagnostics.iter().map(|d| d.message.clone()).collect(),
+            },
         );
-        error.details = serde_json::json!({"port":port.parse::<u16>().map_err(|e| e.to_string())?,"diagnostics":diagnostics});
+        *error.details = serde_json::json!({"port":port,"diagnostics":diagnostics});
         return Err(error);
     }
     Ok(())
@@ -895,13 +883,22 @@ pub async fn continue_install(
             super::state::remove_in(home);
             return Ok(FlowExit::Completed);
         }
-        return Err(InstallFailure::recorded(
+        let mut error = InstallFailure::recorded(
             &state,
-            format!(
-                "上次安装因实例级失败已中止，不自动重试（{}）。排除原因后重新执行 aproxy install",
-                state.last_error.as_deref().unwrap_or("原因未记录")
-            ),
-        ));
+            state.last_error.clone().unwrap_or_else(|| {
+                super::reason::Cause::NoReason.render(aproxy_ipc::i18n::Lang::En)
+            }),
+        );
+        let original = error.cause.take().unwrap_or_else(|| {
+            Box::new(match &state.last_error {
+                Some(s) => super::reason::Cause::Evidence(s.clone()),
+                None => super::reason::Cause::NoReason,
+            })
+        });
+        let cause = super::reason::Cause::Halted(original);
+        error.message = cause.render(aproxy_ipc::i18n::Lang::En);
+        error.cause = Some(Box::new(cause));
+        return Err(error);
     }
     // 接管判定：常规 stale（超时+原进程死）或宣告心跳过期（runtime 挂死
     // 的即时证据）。原安装进程健康 → 不动（并发防重；误触发的 --continue 与

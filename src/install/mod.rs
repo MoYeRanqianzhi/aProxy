@@ -4,6 +4,11 @@
 //! rename、ACK 齐了才交换、逐个重启最后删除）。本模块当前承载状态文件
 //! 与状态机；下载链条、交换原语、IPC 广播等随计划分步落位。
 
+/// 普通安装的跨进程诊断；强制安装按自己的契约报告。
+#[path = "../i18n/install_reason.rs"]
+pub mod reason;
+use aproxy_ipc::i18n::Lang;
+use reason::Cause;
 pub mod announce;
 pub mod broadcast;
 pub mod download;
@@ -25,7 +30,9 @@ pub struct InstallFailure {
     /// 人能读懂的原因；也是较早的安装者唯一认得的 last_error。
     pub message: String,
     /// 与这个码同一项的详情；没有字段时仍是空对象。
-    pub details: serde_json::Value,
+    pub details: Box<serde_json::Value>,
+    /// 用于本进程或交接状态的原因；不作为公开 error 的字段。
+    pub cause: Option<Box<Cause>>,
 }
 
 impl InstallFailure {
@@ -34,28 +41,61 @@ impl InstallFailure {
         Self {
             code: code.into(),
             message: message.into(),
-            details: serde_json::json!({}),
+            details: Box::new(serde_json::json!({})),
+            cause: None,
         }
     }
 
+    /// 同一原因同时生成持久的英文和可以发给接手者的排版参数。
+    pub fn because(code: &str, cause: Cause) -> Self {
+        let message = cause.render(Lang::En);
+        Self {
+            cause: Some(Box::new(cause)),
+            ..Self::new(code, message)
+        }
+    }
+    /// 旧二进制的说明和不识别的私有排版参数一律回退到该记录的原文。
+    pub fn render(&self, lang: Lang) -> String {
+        self.cause
+            .as_ref()
+            .map(|r| r.render(lang))
+            .unwrap_or_else(|| self.message.clone())
+    }
+    /// 附加操作阶段时仍能使用底层原因的结构化参数。
+    pub fn into_cause(self) -> Cause {
+        self.cause
+            .map(|c| *c)
+            .unwrap_or(Cause::Evidence(self.message))
+    }
     /// 上层补充操作上下文时保留底层的码与详情。
     pub fn with_message(self, message: String) -> Self {
-        Self { message, ..self }
+        Self {
+            message,
+            cause: None,
+            ..self
+        }
     }
 
     /// 交棒后使用接手版本留下的失败记录；旧版本没写码时仍然按普通失败退出。
     pub fn recorded(state: &state::InstallState, message: String) -> Self {
         Self {
+            cause: state
+                .error_render
+                .clone()
+                .and_then(|v| serde_json::from_value::<Box<Cause>>(v).ok())
+                .filter(|c| c.render(Lang::En) == message),
             code: state
                 .error_code
                 .clone()
                 .unwrap_or_else(|| "install_failed".into()),
             message,
-            details: state
-                .error_details
-                .clone()
-                .filter(|v| v.is_object())
-                .unwrap_or_else(|| serde_json::json!({})),
+            details: Box::new(
+                state
+                    .error_details
+                    .clone()
+                    .filter(|v| v.is_object())
+                    .unwrap_or_else(|| serde_json::json!({})),
+            ),
         }
     }
 

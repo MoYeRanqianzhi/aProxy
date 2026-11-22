@@ -204,6 +204,25 @@ async fn install_refuses_foreground_instances_before_touching_anything() {
     assert_eq!(result["error"]["code"], "install_foreground_instances");
     assert_eq!(lines.len(), 1);
     assert_eq!(result["error"]["details"], serde_json::json!({"ports":[p]}));
+    let zh = h
+        .cmd()
+        .env("APROXY_LANG", "zh-CN")
+        .args([
+            "install",
+            "--from",
+            from.to_str().unwrap(),
+            "--no-skills",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(zh.status.code(), Some(1));
+    assert_eq!(events(&zh), lines);
+    assert!(
+        String::from_utf8(zh.stderr)
+            .unwrap()
+            .contains("上的实例在前台运行")
+    );
     let out = run(
         &h,
         &["install", "--from", from.to_str().unwrap(), "--no-skills"],
@@ -212,7 +231,7 @@ async fn install_refuses_foreground_instances_before_touching_anything() {
     assert!(
         String::from_utf8(out.stderr)
             .unwrap()
-            .contains("上的实例在前台运行")
+            .contains("running in the foreground")
     );
     assert!(!state::state_path_in(h.path()).exists());
     assert_eq!(fs::read(bin).unwrap(), b"original image");
@@ -272,7 +291,7 @@ async fn continuation_fails_before_broadcast_with_foreground_instances() {
         &h,
         &bin,
         "install_foreground_instances",
-        "live foreground instances",
+        "The instance on port",
     );
     assert_eq!(st.error_details, Some(serde_json::json!({"ports":[p]})));
     assert_eq!(pid(&h, p).await, child.0.id());
@@ -316,7 +335,7 @@ async fn install_precheck_failure_changes_nothing() {
     );
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(
-        err.contains("安装前的预检没有通过")
+        err.contains("Precheck failed for the instance on port")
             && err.contains("config_unknown_key")
             && !err.contains("滚动已中止"),
         "{err}"
@@ -332,11 +351,14 @@ async fn install_precheck_failure_changes_nothing() {
     assert_eq!(d["severity"], "error");
     assert_eq!(d["key"], "nope");
     assert_eq!(
-        st.last_error.unwrap(),
-        format!(
-            "precheck failed for the instance on port {p}: {}",
-            d["message"].as_str().unwrap()
-        )
+        st.last_error.as_deref(),
+        result["error"]["message"].as_str()
+    );
+    assert!(d["message"].as_str().unwrap().contains("nope"));
+    assert_eq!(st.error_render.as_ref().unwrap()["id"], "precheck");
+    assert!(
+        result["error"].get("render").is_none()
+            && result["error"]["details"].get("error_render").is_none()
     );
     assert_eq!(pid(&h, p).await, child.0.id());
     assert_eq!(fs::metadata(bin).unwrap().modified().unwrap(), before);
@@ -372,7 +394,7 @@ fn continuation_prechecks_an_unreadable_record_on_a_down_port() {
         &h,
         &bin,
         "install_precheck_failed",
-        "precheck failed for the instance on port",
+        "Precheck failed for the instance on port",
     );
     let d = st.error_details.unwrap();
     assert_eq!(d["port"], p);
@@ -540,4 +562,61 @@ fn install_json_probe_failure_has_no_plan() {
     assert_eq!(lines[0]["outcome"], "failed");
     assert_eq!(lines[0]["error"]["code"], "install_probe_failed");
     assert!(lines[0]["version"].is_null());
+}
+
+/// 不认识排版参数不影响失败码或完整英文证据；退出凭据仍严格匹配事务和大小界限。
+#[test]
+fn private_install_causes_survive_handover_and_unknown_ids_fall_back() {
+    use aproxy::install::{InstallFailure, reason::Cause, state::ExitEvidence};
+    use aproxy_ipc::i18n::Lang;
+    let h = TestHome::new();
+    let mut st = InstallState::new_marking("test", InstallSource::From);
+    let failure =
+        InstallFailure::because("install_unmanaged_instances", Cause::Unmanaged(vec![77]));
+    state::fail_in(h.path(), &mut st, &failure);
+    let mut saved = state::load_in(h.path()).unwrap();
+    assert_eq!(
+        saved.error_details.as_ref().unwrap(),
+        &serde_json::json!({})
+    );
+    let en = saved.last_error.clone().unwrap();
+    let restore = |s: &InstallState| InstallFailure::recorded(s, en.clone());
+    assert!(restore(&saved).render(Lang::Zh).contains("旧版本启动"));
+    for unknown in [None, Some(serde_json::json!({"id":"future_reason"}))] {
+        saved.error_render = unknown;
+        assert_eq!(restore(&saved).render(Lang::Zh), en);
+        assert_eq!(restore(&saved).code, failure.code);
+    }
+    ExitEvidence::record(
+        h.path(),
+        &st,
+        "install_failed",
+        &Cause::NoTerminal(Some(259)),
+    )
+    .unwrap();
+    let evidence = ExitEvidence::read(h.path(), &st).unwrap();
+    assert!(evidence.reason.contains("exit status 259 (0x00000103)"));
+    assert!(evidence.cause().render(Lang::Zh).contains("退出状态 259"));
+    let path = h.path().join("install/last-exit.json");
+    let mut old: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    old.as_object_mut().unwrap().remove("render");
+    old.as_object_mut().unwrap().remove("code");
+    fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+    assert_eq!(
+        ExitEvidence::read(h.path(), &st)
+            .unwrap()
+            .cause()
+            .render(Lang::Zh),
+        old["reason"]
+    );
+    ExitEvidence::record(
+        h.path(),
+        &st,
+        "install_failed",
+        &Cause::Panic("x".repeat(10000)),
+    )
+    .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(doc["reason"].as_str().unwrap().chars().count(), 4096);
+    assert!(doc.get("render").is_none());
 }

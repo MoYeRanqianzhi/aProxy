@@ -247,6 +247,9 @@ pub struct InstallState {
     /// 的安装者靠它把接手者的失败原因转告用户。
     #[serde(default)]
     pub last_error: Option<String>,
+    /// 私有的排版参数与公开详情分开保存；未来版本的 id 无需可反序列化也能读主状态。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_render: Option<serde_json::Value>,
     /// 进入 failed 前的阶段，便于区分备料、交换与实例滚动的故障。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_at: Option<InstallPhase>,
@@ -290,6 +293,7 @@ impl InstallState {
             pending_restores: Vec::new(),
             halted: false,
             last_error: None,
+            error_render: None,
             failed_at: None,
             installer_version: Some(env!("CARGO_PKG_VERSION").into()),
             error_code: None,
@@ -423,6 +427,10 @@ pub fn advance_in(home: &Path, state: &mut InstallState, to: InstallPhase) -> Re
             state.phase
         ));
     }
+    // 结局文件由 done 状态改名而来，不应携带上次失败的私有排版上下文。
+    if to == InstallPhase::Done {
+        state.error_render = None;
+    }
     let previous = std::mem::replace(&mut state.phase, to);
     write_in(home, state).map_err(|e| {
         // 写不成就没有推进；随后记 failed_at 要用上一个成功落盘的相位。
@@ -442,6 +450,12 @@ pub struct ExitEvidence {
     pub phase: InstallPhase,
     /// 只留有界的失败原因，不复制可能含密钥的恢复规格。
     pub reason: String,
+    /// 退出凭据只作诊断，不把内层故障码改作等待者的退出码。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// 不识别私有原因的读者仍可使用 reason。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    render: Option<serde_json::Value>,
 }
 
 impl ExitEvidence {
@@ -458,17 +472,42 @@ impl ExitEvidence {
         (item.pid == state.installer_pid && item.started_at == state.started_at).then_some(item)
     }
 
+    /// 不从未识别、缺失或截断的文字猜测协议分类。
+    pub fn cause(self) -> super::reason::Cause {
+        self.render
+            .and_then(|v| serde_json::from_value::<super::reason::Cause>(v).ok())
+            .filter(|r| r.render(aproxy_ipc::i18n::Lang::En) == self.reason)
+            .unwrap_or(super::reason::Cause::Evidence(self.reason))
+    }
+
     /// 原子替换同一份有限大小的报告，不让多次失败无限占用空间。
-    pub fn record(home: &Path, state: &InstallState, reason: &str) -> std::io::Result<()> {
-        let item = Self {
+    pub fn record(
+        home: &Path,
+        state: &InstallState,
+        code: &str,
+        cause: &super::reason::Cause,
+    ) -> std::io::Result<()> {
+        let reason = cause.render(aproxy_ipc::i18n::Lang::En);
+        let mut item = Self {
+            code: (code.len() <= 256).then(|| code.to_owned()),
+            render: None,
             pid: state.installer_pid,
             started_at: state.started_at,
             phase: state.failed_at.unwrap_or(state.phase),
             reason: reason.chars().take(4096).collect(),
         };
+        // 超过旧读者上限的上下文不给它；保留原来的有限摘录，不在私有参数里绕过截断。
+        if item.reason == reason {
+            item.render = Some(serde_json::to_value(cause)?);
+        }
+        let mut bytes = serde_json::to_vec(&item)?;
+        if bytes.len() > 32 * 1024 {
+            item.render = None;
+            bytes = serde_json::to_vec(&item)?;
+        }
         crate::fsx::write_atomic_private(
             &super::install_dir_in(home).join("last-exit.json"),
-            &serde_json::to_vec(&item)?,
+            &bytes,
         )
     }
 }
@@ -481,15 +520,23 @@ pub fn fail_in(home: &Path, state: &mut InstallState, error: &super::InstallFail
         state.failed_at = Some(state.phase);
     }
     state.last_error = Some(error.message.clone());
+    state.error_render = error
+        .cause
+        .as_ref()
+        .and_then(|r| serde_json::to_value(r).ok());
     state.error_code = Some(error.code.clone());
-    state.error_details = Some(error.details.clone());
+    state.error_details = Some((*error.details).clone());
     state.phase = InstallPhase::Failed;
     if let Err(io) = write_in(home, state) {
-        let reason = format!(
-            "{}: {}; saving install/state.json: {io}",
-            error.code, error.message
-        );
-        if let Err(other) = ExitEvidence::record(home, state, &reason) {
+        let reason = super::reason::Cause::Saving {
+            code: error.code.clone(),
+            cause: error
+                .cause
+                .clone()
+                .unwrap_or_else(|| Box::new(super::reason::Cause::Evidence(error.message.clone()))),
+            error: io.to_string(),
+        };
+        if let Err(other) = ExitEvidence::record(home, state, &error.code, &reason) {
             tracing::error!(%io, %other, "cannot persist installer failure");
         }
     }
@@ -783,11 +830,11 @@ mod tests {
             outcome: "rolled_back".into(),
         });
         let mut error = super::super::InstallFailure::new("install_restart_failed", "not ready");
-        error.details = serde_json::json!({"port": 90});
+        *error.details = serde_json::json!({"port": 90});
         fail_in(home, &mut state, &error);
         assert_eq!(load_in(home).unwrap(), state);
         assert_eq!(state.failed_at, Some(InstallPhase::Downloaded));
-        assert_eq!(state.error_details, Some(error.details));
+        assert_eq!(state.error_details, Some(*error.details));
         assert_eq!(state.error_code.as_deref(), Some("install_restart_failed"));
     }
 

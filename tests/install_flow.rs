@@ -661,7 +661,8 @@ fn install_instance_failure_exits_nonzero_and_keeps_restore() {
         "实例级失败必须非零退出（Windows 接力路径修复前为 0）; stdout: {stdout} stderr: {stderr}"
     );
     assert!(
-        stderr.contains("安装前的预检没有通过") && !stderr.contains("滚动已中止"),
+        stderr.contains("Precheck failed for the instance on port")
+            && !stderr.contains("滚动已中止"),
         "应给出预检诊断: {stderr}"
     );
     // 失败发生在接手的目标版本进程里，经 CLI 轮询 install.state 转告

@@ -79,7 +79,7 @@ impl RestartError {
             && let Ok(port) = port.parse::<u16>()
         {
             let mut error = super::InstallFailure::new("install_restart_failed", message);
-            error.details = serde_json::json!({"port": port});
+            *error.details = serde_json::json!({"port": port});
             error
         } else {
             message.into()

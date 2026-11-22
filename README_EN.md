@@ -492,7 +492,8 @@ scratch space, one directory per instance process; removed when the instance
 stops, and leftovers of a crashed one are removed by the next instance that
 starts or by the watchdog), `settings.json` (the home's program state: `aliases`,
 `default_config`, `config_dirs`, `defaults` with global config.toml defaults, and
-the `watchdog`, `logs`, `instances`, `update` and `ui` sections).
+the `watchdog`, `logs`, `instances` and `update` sections; the `ui` section is
+not used, and the desktop window keeps its preferences under `desktop/`).
 
 `settings.json` is read and written with
 `aproxy settings show|get|set|unset` (keys are dotted paths such as

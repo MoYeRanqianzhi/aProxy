@@ -520,7 +520,8 @@ settings.json 的 `defaults` 段收的就是 config.toml 的键（同名同嵌�
 
 `config.toml` 人类可读可写、可多份（多开各自指定）；`settings.json` 是整个 home 的程序状态，
 **全局唯一**，分节存放：`schema`、`language`、`aliases`、`default_config`、`config_dirs`、
-`defaults`、`watchdog`、`logs`、`instances`、`update`、`ui`（不透明，界面私有）。它被严格解析：
+`defaults`、`watchdog`、`logs`、`instances`、`update`、`ui`（保留不用：只查它是对象、写入时原样保留；
+界面偏好存在 `<home>/desktop/` 下，不在这里）。它被严格解析：
 未知键、类型不对、取值非法、更高 `schema` 都是 error 级诊断；没有自动迁移，0.1.x 的平铺字段
 按未知键（`watchdog` 布尔值则按类型不对）报错。写入走 config.toml 同一把写锁与原子写，只打补丁目标键，并因可能含明文密钥而以
 所有者私有权限落盘（`write_atomic_private`）。无效文件不参与任何实例的启动：`main` 在分派

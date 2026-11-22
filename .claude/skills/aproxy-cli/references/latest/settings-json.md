@@ -127,7 +127,7 @@ means running instances keep the old value until `aproxy restart PORT|ALIAS`.
 | `update.download_chain` | array or `null` | `null` (built-in chain) | next install |
 | `update.download_proxy` | string or `null` | `null` | next install |
 | `update.skill_auto_update` | boolean | `true` | next install |
-| `ui` | object | `{}` | kept for the desktop window; the CLI validates only that it is an object |
+| `ui` | object | `{}` | not used; the CLI checks only that it is an object and keeps its content |
 
 Integers are non-negative. A wrong type, an unknown key, a value outside its allowed set, a missing
 required key and a newer `schema` are all errors, reported with the file, the key path, line:column
@@ -414,7 +414,7 @@ them, even when this field is `false`.
 
 ## ui
 
-Reserved for the desktop window's preferences; this version does not read it. The CLI only checks
-that `ui` is an object, and everything inside is opaque and preserved through every `settings` write,
-so the window can add a preference without an older command line refusing to start. Put UI
-preferences here rather than at the top level: any top-level key not listed above is an error.
+Not used. The desktop window keeps its own preferences under `<home>/desktop/`, not in
+settings.json. `ui` stays a valid key so that files which have it keep working: the CLI only checks
+that it is an object and keeps whatever is inside through every `settings` write. Nothing reads it;
+leave it as it is.

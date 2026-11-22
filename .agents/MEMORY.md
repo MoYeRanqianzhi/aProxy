@@ -42,3 +42,4 @@
 - [0.2.0 的配置与设置形状](memory/2026-11-17-config-settings-shape.md) — config.toml、settings.json 的新键、严格解析、分层与写回在哪实现；旧记忆里的 0.1.x 键名按它换；运行时字段名没改；凭据随目标继承 [[config-settings-shape-0-2-0]]
 - [请求历史](memory/2026-11-19-request-history.md) — 体为什么拷贝而不零拷贝、量出来的四处开销（1 MiB 缓冲的释放、多开一次文件、锁里释放、事件逐个写）、几个百分点的差别怎么量 [[request-history]]
 - [Windows login restore carrier](memory/desktop-login-carrier.md) -- Why the per-home Run command uses the headless system console host and how to remeasure it.
+- [CLI language and stored evidence](memory/cli-language-evidence.md) -- When a later reader can localize a recorded failure, and when the original evidence must survive.

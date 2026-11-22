@@ -76,7 +76,7 @@ pub const DEFAULT_KEEPALIVE_TRIGGER: KeepaliveTrigger = KeepaliveTrigger::Any;
 
 /// 一个实例的运行时配置。由 [`resolve()`] 从各层合并得到；字段名与 config.toml 键名的对应
 /// 见模块文档。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct Config {
     /// 上游 API 的 base URL，例如 `https://api.anthropic.com`
     /// 末尾斜杠会被自动去除以避免拼接时产生 `//`。
@@ -225,16 +225,6 @@ pub struct Config {
     /// 进程内构建 AppState 时若无此覆盖，会按端口写入真实 ~/.aproxy/spool/。
     /// 生产路径为 None，实际目录 = ~/.aproxy/spool/<pid>-<启动标记短哈希>/。
     pub spool_dir_override: Option<PathBuf>,
-}
-
-impl Config {
-    /// 严格解析后的全部运行值（包括继承凭据）只在本机比较；先递归排序，消除头表哈希种子的差别。
-    pub fn launch_revision(&self) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut v = serde_json::to_value(self).expect("runtime configuration serializes");
-        v.sort_all_objects();
-        Sha256::digest(serde_json::to_vec(&v).expect("JSON value serializes")).into()
-    }
 }
 
 /// 转换器 args 里「后一个参数是密钥」的旗标（比较时大小写不敏感）。format 程序常见的传 key

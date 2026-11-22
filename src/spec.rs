@@ -120,47 +120,16 @@ pub fn capture_env() -> BTreeMap<String, Option<String>> {
 /// 把规格写成交接文件 `run/<纳秒>-<pid>.spec.json`，返回路径。名字里的 pid 是拉起方的：
 /// 残留的交接文件靠它判断写者是否还在。
 pub fn write_spec_file(run_dir: &Path, spec: &InstanceSpec) -> std::io::Result<PathBuf> {
-    write_launch_file(run_dir, spec, None)
-}
-/// 只在单次交接文件中携带待核对的运行配置摘要，不改变恢复记录，也不复制有效配置中的凭据。
-pub(crate) fn write_launch_file(
-    run_dir: &Path,
-    spec: &InstanceSpec,
-    revision: Option<[u8; 32]>,
-) -> std::io::Result<PathBuf> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let path = run_dir.join(format!("{nanos}-{}{SPEC_SUFFIX}", std::process::id()));
-    #[derive(Serialize)]
-    struct Launch<'a> {
-        #[serde(flatten)]
-        spec: &'a InstanceSpec,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        expected_revision: Option<[u8; 32]>,
-    }
-    crate::fsx::write_atomic_private(
-        &path,
-        &serde_json::to_vec(&Launch {
-            spec,
-            expected_revision: revision,
-        })?,
-    )?;
+    let json = serde_json::to_string(spec).expect("launch specifications must serialize");
+    crate::fsx::write_atomic_private(&path, json.as_bytes())?;
     Ok(path)
 }
 
-/// 一次读取规格及其可选的启动前置条件；期望状态和跨版本恢复都不继承此条件。
-pub fn read_launch_file(path: &Path) -> Result<(InstanceSpec, Option<[u8; 32]>), Unreadable> {
-    #[derive(Deserialize)]
-    struct Launch {
-        #[serde(flatten)]
-        spec: InstanceSpec,
-        expected_revision: Option<[u8; 32]>,
-    }
-    let v: Launch = read_record(path, SCHEMA)?;
-    Ok((v.spec, v.expected_revision))
-}
 /// 读交接文件。
 pub fn read_spec_file(path: &Path) -> Result<InstanceSpec, Unreadable> {
     read_record(path, SCHEMA)

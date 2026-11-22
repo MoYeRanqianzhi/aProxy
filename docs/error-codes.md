@@ -136,11 +136,6 @@ Faults returned to the bundled desktop page. They do not change CLI exit codes.
 | Code | When | `details` |
 |---|---|---|
 | `desktop_toml` | The desktop preferences file could not be edited. | `kind` (string), `line`? (integer), `column`? (integer), `key`? (string) |
-| `desktop_extension_package` | The extension package could not be loaded safely. | `reason` (string), `field` (string) |
-| `desktop_extension_state` | Private extension state could not be trusted or saved. | `reason` (string) |
-| `desktop_extension_denied` | The attributed operation was not authorized. | — |
-| `desktop_extension_runtime` | Scripted extensions are unavailable in this window. | — |
-| `desktop_extension_limit` | An extension resource would exceed its limit. | — |
 
 ## Install codes
 

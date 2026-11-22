@@ -305,19 +305,6 @@ pub struct Issue {
     rename_all_fields = "camelCase"
 )]
 pub enum Fault {
-    /// Invalid package; selectors never quote hostile input.
-    DesktopExtensionPackage {
-        reason: super::InvalidReason,
-        field: super::ExtField,
-    },
-    /// Persistent authority is unavailable; do not fall back to allowed.
-    DesktopExtensionState { reason: super::ExtStateReason },
-    /// No authorization covers the requested action.
-    DesktopExtensionDenied {},
-    /// Script containment has not been qualified or installed.
-    DesktopExtensionRuntime {},
-    /// A bounded extension resource would overflow.
-    DesktopExtensionLimit {},
     /// Malformed arguments; never quote input.
     DesktopBadInput {},
     /// Required local service or IO unavailable.

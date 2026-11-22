@@ -15,7 +15,6 @@ use tokio::{
 const LINE: usize = 1024 * 1024;
 #[derive(Default)]
 pub(super) struct Checks {
-    cached: Option<UpdateInfo>,
     serial: u64,
     offer: Option<Offer>,
     busy: bool,
@@ -344,7 +343,6 @@ impl UpdateOps for DesktopHome {
                 st.check = Some(tx);
                 st.serial = st.serial.wrapping_add(1);
                 st.offer = None;
-                st.cached = None;
                 (st.serial, rx)
             };
             let _lease = CheckLease(&self.updates);
@@ -391,7 +389,6 @@ impl UpdateOps for DesktopHome {
                 });
                 result.check = Some(token)
             }
-            st.cached = Some(result.clone());
             Ok(result)
         })
     }
@@ -417,7 +414,6 @@ impl UpdateOps for DesktopHome {
                 if !st.offer.as_ref().is_some_and(|o| o.token == check) {
                     return Err(Fault::DesktopChanged {});
                 }
-                st.cached = None;
                 let o = st.offer.take().unwrap();
                 if hash != o.fingerprint {
                     return Err(Fault::DesktopChanged {});
@@ -471,45 +467,6 @@ impl UpdateOps for DesktopHome {
             progress(job);
             self.updates.lock().unwrap().busy = false;
             result
-        })
-    }
-}
-
-impl DesktopHome {
-    /// 只返回上一次由页面发起的检查；读取不会重新联网或旋转候选令牌。
-    pub fn extension_update_offer(&self, lease: &str) -> R<Option<UpdateInfo>> {
-        self.extension_reader(lease)?;
-        let value = self.updates.lock().unwrap().cached.clone();
-        let secrets = self.display_secrets().ok_or_else(protocol)?;
-        if let Some(v) = &value {
-            public_version(&secrets, &v.current)?;
-            for t in [&v.latest, &v.check].into_iter().flatten() {
-                public_version(&secrets, t)?
-            }
-        }
-        Ok(value)
-    }
-    pub(super) async fn checked_offer(&self, lease: &str, token: &str) -> R<TargetView> {
-        let v = self
-            .extension_update_offer(lease)?
-            .filter(|v| v.check.as_deref() == Some(token))
-            .ok_or(Fault::DesktopChanged {})?;
-        let hash = fingerprint(crate::install::swap::bin_path_in(&self.home)).await?;
-        if !self
-            .updates
-            .lock()
-            .unwrap()
-            .offer
-            .as_ref()
-            .is_some_and(|o| o.token == token && o.fingerprint == hash)
-        {
-            return Err(Fault::DesktopChanged {});
-        }
-        Ok(TargetView::InstallUpdate {
-            version: v.latest.ok_or(Fault::DesktopChanged {})?,
-            variant: v.variant,
-            channel: v.channel,
-            scope: InstallScope::AllHomeInstances,
         })
     }
 }

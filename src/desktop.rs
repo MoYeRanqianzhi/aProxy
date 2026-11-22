@@ -1,5 +1,4 @@
 //! 绑定单个主目录的桌面业务逻辑。私有文件只在宿主侧打开，界面只见字段投影与不透明令牌。
-mod extensions;
 mod forms;
 mod instances;
 mod login;
@@ -29,7 +28,6 @@ pub struct DesktopHome {
     state_serial: Arc<tokio::sync::Mutex<()>>,
     login_test_slot: Option<String>,
     updates: Arc<std::sync::Mutex<update::Checks>>,
-    extensions: Arc<std::sync::Mutex<extensions::Runtime>>,
     listing: Arc<std::sync::Mutex<Option<[u8; 16]>>>,
 }
 impl DesktopHome {
@@ -46,7 +44,6 @@ impl DesktopHome {
             exe,
             state_serial: Default::default(),
             login_test_slot: None,
-            extensions: Default::default(),
             listing: Default::default(),
             updates: Default::default(),
         };

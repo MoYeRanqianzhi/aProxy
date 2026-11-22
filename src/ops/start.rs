@@ -332,7 +332,7 @@ pub async fn launch_in(
 
 /// 确保看护者在任（settings.watchdog 开启时）。
 /// 失败静默（看护者缺失只是失去自愈保护，不应让 start 失败）。
-pub(crate) fn ensure_watchdog_if_enabled(home: &Path, exe: &Path) {
+fn ensure_watchdog_if_enabled(home: &Path, exe: &Path) {
     let settings = settings::load_from(&settings::settings_path_in(home));
     if !settings.watchdog {
         return;

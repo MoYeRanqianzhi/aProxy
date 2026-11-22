@@ -1,9 +1,0 @@
-{
-  "manifestVersion": 1,
-  "id": "little-orb",
-  "name": "Little orb",
-  "version": "1.0.0",
-  "kind": "mascot",
-  "entry": "main.mjs",
-  "permissions": []
-}

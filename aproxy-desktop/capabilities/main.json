@@ -40,25 +40,6 @@
     "allow-check-update",
     "allow-install-update",
     "allow-read-autostart",
-    "allow-set-autostart",
-    "allow-extension-list",
-    "allow-extension-enable",
-    "allow-extension-open",
-    "allow-extension-close",
-    "allow-extension-query-logs",
-    "allow-extension-request-detail",
-    "allow-extension-body-chunk",
-    "allow-extension-cancel-detail",
-    "allow-extension-list-configs",
-    "allow-extension-read-config",
-    "allow-extension-update-offer",
-    "allow-extension-pending",
-    "allow-extension-answer",
-    "allow-extension-revoke",
-    "allow-extension-audit",
-    "allow-extension-start",
-    "allow-extension-stop",
-    "allow-extension-restart",
-    "allow-extension-install"
+    "allow-set-autostart"
   ]
 }

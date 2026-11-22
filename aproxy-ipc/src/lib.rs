@@ -25,7 +25,6 @@ pub mod diag;
 pub mod endpoint;
 #[cfg(feature = "client")]
 pub mod enumerate;
-pub mod extension_shell;
 pub mod home;
 pub mod i18n;
 #[cfg(feature = "body-inspection")]

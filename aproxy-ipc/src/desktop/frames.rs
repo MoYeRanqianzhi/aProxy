@@ -44,14 +44,6 @@ pub enum DesktopEvent {
     DesktopStateChanged,
     /// Re-read global settings after a successful write.
     SettingsChanged,
-    /// Reconcile inventory, grants and active mounts.
-    ExtensionsChanged,
-    /// Re-read pending dialogs from the trusted page only.
-    ExtensionConsentsChanged,
-    /// Re-read bounded attributed activity.
-    ExtensionAuditChanged,
-    /// The last page-initiated update observation changed.
-    ExtensionOfferChanged,
 }
 impl DesktopEvent {
     fn supersedes(&self, old: &Self) -> bool {

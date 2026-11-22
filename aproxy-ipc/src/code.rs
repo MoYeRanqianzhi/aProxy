@@ -262,36 +262,6 @@ pub const TABLE: &[Code] = &[
             opt("key", T::String),
         ],
     ),
-    plain(
-        "desktop_extension_package",
-        &[Family::Desktop],
-        "The extension package could not be loaded safely.",
-        &[req("reason", T::String), req("field", T::String)],
-    ),
-    plain(
-        "desktop_extension_state",
-        &[Family::Desktop],
-        "Private extension state could not be trusted or saved.",
-        &[req("reason", T::String)],
-    ),
-    plain(
-        "desktop_extension_denied",
-        &[Family::Desktop],
-        "The attributed operation was not authorized.",
-        &[],
-    ),
-    plain(
-        "desktop_extension_runtime",
-        &[Family::Desktop],
-        "Scripted extensions are unavailable in this window.",
-        &[],
-    ),
-    plain(
-        "desktop_extension_limit",
-        &[Family::Desktop],
-        "An extension resource would exceed its limit.",
-        &[],
-    ),
     // ----- 数据面终态码 -----
     terminal(
         "inbound_host_rejected",

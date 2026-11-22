@@ -11,6 +11,10 @@
 //! 目标时整条命令失败：目标不存在是 `target_not_found`（4），多个实例在运行而没指定目标是
 //! `target_ambiguous`（2）。
 
+#[path = "../i18n/stop.rs"]
+pub(super) mod text;
+use aproxy_ipc::i18n::current;
+
 use aproxy::daemon::{self, InstanceRecord};
 use aproxy::ops::stop::{
     IdleStop, StopFailure, StopMode, Stopped, forget_all_stopped, forget_stopped_config,
@@ -23,11 +27,9 @@ use super::{Failure, Results, port_value, say};
 
 /// 别名、端口、配置文件都对不上：`target_not_found`（4）。
 pub(crate) fn unknown_target(target: &str) -> Failure {
-    Failure::new(
+    Failure::rendered(
         "target_not_found",
-        format!(
-            "未知的别名或端口号: {target}\n用 aproxy alias list 查看已有别名，或 aproxy alias add {target} <路径> 添加"
-        ),
+        |lang| text::unknown(lang, target),
         json!({"target": target}),
     )
 }
@@ -35,27 +37,27 @@ pub(crate) fn unknown_target(target: &str) -> Failure {
 /// 没指定目标，而运行中的实例不止一个：`target_ambiguous`（2）。`cmd` 是命令名，用来在
 /// 说明里给出可以照抄的命令行。
 pub(crate) fn ambiguous(cmd: &str, ports: &[String]) -> Failure {
-    let mut message = format!(
-        "有 {} 个实例在运行，必须指定端口号、别名或 all：",
-        ports.len()
-    );
-    for port in ports {
-        message.push_str(&format!("\n  aproxy {cmd} {port}"));
-    }
-    let ports: Vec<_> = ports.iter().map(|port| port_value(port)).collect();
-    Failure::new("target_ambiguous", message, json!({"ports": ports}))
+    let message = |lang| {
+        let mut message = text::ambiguous(lang, ports.len());
+        for port in ports {
+            message.push_str(&format!("\n  aproxy {cmd} {port}"));
+        }
+        message
+    };
+    let numbers: Vec<_> = ports.iter().map(|port| port_value(port)).collect();
+    Failure::rendered("target_ambiguous", message, json!({"ports": numbers}))
 }
 
 /// 实例的进程还在，却不应答控制通道：没带 `--force` 时处理不了它，`instance_unresponsive`（1）。
 /// `alias` 是用户写的别名（按端口指定、或随 all 一起选中时为 None）。
 pub(crate) fn unresponsive(alias: Option<&str>, port: &str, pid: u32) -> Failure {
-    let who = match alias {
-        Some(alias) => format!("别名 {alias} 的实例（端口 {port}，pid {pid}）"),
-        None => format!("端口 {port} 的实例（pid {pid}）"),
+    let who = |lang| match alias {
+        Some(alias) => text::alias_pid(lang, alias, port, pid),
+        None => text::port_pid(lang, port, pid),
     };
-    Failure::new(
+    Failure::rendered(
         "instance_unresponsive",
-        format!("{who}进程仍在，但不应答控制通道，无法优雅停止；用 --force 强制结束"),
+        |lang| text::unresponsive(lang, &who(lang)),
         json!({"port": port_value(port), "pid": pid}),
     )
 }
@@ -66,7 +68,7 @@ pub(crate) fn fail_unresponsive_skipped(selection: &Selection, results: &mut Res
     for info in &selection.unresponsive_skipped {
         let port = daemon::port_of(&info.listen_addr);
         let failure = unresponsive(None, port, info.pid);
-        eprintln!("{}", failure.message);
+        eprintln!("{}", failure.terminal());
         results.failed(port, "failed", &failure);
     }
 }
@@ -80,11 +82,9 @@ pub(crate) fn require_idle_for_threshold(
     json: bool,
 ) {
     if threshold.is_some() && !target.is_some_and(|t| t.eq_ignore_ascii_case("idle")) {
-        Failure::new(
+        Failure::rendered(
             "usage",
-            format!(
-                "--idle-threshold-secs 只能与目标 idle 一起用，例如: aproxy {cmd} idle --idle-threshold-secs 600"
-            ),
+            |lang| text::idle_only(lang, cmd),
             json!({"reason": "idle_threshold_without_idle"}),
         )
         .exit(json)
@@ -111,19 +111,9 @@ pub(crate) async fn handle_stop_cmd(
         Err(SelectError::Ambiguous { ports }) => ambiguous("stop", &ports).exit(json),
         Err(SelectError::NothingOnPort { port }) => {
             if forget_stopped_port(&port).await {
-                say(
-                    json,
-                    format!(
-                        "端口 {port} 的实例已不在运行；已删除它的期望状态记录，restore 与看护者不会再拉起它。"
-                    ),
-                );
+                say(json, text::forgotten(current(), &port));
             } else {
-                say(
-                    json,
-                    format!(
-                        "端口 {port} 上没有运行中的 aProxy 实例。\n（若该端口被其他程序占用，与本工具无关）"
-                    ),
-                );
+                say(json, text::no_port(current(), &port));
             }
             results.ok(&port, "already_stopped", None);
             results.finish(json)
@@ -136,20 +126,21 @@ pub(crate) async fn handle_stop_cmd(
             if ports.is_empty() {
                 say(
                     json,
-                    format!(
-                        "别名 {target}（配置 {}）当前未在运行。",
-                        config_path.display()
-                    ),
+                    text::no_alias(current(), &target, config_path.display()),
                 );
                 // 这一项说的不是某个端口：别名的实例没在运行，也没留下记录
                 results.ok("", "already_stopped", None);
             } else {
                 say(
                     json,
-                    format!(
-                        "配置 {} 的实例已不在运行；已删除它的期望状态记录（端口 {}），restore 与看护者不会再拉起它。",
+                    text::forgot_config(
+                        current(),
                         config_path.display(),
-                        ports.join("、")
+                        &ports.join(if current() == aproxy_ipc::i18n::Lang::Zh {
+                            "、"
+                        } else {
+                            ", "
+                        }),
                     ),
                 );
                 for port in &ports {
@@ -160,7 +151,7 @@ pub(crate) async fn handle_stop_cmd(
         }
         Err(SelectError::Unresponsive { target, port, pid }) => {
             let failure = unresponsive(target.as_deref(), &port, pid);
-            eprintln!("{}", failure.message);
+            eprintln!("{}", failure.terminal());
             results.failed(&port, "failed", &failure);
             results.finish(json)
         }
@@ -168,11 +159,9 @@ pub(crate) async fn handle_stop_cmd(
     fail_unresponsive_skipped(&selection, &mut results);
     match selection.empty {
         Some(Empty::NoneRunning) if selection.unresponsive_skipped.is_empty() => {
-            say(json, "没有运行中的 aProxy 实例。")
+            say(json, super::status::text::none(current()))
         }
-        Some(Empty::NoneIdle { idle_secs }) => {
-            say(json, format!("没有闲置超过 {idle_secs} 秒的实例。"))
-        }
+        Some(Empty::NoneIdle { idle_secs }) => say(json, text::none_idle(current(), idle_secs)),
         _ => {}
     }
     // stop idle 的优雅停止带着闲置条件：被选中之后又收到请求的实例不停（强制终止没有条件
@@ -195,18 +184,12 @@ pub(crate) async fn handle_stop_cmd(
             }
             // 选中之后又收到了请求：不再闲置，跳过它是 idle 目标要的结果，计为成功
             Ok(IdleStop::Busy { idle_secs }) => {
-                say(
-                    json,
-                    format!(
-                        "pid {}（端口 {port}）刚才又收到了请求（已闲置 {idle_secs} 秒），不再算闲置，未停止",
-                        info.pid
-                    ),
-                );
+                say(json, text::not_idle(current(), info.pid, port, idle_secs));
                 results.ok(port, "skipped", Some("not_idle"));
             }
             Err(failure) => {
                 let failure = stop_failure(info, &failure);
-                eprintln!("{}", failure.message);
+                eprintln!("{}", failure.terminal());
                 results.failed(port, "failed", &failure);
             }
         }
@@ -217,9 +200,13 @@ pub(crate) async fn handle_stop_cmd(
         if !ports.is_empty() {
             say(
                 json,
-                format!(
-                    "已删除不在运行的实例留下的期望状态记录（端口 {}）。",
-                    ports.join("、")
+                text::cleaned(
+                    current(),
+                    &ports.join(if current() == aproxy_ipc::i18n::Lang::Zh {
+                        "、"
+                    } else {
+                        ", "
+                    }),
                 ),
             );
         }
@@ -228,9 +215,12 @@ pub(crate) async fn handle_stop_cmd(
         }
         for record in &unreadable {
             eprintln!(
-                "保留了读不懂的记录 {}（{}）：多半由更新版本的 aproxy 写下，请用那个版本处理。",
-                record.path.display(),
-                record.reason
+                "{}",
+                text::retain(
+                    current(),
+                    record.path.display(),
+                    &record.reason.diagnostic().render(current())
+                )
             );
         }
     }
@@ -251,9 +241,9 @@ fn stopped_outcome(stopped: Stopped) -> &'static str {
 pub(crate) fn stopped_line(info: &InstanceRecord, stopped: Stopped) -> String {
     let port = daemon::port_of(&info.listen_addr);
     match stopped {
-        Stopped::Graceful => format!("已停止 pid {}（端口 {port}）", info.pid),
-        Stopped::AlreadyGone => format!("pid {}（端口 {port}）已不在运行", info.pid),
-        Stopped::Forced => format!("已强制终止 pid {}（端口 {port}）", info.pid),
+        Stopped::Graceful => text::stopped(current(), info.pid, port),
+        Stopped::AlreadyGone => text::gone(current(), info.pid, port),
+        Stopped::Forced => text::killed(current(), info.pid, port),
     }
 }
 
@@ -265,39 +255,34 @@ pub(crate) fn stop_failure(info: &InstanceRecord, failure: &StopFailure) -> Fail
     // 强制结束指向 `stop --force`：跨平台，且终止前按 pid + 创建时间核验身份，不会像手敲
     // taskkill/kill 那样误杀复用了该 pid 的其他进程
     match failure {
-        StopFailure::GenerationChanged => Failure::new(
+        StopFailure::GenerationChanged => Failure::rendered(
             "command_failed",
-            format!(
-                "The selected instance on port {port} was replaced; the current instance was not stopped."
-            ),
+            |lang| text::generation(lang, port),
             json!({"port":port_value(port),"reason":"generation_changed"}),
         ),
-        StopFailure::StillRunning => Failure::new(
+        StopFailure::StillRunning => Failure::rendered(
             "stop_failed",
-            format!(
-                "pid {} 已收到停止请求但尚未退出，可用 aproxy status 稍后确认，或 aproxy stop {port} --force 强制结束",
-                info.pid
-            ),
+            |lang| text::still_running(lang, info.pid, port),
             json!({"port": port_value(port), "reason": "still_running"}),
         ),
-        StopFailure::Unresponsive { error } => Failure::new(
+        StopFailure::Unresponsive { error } => Failure::rendered(
             "instance_unresponsive",
-            format!(
-                "pid {} 不应答停止请求（{error}），可用 aproxy stop {port} --force 强制结束",
-                info.pid
-            ),
+            |lang| text::no_reply(lang, info.pid, port, &error.render(lang)),
             json!({"port": port_value(port), "pid": info.pid}),
         ),
         StopFailure::ForceFailed {
             error,
             restore_error,
         } => {
-            let mut message = String::new();
-            if let Some(werr) = restore_error {
-                message.push_str(&format!("放回端口 {port} 的恢复记录失败: {werr}\n"));
-            }
-            message.push_str(&format!("强制终止 pid {} 失败: {error}", info.pid));
-            Failure::new(
+            let message = |lang| {
+                let mut message = String::new();
+                if let Some(werr) = restore_error {
+                    message.push_str(&text::restore_error(lang, port, werr));
+                }
+                message.push_str(&text::kill_error(lang, info.pid, &error.render(lang)));
+                message
+            };
+            Failure::rendered(
                 "stop_failed",
                 message,
                 json!({"port": port_value(port), "reason": "kill_failed"}),

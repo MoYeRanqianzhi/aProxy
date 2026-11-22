@@ -104,6 +104,9 @@ unknown_arg invalid_state idle_condition not_found busy""".split())
                 diagnostic |= path.relative_to(ROOT).as_posix() == "aproxy-ipc/src/i18n/ipc.rs" and name in ipc_drafts
                 diagnostic |= path.relative_to(ROOT).as_posix() == "src/i18n/startup.rs" and name == "spec_read"
                 diagnostic |= path.relative_to(ROOT).as_posix() == "src/i18n/start.rs" and name in {"ready", "formats"}
+                diagnostic |= path.relative_to(ROOT).as_posix() == "src/i18n/stop.rs" and name == "generation"
+                diagnostic |= path.relative_to(ROOT).as_posix() == "src/i18n/restart.rs" and name in {"starting", "starting_state", "changed_state"}
+                diagnostic |= path.relative_to(ROOT).as_posix() == "src/i18n/format_fault.rs" and name in {"open", "spawn", "io", "died", "timeout", "protocol", "invalid", "stages", "handshake"}
                 unexpected += not (known or diagnostic)
                 reason = "no previous Chinese help" if known else "English-only diagnostic" if diagnostic else "REVIEW"
                 print(f"{path.relative_to(ROOT)}:{line} {name}: {value!r} ({reason})")

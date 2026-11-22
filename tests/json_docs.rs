@@ -768,3 +768,39 @@ fn start_and_restore_choose_language_only_for_the_terminal() {
     assert_eq!(en.stdout, zh.stdout);
     assert_eq!(document(&zh)["error"]["details"]["target"], target);
 }
+
+/// 没有目标时 stop 与 restart 的语义不同；失败的机器文档不受终端语言影响。
+#[test]
+fn stop_and_restart_render_their_own_terminal_notices() {
+    let home = TestHome::new();
+    let run = |lang, args: &[&str]| {
+        home.cmd()
+            .env("APROXY_LANG", lang)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for (lang, none, restart) in [
+        (
+            "en",
+            "No running aProxy instances.",
+            "Restart only restarts running instances.",
+        ),
+        (
+            "zh-CN",
+            "没有运行中的 aProxy 实例。",
+            "restart 只重启运行中的实例",
+        ),
+    ] {
+        let stop = run(lang, &["stop"]);
+        assert!(stop.status.success() && String::from_utf8(stop.stdout).unwrap().contains(none));
+        let fail = run(lang, &["restart"]);
+        assert_eq!(fail.status.code(), Some(4));
+        let err = String::from_utf8(fail.stderr).unwrap();
+        assert!(err.contains(none) && err.contains(restart), "{err}");
+    }
+    let en = run("en", &["restart", "--json"]);
+    let zh = run("zh-CN", &["restart", "--json"]);
+    assert_eq!(en.stdout, zh.stdout);
+    assert_eq!(document(&zh)["error"]["code"], "target_not_running");
+}

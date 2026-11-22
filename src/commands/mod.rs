@@ -159,6 +159,13 @@ impl Failure {
         failure
     }
 
+    /// 给两种输出补上同一个操作阶段，不改变原来的诊断码、细节或退出码。
+    fn context(mut self, render: impl Fn(Lang, &str) -> String) -> Self {
+        self.terminal = (current() == Lang::Zh).then(|| render(Lang::Zh, self.terminal()));
+        self.message = render(Lang::En, &self.message);
+        self
+    }
+
     /// 终端没有独立的译文时，沿用原始故障证据。
     fn terminal(&self) -> &str {
         self.terminal.as_deref().unwrap_or(&self.message)
@@ -166,13 +173,9 @@ impl Failure {
 
     /// 前台与后台用同一份结构化诊断；静态协议不匹配和程序暂时不可用的退出码不同。
     pub(crate) fn handshake(e: &aproxy::transform::StartupError) -> Self {
-        Self {
-            code: e.code(),
-            message: e.to_string(),
-            terminal: None,
-            details: Box::new(e.details()),
-            exit_override: Some(e.exit_code()),
-        }
+        let mut failure = Self::rendered(e.code(), |lang| e.render(lang), e.details());
+        failure.exit_override = Some(e.exit_code());
+        failure
     }
 
     /// 这个失败的退出码。

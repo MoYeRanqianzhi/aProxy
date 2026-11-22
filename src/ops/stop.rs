@@ -48,7 +48,7 @@ pub enum StopFailure {
     /// 强制终止失败（身份核验不过、无权限）。恢复记录已放回，实例照旧受崩溃恢复保护；
     /// 放回失败时 `restore_error` 带着原因
     ForceFailed {
-        error: String,
+        error: crate::process::TerminationError,
         restore_error: Option<String>,
     },
 }

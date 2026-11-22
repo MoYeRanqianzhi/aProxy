@@ -8,10 +8,12 @@
 
 #[path = "../i18n/restart.rs"]
 mod restart_text;
+use super::stop::text as stop_text;
 use aproxy::daemon::{self, InstanceRecord};
 use aproxy::ops::restart::{PrecheckError, RestartFailure, restart_instance};
 use aproxy::ops::stop::{StopFailure, StopMode};
 use aproxy::ops::target::{self, Empty, SelectError};
+use aproxy_ipc::i18n::{Lang, current};
 use serde_json::json;
 
 use super::stop::{
@@ -22,10 +24,10 @@ use super::{Failure, Results, port_value, say};
 
 /// 目标没在运行：restart 不启动它，`target_not_running`（4）。`target` 为 None 表示命令行上
 /// 没写目标。
-fn not_running(target: Option<&str>, message: String) -> Failure {
-    Failure::new(
+fn not_running(target: Option<&str>, message: impl Fn(Lang) -> String) -> Failure {
+    Failure::rendered(
         "target_not_running",
-        format!("{message}\nrestart 只重启运行中的实例，不启动新实例；要启动用 aproxy start"),
+        |lang| restart_text::not_running(lang, &message(lang)),
         json!({"target": target}),
     )
 }
@@ -47,19 +49,13 @@ pub(crate) async fn handle_restart_cmd(
         Err(SelectError::NotRunning {
             target,
             config_path,
-        }) => not_running(
-            Some(&target),
-            format!(
-                "别名 {target}（配置 {}）当前未在运行。",
-                config_path.display()
-            ),
-        )
+        }) => not_running(Some(&target), |lang| {
+            stop_text::no_alias(lang, &target, config_path.display())
+        })
         .exit(json),
-        Err(SelectError::NothingOnPort { port }) => not_running(
-            Some(&port),
-            format!("端口 {port} 上没有运行中的 aProxy 实例。"),
-        )
-        .exit(json),
+        Err(SelectError::NothingOnPort { port }) => {
+            not_running(Some(&port), |lang| restart_text::no_port(lang, &port)).exit(json)
+        }
         Err(SelectError::Unresponsive { target, port, pid }) => {
             let failure = unresponsive(target.as_deref(), &port, pid);
             eprintln!("{}", failure.terminal());
@@ -73,18 +69,18 @@ pub(crate) async fn handle_restart_cmd(
         Some(Empty::NoneRunning)
             if target.is_none() && selection.unresponsive_skipped.is_empty() =>
         {
-            not_running(None, "没有运行中的 aProxy 实例。".to_string()).exit(json)
+            not_running(None, |lang| super::status::text::none(lang).to_owned()).exit(json)
         }
         // all：没有运行中的实例就是没有要重启的，无事可做
         Some(Empty::NoneRunning) if selection.unresponsive_skipped.is_empty() => {
-            say(json, "没有运行中的 aProxy 实例。")
+            say(json, super::status::text::none(current()))
         }
         Some(Empty::NoneIdle { idle_secs }) => {
-            say(json, format!("没有闲置超过 {idle_secs} 秒的实例。"))
+            say(json, stop_text::none_idle(current(), idle_secs))
         }
         _ => {}
     }
-    let exe = std::env::current_exe().expect("无法定位自身可执行文件");
+    let exe = std::env::current_exe().expect("cannot locate the current executable");
     // 多实例时最后再汇总一遍：逐条失败信息可能已被后续实例的输出冲散
     let mut failed: Vec<(String, &'static str)> = Vec::new();
     for info in &selection.instances {
@@ -96,25 +92,26 @@ pub(crate) async fn handle_restart_cmd(
                 let new_port = daemon::port_of(&done.live.instance.listen_addr);
                 say(
                     json,
-                    format!(
-                        "已重启（端口 {new_port}）\n  pid: {}（旧 pid {}）\n  监听: http://{}",
-                        done.live.instance.pid, done.old_pid, done.live.instance.listen_addr
+                    restart_text::done(
+                        current(),
+                        new_port,
+                        done.live.instance.pid,
+                        done.old_pid,
+                        &done.live.instance.listen_addr,
                     ),
                 );
                 results.ok(new_port, "restarted", None);
             }
             Err(failure) => {
                 let state = match &failure {
-                    RestartFailure::Starting => {
-                        "Instance is still starting; no restart was attempted."
-                    }
-                    RestartFailure::Unsupported => "没有可用来重新拉起它的记录，旧实例保持运行",
-                    RestartFailure::Precheck(_) => "预检未通过，旧实例保持运行",
+                    RestartFailure::Starting => restart_text::starting_state(current()),
+                    RestartFailure::Unsupported => restart_text::unsupported_state(current()),
+                    RestartFailure::Precheck(_) => restart_text::precheck_state(current()),
                     RestartFailure::Stop(StopFailure::GenerationChanged) => {
-                        "The current instance was not stopped."
+                        restart_text::changed_state(current())
                     }
-                    RestartFailure::Stop(_) => "停止未确认，未启动新实例",
-                    RestartFailure::Start { .. } => "旧实例已停止、新实例未就绪，服务已中断",
+                    RestartFailure::Stop(_) => restart_text::stop_state(current()),
+                    RestartFailure::Start { .. } => restart_text::start_state(current()),
                 };
                 let failure = restart_failure(info, &port, failure, json);
                 eprintln!("{}", failure.terminal());
@@ -125,12 +122,11 @@ pub(crate) async fn handle_restart_cmd(
     }
     if !failed.is_empty() && selection.instances.len() > 1 {
         eprintln!(
-            "\n{} 个实例中有 {} 个重启失败（已跳过，其余照常重启）：",
-            selection.instances.len(),
-            failed.len()
+            "{}",
+            restart_text::failed_count(current(), selection.instances.len(), failed.len())
         );
         for (port, state) in &failed {
-            eprintln!("  端口 {port}：{state}");
+            eprintln!("{}", restart_text::state(current(), port, state));
         }
     }
     results.finish(json)
@@ -145,35 +141,21 @@ fn restart_failure(
     json: bool,
 ) -> Failure {
     match failure {
-        RestartFailure::Starting => Failure::new(
+        RestartFailure::Starting => Failure::rendered(
             "command_failed",
-            format!("Instance on port {port} is still starting; retry after it begins serving."),
+            |lang| restart_text::starting(lang, port),
             json!({}),
         ),
-        RestartFailure::Unsupported => Failure::new(
+        RestartFailure::Unsupported => Failure::rendered(
             "restart_unsupported",
-            format!(
-                "端口 {port} 未重启：这个实例没有可用来重新拉起它的记录（前台运行的实例要在它自己的终端里重启），旧实例保持运行。"
-            ),
+            |lang| restart_text::unsupported(lang, port),
             json!({"port": port_value(port)}),
         ),
-        RestartFailure::Precheck(reason) => {
-            let mut failure = precheck_failure(port, reason);
-            failure.message = format!(
-                "端口 {port} 未重启：预检未通过，旧实例保持运行。\n{}",
-                failure.message
-            );
-            failure
-        }
+        RestartFailure::Precheck(reason) => precheck_failure(port, reason)
+            .context(|lang, cause| restart_text::precheck(lang, port, cause)),
         RestartFailure::Stop(stop @ StopFailure::GenerationChanged) => stop_failure(info, &stop),
-        RestartFailure::Stop(stop) => {
-            let mut failure = stop_failure(info, &stop);
-            failure.message = format!(
-                "{}\n端口 {port} 停止未确认，重启中止（未启动新实例，以免与旧实例争抢端口）。",
-                failure.message
-            );
-            failure
-        }
+        RestartFailure::Stop(stop) => stop_failure(info, &stop)
+            .context(|lang, cause| restart_text::stop_failed(lang, port, cause)),
         RestartFailure::Start {
             stopped,
             error,
@@ -199,20 +181,20 @@ fn restart_failure(
 /// `port_in_use` 或 `start_failed`（1）。
 fn precheck_failure(port: &str, reason: PrecheckError) -> Failure {
     match reason {
-        PrecheckError::RecordUnreadable { reason } => Failure::new(
+        PrecheckError::RecordUnreadable { reason } => Failure::rendered(
             "restart_unsupported",
-            format!("这个实例的期望状态记录读不懂：{reason}"),
+            |lang| restart_text::unreadable(lang, &reason.diagnostic().render(lang)),
             json!({"port": port_value(port)}),
         ),
-        PrecheckError::ConfigMissing { path } => Failure::new(
+        PrecheckError::ConfigMissing { path } => Failure::rendered(
             "target_not_found",
-            format!("配置文件已不存在（{}）", path.display()),
+            |lang| restart_text::missing(lang, path.display()),
             json!({"target": path.display().to_string()}),
         ),
         PrecheckError::Config(error) => super::start::config_failure(&error),
-        PrecheckError::PortTaken { port, pid } => Failure::new(
+        PrecheckError::PortTaken { port, pid } => Failure::rendered(
             "port_in_use",
-            format!("新配置的监听端口 {port} 上已有 aProxy 实例（pid {pid}）在运行"),
+            |lang| restart_text::taken(lang, pid, &port),
             json!({"port": port_value(&port), "owner": "aproxy"}),
         ),
         PrecheckError::Bind { listen_addr, error } => super::bind_failure(&listen_addr, &error),

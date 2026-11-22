@@ -256,18 +256,24 @@ impl Fault {
         matches!(self, Self::Spawn | Self::Io | Self::Died | Self::Timeout)
     }
 }
+impl Fault {
+    /// 终端可以重排已有的故障分类；快照和请求历史不读取终端语言。
+    pub(super) fn render(&self, lang: aproxy_ipc::i18n::Lang) -> &'static str {
+        match self {
+            Self::Open { .. } => super::fault_text::open(lang),
+            Self::Spawn => super::fault_text::spawn(lang),
+            Self::Io => super::fault_text::io(lang),
+            Self::Died => super::fault_text::died(lang),
+            Self::Timeout => super::fault_text::timeout(lang),
+            Self::Protocol => super::fault_text::protocol(lang),
+            Self::Invalid => super::fault_text::invalid(lang),
+            Self::Stages(_) => super::fault_text::stages(lang),
+        }
+    }
+}
 impl std::fmt::Display for Fault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Open { .. } => "circuit open",
-            Self::Spawn => "could not start the program",
-            Self::Io => "worker pipe I/O failed",
-            Self::Died => "worker exited before replying",
-            Self::Timeout => "worker reply timed out",
-            Self::Protocol => "invalid protocol version, framing or sequence number",
-            Self::Invalid => "invalid worker reply",
-            Self::Stages(_) => "worker does not support the configured stages",
-        })
+        f.write_str(self.render(aproxy_ipc::i18n::Lang::En))
     }
 }
 

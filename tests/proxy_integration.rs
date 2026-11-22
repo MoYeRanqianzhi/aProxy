@@ -5247,7 +5247,7 @@ fn daemon_lifecycle_start_status_stop() {
     let out = run(&["stop", &port.to_string()]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("已停止"), "实际: {stdout}");
+    assert!(stdout.contains("Stopped pid"), "实际: {stdout}");
 
     // status 不再列出本实例
     let out = run(&["status"]);
@@ -5828,7 +5828,7 @@ fn alias_start_and_stop_roundtrip() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("已停止"), "实际: {stdout}");
+    assert!(stdout.contains("Stopped pid"), "实际: {stdout}");
 
     // 已停止后再 stop 别名：说明「未在运行」，stop 要的状态已经达成，以 0 退出
     let out = home.cmd().args(["stop", &alias]).output().unwrap();
@@ -5842,7 +5842,7 @@ fn alias_start_and_stop_roundtrip() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(text.contains("未在运行"), "实际: {text}");
+    assert!(text.contains("is not running"), "实际: {text}");
 
     // 清理别名（无论如何执行，不留测试残留——隔离 home 内本就随 tempdir 删除）
     let _ = home.cmd().args(["alias", "remove", &alias]).output();
@@ -5878,7 +5878,7 @@ fn alias_errors_on_unknown_names() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(text.contains("未知的别名或端口号"), "实际: {text}");
+    assert!(text.contains("Unknown alias or port"), "实际: {text}");
 
     // add 保留字：all / 纯数字被拒绝
     for bad in ["all", "12345"] {
@@ -5989,7 +5989,7 @@ fn logs_via_alias_connects_and_follows() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(text.contains("未知的别名或端口号"), "实际: {text}");
+    assert!(text.contains("Unknown alias or port"), "实际: {text}");
 
     // add 别名 → start <别名> → IPC 就绪
     let out = home

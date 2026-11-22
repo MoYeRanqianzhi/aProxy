@@ -162,7 +162,7 @@ fn restart_not_running_port_fails() {
     assert_eq!(out.status.code(), Some(4), "未启动的 target 应退出 4");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("没有运行中的 aProxy 实例"),
+        stderr.contains(&format!("No running aProxy instance on port {port}")),
         "应提示未在运行，实际: {stderr}"
     );
 }
@@ -362,7 +362,7 @@ fn restart_with_broken_config_keeps_old_instance() {
         "预检发现配置无效应退出 3: {stderr}"
     );
     assert!(
-        stderr.contains("预检未通过") && stderr.contains("TOML"),
+        stderr.contains("preflight failed") && stderr.contains("TOML"),
         "应报出预检失败与配置错误原因: {stderr}"
     );
     let live = ipc_ping_in_dir(&rt, port, home).expect("旧实例必须仍在运行");
@@ -407,7 +407,7 @@ fn restart_all_skips_failed_instance_and_exits_nonzero() {
         "有成有败时应以 5 退出: {stderr}"
     );
     assert!(
-        stderr.contains("2 个实例中有 1 个重启失败"),
+        stderr.contains("Restart failed for 1 of 2 instances"),
         "应汇总失败实例: {stderr}"
     );
     let a = ipc_ping_in_dir(&rt, port_a, home).expect("A 应已重启并运行");
@@ -448,7 +448,7 @@ fn restart_refuses_port_change_onto_occupied_port() {
         "新端口不可绑定应退出 1: {stderr}"
     );
     assert!(
-        stderr.contains("预检未通过") && stderr.contains(&port_c.to_string()),
+        stderr.contains("preflight failed") && stderr.contains(&port_c.to_string()),
         "应报出新端口不可用: {stderr}"
     );
     let live = ipc_ping_in_dir(&rt, port_a, home).expect("旧实例必须仍在运行");
@@ -590,7 +590,7 @@ fn release_asset_named_instance_is_adopted_respawned_and_force_stoppable() {
     let out = run_cli(&test_home, &bin, &["stop", &port_s, "--force"]);
     let stdout = text(&out.stdout);
     assert!(
-        out.status.success() && stdout.contains("已强制终止"),
+        out.status.success() && stdout.contains("Terminated pid"),
         "stop --force 应成功: {stdout}{}",
         text(&out.stderr)
     );
@@ -1279,7 +1279,7 @@ fn stop_of_a_crashed_instance_deletes_its_record() {
             text(&out.stderr)
         );
         assert!(
-            text(&out.stdout).contains("期望状态记录"),
+            text(&out.stdout).contains("desired-state record"),
             "stop {target} 应说明删了记录: {}",
             text(&out.stdout)
         );
@@ -1324,7 +1324,7 @@ fn foreground_instance_has_no_record_and_restart_refuses_it() {
     let out = run_cli(&test_home, &exe, &["restart", &port.to_string()]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
-        text(&out.stderr).contains("前台"),
+        text(&out.stderr).contains("foreground"),
         "应说明前台实例不能这样重启: {}",
         text(&out.stderr)
     );
@@ -1653,7 +1653,7 @@ fn stop_idle_only_stops_instances_that_are_idle_long_enough() {
         &["stop", "idle", "--idle-threshold-secs", "0"],
     );
     assert!(
-        out.status.success() && text(&out.stdout).contains("已停止"),
+        out.status.success() && text(&out.stdout).contains("Stopped pid"),
         "{}{}",
         text(&out.stdout),
         text(&out.stderr)

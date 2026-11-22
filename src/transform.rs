@@ -9,6 +9,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::io::AsyncWriteExt;
+#[path = "i18n/format_fault.rs"]
+mod fault_text;
 mod pool;
 pub(crate) use pool::{Fault, Pool, StreamWorker};
 /// 头表 → 信封：键小写（HeaderMap 迭代即小写）、跳过 hop-by-hop 头（含
@@ -160,6 +162,10 @@ pub struct StartupError {
     pub(crate) fault: Fault,
 }
 impl StartupError {
+    /// 使用读者的语言解释此工作进程的握手故障；原分类与退出码保持不变。
+    pub fn render(&self, lang: aproxy_ipc::i18n::Lang) -> String {
+        fault_text::handshake(lang, &self.name, self.fault.render(lang), self.code())
+    }
     /// 稳定诊断码区分阶段与协议不匹配。
     pub fn code(&self) -> &'static str {
         if matches!(self.fault, Fault::Stages(_)) {
@@ -182,13 +188,7 @@ impl StartupError {
 }
 impl std::fmt::Display for StartupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "format {:?}: {} [{}]",
-            self.name,
-            self.fault,
-            self.code()
-        )
+        f.write_str(&self.render(aproxy_ipc::i18n::Lang::En))
     }
 }
 

@@ -534,7 +534,7 @@ impl IpcStats {
 /// 创建时间（0）= 证明不了身份——两者都拒绝，杀错进程不可逆。
 ///
 /// 返回 Err 的信息已含原因，调用方直接展示。
-pub fn force_terminate(info: &InstanceRecord) -> Result<(), String> {
+pub fn force_terminate(info: &InstanceRecord) -> Result<(), crate::process::TerminationError> {
     crate::process::terminate_marked_process(info.pid, &info.start)
 }
 
@@ -1928,14 +1928,11 @@ mod tests {
 
         info.start = format!("{start}0");
         let err = force_terminate(&info).unwrap_err();
-        assert!(
-            err.contains("已不是记录里的那个进程"),
-            "pid 复用应以身份不符拒绝: {err}"
-        );
+        assert!(matches!(err, crate::process::TerminationError::Gone(p) if p == pid));
 
         info.start = String::new();
         let err = force_terminate(&info).unwrap_err();
-        assert!(err.contains("核验"), "未登记启动标记应拒绝: {err}");
+        assert!(matches!(err, crate::process::TerminationError::Unmarked(p) if p == pid));
         std::thread::sleep(Duration::from_millis(200));
         assert!(
             child.try_wait().unwrap().is_none(),

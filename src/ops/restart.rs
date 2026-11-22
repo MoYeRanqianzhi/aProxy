@@ -59,7 +59,9 @@ pub enum RestartFailure {
 #[derive(Debug)]
 pub enum PrecheckError {
     /// 期望状态记录读不懂（损坏，或由更新的版本写下）。`reason` 是给人看的原因
-    RecordUnreadable { reason: String },
+    RecordUnreadable {
+        reason: aproxy_ipc::registry::Unreadable,
+    },
     /// 配置文件已不存在
     ConfigMissing { path: PathBuf },
     /// 配置解析或校验不通过
@@ -118,7 +120,7 @@ pub async fn restart_in(
         Ok(None) => return Err(RestartFailure::Unsupported),
         Err(reason) => {
             return Err(RestartFailure::Precheck(PrecheckError::RecordUnreadable {
-                reason: reason.to_string(),
+                reason,
             }));
         }
     };

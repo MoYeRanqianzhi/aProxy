@@ -10,6 +10,34 @@
 pub use aproxy_ipc::registry::{RecordIdentity, process_exited, record_identity};
 use std::path::PathBuf;
 
+#[path = "i18n/process.rs"]
+mod text;
+use aproxy_ipc::i18n::Lang;
+
+/// 拒绝或未能按标记终止进程。台账提供的原始系统证据保留在原因中。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminationError {
+    /// 缺少身份锚点，不能安全终止。
+    Unmarked(u32),
+    /// 记录的进程已退出或 PID 已复用。
+    Gone(u32),
+    /// 经过核验，属主不是当前用户。
+    Other(u32, String),
+    /// 系统未能结束进程。
+    Failed(u32, String),
+}
+impl TerminationError {
+    /// 按接收方语言说明同一项身份核验或系统错误。
+    pub fn render(&self, lang: Lang) -> String {
+        match self {
+            Self::Unmarked(pid) => text::unmarked(lang, *pid),
+            Self::Gone(pid) => text::gone(lang, *pid),
+            Self::Other(pid, owner) => text::other(lang, *pid, owner),
+            Self::Failed(pid, why) => text::failed(lang, *pid, why),
+        }
+    }
+}
+
 /// 查询进程创建时间（FILETIME/滴答）；进程不存在返回 None。
 /// 供 spawn 前登记与收养时建立身份基线。
 pub fn process_start_time(pid: u32) -> Option<u64> {
@@ -32,12 +60,10 @@ pub fn process_image_path(pid: u32) -> Option<PathBuf> {
 ///
 /// 空的 `expected_start` 不是可比对的锚点，直接拒绝。不符、已退出、结束失败均返回 Err
 /// （信息已含原因）——宁可漏杀不误杀。阻塞调用。
-pub fn terminate_marked_process(pid: u32, expected_start: &str) -> Result<(), String> {
+pub fn terminate_marked_process(pid: u32, expected_start: &str) -> Result<(), TerminationError> {
     use aproxy_ipc::ledger;
     if expected_start.is_empty() {
-        return Err(format!(
-            "pid {pid} 没有登记启动标记，无法核验身份，拒绝终止以防误杀"
-        ));
+        return Err(TerminationError::Unmarked(pid));
     }
     let entry = ledger::LedgerEntry {
         ledger: ledger::LEDGER_FORMAT,
@@ -52,13 +78,9 @@ pub fn terminate_marked_process(pid: u32, expected_start: &str) -> Result<(), St
     };
     match ledger::terminate(&entry, std::time::Duration::from_secs(5)) {
         ledger::Termination::Terminated => Ok(()),
-        ledger::Termination::AlreadyGone => Err(format!(
-            "pid {pid} 已不是记录里的那个进程（已退出，或 pid 已被复用），未终止"
-        )),
-        ledger::Termination::NotOwned(owner) => {
-            Err(format!("pid {pid} 属于别的用户（{owner}），未终止"))
-        }
-        ledger::Termination::Failed(why) => Err(format!("终止 pid {pid} 失败（{why}）")),
+        ledger::Termination::AlreadyGone => Err(TerminationError::Gone(pid)),
+        ledger::Termination::NotOwned(owner) => Err(TerminationError::Other(pid, owner)),
+        ledger::Termination::Failed(why) => Err(TerminationError::Failed(pid, why)),
     }
 }
 
@@ -424,7 +446,7 @@ pub(crate) mod tests {
         // 标记不符（pid 被复用的形态）与没有登记标记：都拒绝，子进程必须仍在
         assert!(terminate_marked_process(pid, &format!("{start}0")).is_err());
         let err = terminate_marked_process(pid, "").unwrap_err();
-        assert!(err.contains("核验"), "{err}");
+        assert!(matches!(err, TerminationError::Unmarked(p) if p == pid));
         std::thread::sleep(Duration::from_millis(200));
         assert!(
             child.try_wait().unwrap().is_none(),

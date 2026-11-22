@@ -1,7 +1,7 @@
 //! `aproxy status [--idle|--busy] [--json]`：只读清点 home 里的实例、记录与其他进程。
 
 #[path = "../i18n/status.rs"]
-mod text;
+pub(super) mod text;
 use aproxy_ipc::i18n::current;
 
 use aproxy::daemon;

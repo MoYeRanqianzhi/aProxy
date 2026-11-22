@@ -506,7 +506,7 @@ impl ExitEvidence {
         };
         // 超过旧读者上限的上下文不给它；保留原来的有限摘录，不在私有参数里绕过截断。
         if item.reason == reason {
-            item.render = Some(serde_json::to_value(cause)?);
+            item.render = serde_json::to_value(cause).ok();
         }
         let mut bytes = serde_json::to_vec(&item)?;
         if bytes.len() > 32 * 1024 {
@@ -847,6 +847,33 @@ mod tests {
         assert_eq!(state.failed_at, Some(InstallPhase::Downloaded));
         assert_eq!(state.error_details, Some(*error.details));
         assert_eq!(state.error_code.as_deref(), Some("install_restart_failed"));
+    }
+
+    #[test]
+    fn private_records_keep_only_recognized_refusal_arguments() {
+        use super::super::{InstallFailure, reason::Cause};
+        let home = tempfile::tempdir().unwrap();
+        for (code, known) in [("invalid_state", true), ("future", false)] {
+            let mut state = InstallState::new_marking("v", InstallSource::Github);
+            let cause = Cause::Halted(Box::new(Cause::Control(Box::new(
+                aproxy_ipc::client::IpcError::Remote {
+                    code: code.into(),
+                    message: "received".into(),
+                    details: serde_json::json!({"state":"stopping","token":"private-extra"}),
+                },
+            ))));
+            let failure = InstallFailure::because("install_failed", cause.clone());
+            fail_in(home.path(), &mut state, &failure);
+            ExitEvidence::record(home.path(), &state, "install_failed", &cause).unwrap();
+            let exit = ExitEvidence::read(home.path(), &state).unwrap();
+            for render in [&state.error_render, &exit.render] {
+                assert_eq!(render.is_some(), known);
+                if let Some(r) = render {
+                    assert!(!r.to_string().contains("private-extra"));
+                    assert!(r.to_string().contains("stopping"));
+                }
+            }
+        }
     }
 
     #[test]

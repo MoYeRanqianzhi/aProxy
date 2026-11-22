@@ -136,8 +136,36 @@ impl IpcError {
                 let localized = (lang == Lang::Zh)
                     .then(|| text::remote(lang, code, details))
                     .flatten();
-                text::refused(lang, code, localized.as_deref().unwrap_or(message))
+                text::refused(
+                    lang,
+                    &terminal_safe(code),
+                    &terminal_safe(localized.as_deref().unwrap_or(message)),
+                )
             }
+        }
+    }
+
+    /// Project refusal data before serializing private install evidence. Other variants
+    /// carry local transport diagnostics rather than peer-supplied detail objects.
+    pub fn render_evidence(&self) -> Option<Self> {
+        if let Self::Remote {
+            code,
+            message,
+            details,
+        } = self
+        {
+            let fields = text::fields(code, details)?;
+            Some(Self::Remote {
+                code: code.clone(),
+                message: terminal_safe(message),
+                details: fields
+                    .iter()
+                    .map(|&k| (k.to_owned(), details[k].clone()))
+                    .collect::<serde_json::Map<_, _>>()
+                    .into(),
+            })
+        } else {
+            Some(self.clone())
         }
     }
 
@@ -150,6 +178,12 @@ impl IpcError {
             other => other,
         }
     }
+}
+
+fn terminal_safe(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '�' } else { c })
+        .collect()
 }
 
 /// Process and protocol identity of one run. A port or a PID alone can be reused.
@@ -918,6 +952,34 @@ mod imp {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn inconsistent_peer_arguments_use_safe_received_words() {
+        for (code, details) in [
+            ("invalid_state", serde_json::json!({"state":"other"})),
+            (
+                "not_found",
+                serde_json::json!({"request_id":"a", "reason":"\x1b"}),
+            ),
+            ("unknown_op", serde_json::json!({"op":"a".repeat(129)})),
+            ("busy", serde_json::json!({"limit":0})),
+            ("bad\x07", serde_json::json!({})),
+        ] {
+            let err = IpcError::Remote {
+                code: code.into(),
+                message: "received\x1b evidence".into(),
+                details,
+            };
+            for lang in [Lang::En, Lang::Zh] {
+                let msg = err.render(lang);
+                assert!(
+                    msg.contains("received� evidence") && !msg.contains(char::is_control),
+                    "{msg:?}"
+                );
+            }
+            assert!(err.render_evidence().is_none());
+        }
+    }
 
     /// A changed phrase is not a change of error identity. Decode the actual reply, then
     /// substitute unrelated prose to check that the Chinese reader uses only code/details.

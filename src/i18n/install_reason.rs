@@ -60,7 +60,7 @@ message!(cannot_abort(phase:InstallPhase), en: "The installation has reached bin
 #[serde(tag = "id", content = "args", rename_all = "snake_case")]
 pub enum Cause {
     /// 控制端点已判定的拒绝或传输原因，不匹配错误句子。
-    Control(Box<aproxy_ipc::client::IpcError>),
+    Control(#[serde(serialize_with = "control_evidence")] Box<aproxy_ipc::client::IpcError>),
     /// 恢复记录的诊断沿用解析器的原因。
     Diagnostic(Box<aproxy_ipc::i18n::diagnostic::Reason>),
     /// 重启接手者留下的启动证据；公开码不包含日志或本地化信息。
@@ -136,6 +136,16 @@ pub enum Cause {
         cause: Box<Cause>,
         error: String,
     },
+}
+// 从任何嵌套的安装原因进入这条边界，都只能写入该公开码允许的排版参数。
+fn control_evidence<S: serde::Serializer>(
+    error: &aproxy_ipc::client::IpcError,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    error
+        .render_evidence()
+        .ok_or_else(|| serde::ser::Error::custom("no render evidence for this refusal"))?
+        .serialize(serializer)
 }
 message!(sources(asset:&str,errors:&str),en:"All download sources failed (asset {asset}):\n  {errors}",zh:"下载链条全失败（asset {asset}）:\n  {errors}");
 impl Cause {

@@ -70,10 +70,89 @@ crate::message!(not_found(request_id: &str, reason: &str), en: "nothing to retur
 
 crate::message!(busy(limit: u64), en: "all {limit} streaming connections are in use", zh: "{limit} 条流式连接已全部占用");
 
+/// Only these arguments participate in rendering. Ignore extension fields instead of
+/// copying an entire peer object to disk. Unrecognized data has no private projection.
+pub(crate) fn fields(code: &str, d: &serde_json::Value) -> Option<&'static [&'static str]> {
+    use crate::wire::error_code::*;
+    fn token(v: &serde_json::Value) -> Option<&str> {
+        v.as_str().filter(|s| {
+            !s.is_empty()
+                && s.len() <= 128
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+        })
+    }
+    Some(match code {
+        BAD_REQUEST => match d["reason"].as_str()? {
+            "incomplete_line" | "not_json" | "missing_v" | "missing_op" | "args_not_object"
+                if d.get("arg").is_none() =>
+            {
+                &["reason"]
+            }
+            "missing_arg" | "invalid_arg"
+                if matches!(
+                    d["arg"].as_str()?,
+                    "request_id"
+                        | "offset"
+                        | "limit"
+                        | "before"
+                        | "part"
+                        | "attempt"
+                        | "keep_restore"
+                        | "if_idle_secs"
+                        | "ttl_secs"
+                ) =>
+            {
+                &["reason", "arg"]
+            }
+            _ => return None,
+        },
+        UNSUPPORTED_VERSION
+            if d["supported"].as_array().is_some_and(|a| {
+                !a.is_empty()
+                    && a.len() <= 16
+                    && a.iter().all(|n| {
+                        n.as_u64()
+                            .is_some_and(|v| (1..=u32::MAX as u64).contains(&v))
+                    })
+            }) =>
+        {
+            &["supported"]
+        }
+        UNKNOWN_OP if token(&d["op"]).is_some() => &["op"],
+        UNSUPPORTED_ARG
+            if d["args"].as_array().is_some_and(|a| {
+                !a.is_empty() && a.len() <= 32 && a.iter().all(|v| token(v).is_some())
+            }) =>
+        {
+            &["args"]
+        }
+        INVALID_STATE if matches!(d["state"].as_str()?, "starting" | "stopping") => &["state"],
+        CONDITION_NOT_MET if d["idle_ms"].is_u64() => &["idle_ms"],
+        NOT_FOUND
+            if token(&d["request_id"]).is_some()
+                && matches!(
+                    d["reason"].as_str()?,
+                    "not_retained" | "unknown_request" | "evicted" | "no_such_part"
+                ) =>
+        {
+            &["request_id", "reason"]
+        }
+        BUSY if d["limit"]
+            .as_u64()
+            .is_some_and(|v| (1..=u32::MAX as u64).contains(&v)) =>
+        {
+            &["limit"]
+        }
+        _ => return None,
+    })
+}
+
 /// Reconstruct only known details. The request version is local to this client;
 /// the peer advertises its supported versions, not the one it was sent.
 pub(crate) fn remote(lang: Lang, code: &str, details: &serde_json::Value) -> Option<String> {
     use crate::wire::{IPC_VERSION, error_code};
+    fields(code, details)?;
     Some(match code {
         error_code::BAD_REQUEST => match details["reason"].as_str()? {
             "incomplete_line" => incomplete(lang).into(),

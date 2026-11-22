@@ -80,6 +80,9 @@ mod body;
 mod decide;
 mod delivery;
 mod errors;
+/// 数据面和清点命令共享已脱敏的原因，不让终端语言进入代理协议。
+#[path = "../i18n/data.rs"]
+pub mod failure_text;
 mod forward_only;
 mod handler;
 mod headers;

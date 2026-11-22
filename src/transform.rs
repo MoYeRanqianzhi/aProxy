@@ -10,7 +10,7 @@ use std::{
 };
 use tokio::io::AsyncWriteExt;
 #[path = "i18n/format_fault.rs"]
-mod fault_text;
+pub(crate) mod fault_text;
 mod pool;
 pub(crate) use pool::{Fault, Pool, StreamWorker};
 /// 头表 → 信封：键小写（HeaderMap 迭代即小写）、跳过 hop-by-hop 头（含

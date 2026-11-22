@@ -180,7 +180,7 @@ fn print_live(live: &[&Enumerated], now: u64) {
                 } else {
                     format!("{}: ", e.code)
                 },
-                &e.message,
+                &aproxy::proxy::failure_text::recent(e, current()),
                 &humanize_duration(now.saturating_sub(e.at) / 1000),
             ),
             None => text::no_error(current()).to_string(),

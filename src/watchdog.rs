@@ -1142,8 +1142,12 @@ async fn respawn_instance(
             cfg.display()
         )));
     }
-    let exe = std::env::current_exe()
-        .map_err(|e| RespawnError::Other(format!("无法定位自身可执行文件: {e}")))?;
+    let exe = std::env::current_exe().map_err(|e| {
+        RespawnError::Other(crate::install::reason::self_exe(
+            aproxy_ipc::i18n::Lang::En,
+            &e.to_string(),
+        ))
+    })?;
     // 就绪的判定按新 pid 在注册表里定位（见 crate::spawn）：重拉用的是记录里的规格，但配置
     // 可能已被用户改动（换端口）——新实例监听新端口时 ping 旧端口永远不通（与 restart 同款
     // 实测坑）。spawn_from_spec 只读注册表、不做 list_instances_in 那种验活清理：后者的副作用

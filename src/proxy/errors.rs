@@ -104,7 +104,7 @@ impl AttemptFailure {
     pub(super) fn connect_failed(reason: String) -> Self {
         Self::new(
             "upstream_connect_failed",
-            format!("could not connect to the upstream: {reason}"),
+            super::failure_text::connect(aproxy_ipc::i18n::Lang::En, &reason),
             json!({ "reason": reason }),
         )
     }
@@ -114,7 +114,7 @@ impl AttemptFailure {
         let timeout_ms = millis(timeout);
         Self::new(
             "upstream_connect_timeout",
-            format!("connecting to the upstream timed out after {timeout_ms} ms"),
+            super::failure_text::connect_timeout(aproxy_ipc::i18n::Lang::En, timeout_ms),
             json!({ "timeout_ms": timeout_ms }),
         )
     }
@@ -124,7 +124,7 @@ impl AttemptFailure {
         let timeout_ms = millis(timeout);
         Self::new(
             "upstream_first_byte_timeout",
-            format!("no response headers from the upstream within {timeout_ms} ms"),
+            super::failure_text::first_byte(aproxy_ipc::i18n::Lang::En, timeout_ms),
             json!({ "timeout_ms": timeout_ms }),
         )
     }
@@ -134,9 +134,7 @@ impl AttemptFailure {
         let timeout_ms = millis(timeout);
         Self::new(
             "upstream_read_idle_timeout",
-            format!(
-                "the upstream sent nothing for {timeout_ms} ms after {received_bytes} bytes of the response body"
-            ),
+            super::failure_text::idle(aproxy_ipc::i18n::Lang::En, timeout_ms, received_bytes),
             json!({ "timeout_ms": timeout_ms, "received_bytes": received_bytes }),
         )
     }
@@ -145,9 +143,7 @@ impl AttemptFailure {
     pub(super) fn body_interrupted(received_bytes: u64, reason: String) -> Self {
         Self::new(
             "upstream_body_interrupted",
-            format!(
-                "the upstream connection broke after {received_bytes} bytes of the response body: {reason}"
-            ),
+            super::failure_text::interrupted(aproxy_ipc::i18n::Lang::En, received_bytes, &reason),
             json!({ "received_bytes": received_bytes, "reason": reason }),
         )
     }
@@ -159,13 +155,13 @@ impl AttemptFailure {
         let mut failure = if status.is_client_error() || status.is_server_error() {
             Self::new(
                 "upstream_status",
-                format!("the upstream returned {code}"),
+                super::failure_text::status(aproxy_ipc::i18n::Lang::En, code),
                 json!({ "status": code }),
             )
         } else {
             Self::new(
                 "upstream_error_body",
-                format!("the upstream returned {code} with an error in the body"),
+                super::failure_text::error_body(aproxy_ipc::i18n::Lang::En, code),
                 json!({ "status": code }),
             )
         };
@@ -230,9 +226,7 @@ impl Terminal {
     pub(super) fn inbound_host_rejected(host: &str) -> Self {
         Self::new(
             "inbound_host_rejected",
-            format!(
-                "the Host {host:?} is not allowed; add it (without the port) to allowed_hosts in config.toml, or set allowed_hosts = [\"*\"] to turn the check off"
-            ),
+            super::failure_text::host(aproxy_ipc::i18n::Lang::En, host),
             json!({ "host": host }),
         )
     }
@@ -241,9 +235,7 @@ impl Terminal {
     pub(super) fn inbound_origin_rejected(origin: &str) -> Self {
         Self::new(
             "inbound_origin_rejected",
-            format!(
-                "requests from the web page origin {origin:?} are not allowed; add it to allowed_origins in config.toml, or set allowed_origins = [\"*\"] to turn the check off"
-            ),
+            super::failure_text::origin(aproxy_ipc::i18n::Lang::En, origin),
             json!({ "origin": origin }),
         )
     }
@@ -252,9 +244,7 @@ impl Terminal {
     pub(super) fn request_too_large(limit_bytes: usize) -> Self {
         Self::new(
             "request_too_large",
-            format!(
-                "the request body exceeds the limit of {limit_bytes} bytes; raise max_request_mb in config.toml"
-            ),
+            super::failure_text::request_size(aproxy_ipc::i18n::Lang::En, limit_bytes as u64),
             json!({ "limit_bytes": limit_bytes }),
         )
     }
@@ -263,7 +253,7 @@ impl Terminal {
     pub(super) fn client_body_aborted() -> Self {
         Self::new(
             "client_body_aborted",
-            "reading the request body failed: the client stopped sending".to_string(),
+            super::failure_text::aborted(aproxy_ipc::i18n::Lang::En).to_string(),
             json!({}),
         )
     }
@@ -272,7 +262,7 @@ impl Terminal {
     pub(super) fn upgrade_unsupported(upgrade: &str) -> Self {
         Self::new(
             "upgrade_unsupported",
-            format!("connection upgrades ({upgrade}) are not supported"),
+            super::failure_text::upgrade(aproxy_ipc::i18n::Lang::En, upgrade),
             json!({ "upgrade": upgrade }),
         )
     }
@@ -290,9 +280,7 @@ impl Terminal {
     pub(super) fn response_too_large(limit_bytes: usize) -> Self {
         Self::new(
             "response_too_large",
-            format!(
-                "the upstream response exceeds the limit of {limit_bytes} bytes; raise max_response_mb in config.toml"
-            ),
+            super::failure_text::response_size(aproxy_ipc::i18n::Lang::En, limit_bytes as u64),
             json!({ "limit_bytes": limit_bytes }),
         )
     }
@@ -348,9 +336,7 @@ impl Terminal {
         let encoding = secrets.replace(encoding);
         Self::new(
             "decode_failed",
-            format!(
-                "the upstream response used the content-encoding {encoding:?}, which the already committed stream cannot carry, and decoding it failed"
-            ),
+            super::failure_text::decode(aproxy_ipc::i18n::Lang::En, &encoding),
             json!({ "encoding": encoding }),
         )
     }

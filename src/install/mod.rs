@@ -218,7 +218,7 @@ pub fn lock_path_in(home: &Path) -> PathBuf {
 
 /// 持有中的安装锁，析构即释放。锁是文件句柄上的操作系统锁（见 [`lock_install_in`]），
 /// 持有者进程死亡时由系统自动释放，所以崩溃不会留下打不开的死锁。
-#[must_use = "锁在析构时释放，要让它活到 bin/ 改完"]
+#[must_use = "keep the installation lock alive until changes to bin/ are complete"]
 pub struct InstallLock {
     file: std::fs::File,
 }

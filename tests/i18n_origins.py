@@ -108,6 +108,7 @@ unknown_arg invalid_state idle_condition not_found busy""".split())
                 diagnostic |= path.relative_to(ROOT).as_posix() == "src/i18n/restart.rs" and name in {"starting", "starting_state", "changed_state"}
                 diagnostic |= path.relative_to(ROOT).as_posix() == "src/i18n/format_fault.rs" and name in {"open", "spawn", "io", "died", "timeout", "protocol", "invalid", "stages", "handshake"}
                 diagnostic |= path.relative_to(ROOT).as_posix() == "src/i18n/install_reason.rs" and name in {"panic_at", "no_terminal", "saving", "exit_status", "no_status"}
+                diagnostic |= path.relative_to(ROOT).as_posix() == "src/i18n/data.rs" and name in {"connect", "connect_timeout", "first_byte", "idle", "interrupted", "status", "error_body", "host", "origin", "request_size", "response_size", "aborted", "upgrade", "decode", "decision", "format_error"}
                 unexpected += not (known or diagnostic)
                 reason = "no previous Chinese help" if known else "English-only diagnostic" if diagnostic else "REVIEW"
                 print(f"{path.relative_to(ROOT)}:{line} {name}: {value!r} ({reason})")

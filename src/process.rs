@@ -178,9 +178,10 @@ mod imp {
             } else if GetExitCodeProcess(h, &mut code) != 0 && code != 259 {
                 Err(format!("pid {pid} has exited"))
             } else if TerminateProcess(h, 1) == 0 {
-                Err(format!(
-                    "could not terminate pid {pid} ({})",
-                    std::io::Error::last_os_error()
+                Err(super::text::failed(
+                    super::Lang::En,
+                    pid,
+                    &std::io::Error::last_os_error().to_string(),
                 ))
             } else {
                 Ok(())
@@ -275,9 +276,10 @@ mod imp {
         if r == 0 {
             Ok(())
         } else {
-            Err(format!(
-                "could not terminate pid {pid} ({})",
-                std::io::Error::last_os_error()
+            Err(super::text::failed(
+                super::Lang::En,
+                pid,
+                &std::io::Error::last_os_error().to_string(),
             ))
         }
     }

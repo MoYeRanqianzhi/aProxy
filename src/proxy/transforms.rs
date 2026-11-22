@@ -500,7 +500,11 @@ impl RequestChain {
                     Err(e) if pool.entry.required => {
                         return Err(ChainError::Retry(AttemptFailure::new(
                             "format_error",
-                            format!("format '{safe}': {e}"),
+                            super::failure_text::format_error(
+                                aproxy_ipc::i18n::Lang::En,
+                                &safe,
+                                &e.to_string(),
+                            ),
                             json!({"format":safe,"stage":stage,"kind":e.kind()}),
                         )));
                     }

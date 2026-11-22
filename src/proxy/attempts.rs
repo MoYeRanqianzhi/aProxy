@@ -793,7 +793,7 @@ pub(super) async fn run_attempts(
                     let failure = previous.unwrap_or_else(|| {
                         let mut f = AttemptFailure::new(
                             "format_decision",
-                            format!("format '{name}' rejected the successful attempt"),
+                            super::failure_text::decision(aproxy_ipc::i18n::Lang::En, name),
                             serde_json::json!({"format":name}),
                         );
                         f.status = original.as_ref().map(|r| r.status.as_u16());

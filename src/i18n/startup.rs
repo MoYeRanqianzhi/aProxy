@@ -159,6 +159,33 @@ struct ReportDetails {
     stamp: String,
 }
 impl LaunchReport {
+    // 交接槽不是额外的日志通道；丢弃放不进摘录、带控制字符或无法验证的排版参数。
+    fn bounded_payload(&self) -> Option<Vec<u8>> {
+        const MAX_BYTES: usize = 32 * 1024;
+        let mut buf = vec![0; MAX_BYTES];
+        let mut writer = std::io::Cursor::new(buf.as_mut_slice());
+        serde_json::to_writer(&mut writer, self).ok()?;
+        let len = writer.position() as usize;
+        buf.truncate(len);
+        fn clean(v: &serde_json::Value) -> bool {
+            match v {
+                serde_json::Value::String(s) => !s.contains(char::is_control),
+                serde_json::Value::Object(m) => m.values().all(clean),
+                serde_json::Value::Array(a) => a.iter().all(clean),
+                _ => true,
+            }
+        }
+        (self.code == self.render.code()
+            && clean(&serde_json::from_slice(&buf).ok()?)
+            && self
+                .render
+                .render(Lang::En)
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count()
+                <= super::StartupLog::MAX_LINES)
+            .then_some(buf)
+    }
     /// 在启动者自己的交接槽内保存失败原因。只打开现有普通文件，不跟随符号链接，
     /// 不覆盖其他命名的用户文件，也不重新创建启动者超时后已删除的规格。
     pub fn publish(self, run_dir: &Path, slot: &Path) {
@@ -190,7 +217,12 @@ impl LaunchReport {
                 windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
             );
         }
-        let Ok(file) = options.open(slot) else { return };
+        let Some(payload) = self.bounded_payload() else {
+            return;
+        };
+        let Ok(mut file) = options.open(slot) else {
+            return;
+        };
         let Ok(metadata) = file.metadata() else {
             return;
         };
@@ -230,7 +262,8 @@ impl LaunchReport {
             }
         }
         if file.set_len(0).is_ok() {
-            let _ = serde_json::to_writer(file, &self);
+            use std::io::Write;
+            let _ = file.write_all(&payload);
         }
     }
     /// 把日志写者实际用的时间戳与同一条原因配对，旧读者不认识这个文档便沿用日志摘录。
@@ -244,6 +277,7 @@ impl LaunchReport {
     pub(super) fn localized_lines(&self, original: &[String], lang: Lang) -> Option<Vec<String>> {
         // 多个实例共用 startup.log；只有本进程选择的启动槽里的原因和完整的原始行均吻合，
         // 才在终端上显示译文。重名、截断或并发交错都保留英文证据，不猜哪一行来自本实例。
+        self.bounded_payload()?;
         let block = |lang| {
             format!("[{}] {}", self.details.stamp, self.render.render(lang))
                 .lines()
@@ -269,6 +303,34 @@ impl LaunchReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_arguments_cannot_extend_the_excerpt() {
+        for path in [
+            "p".repeat(32 * 1024),
+            "private\x1bfield".into(),
+            "line\nbreak".into(),
+        ] {
+            let report = LaunchReport::new(LaunchReason::Missing { path }, "t".into());
+            assert!(report.bounded_payload().is_none());
+        }
+        let report = LaunchReport::new(
+            LaunchReason::Missing {
+                path: "outside excerpt".into(),
+            },
+            "t".into(),
+        );
+        let err = super::super::SpawnError::Exited {
+            pid: 1,
+            format: None,
+            report: Some(Box::new(report)),
+            startup_log: super::super::StartupLog {
+                path: "startup.log".into(),
+                lines: vec!["different record".into()],
+            },
+        };
+        assert!(serde_json::to_value(err.evidence()).unwrap()["report"].is_null());
+    }
 
     #[test]
     fn translates_only_one_complete_matching_record() {

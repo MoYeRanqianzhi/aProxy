@@ -131,7 +131,14 @@ impl SpawnError {
                 path: l.path.to_string_lossy().as_ref().into(),
                 lines: l.lines.clone(),
             }),
-            report: self.report().cloned().map(Box::new),
+            report: self
+                .report()
+                .filter(|r| {
+                    self.startup_log()
+                        .is_some_and(|log| r.localized_lines(&log.lines, Lang::En).is_some())
+                })
+                .cloned()
+                .map(Box::new),
         }
     }
     /// 单独排版故障摘要，使清点/日志和终端可以共用原因而不共用语言。

@@ -85,7 +85,9 @@
      只在安装前逐条弹窗（见 [w5e-extensions](w5e-extensions.md) 顶部）。这 12 个修复**不合入**，分支留作参考；v24 的结论随之作废。
 9b. **t10b：扩展改成「安装入口 + 接口暴露 + 安装前的可信度检查」**（下一份任务书，Rust 侧）
    - 范围：按 [w5e-extensions](w5e-extensions.md) 顶部一节：主题包与扩展包的读取、安装、列出、启停、卸载；包文件 sha256；
-     GitHub 仓库信息与 release asset 摘要的查询（走更新下载的代理设置）；两步安装的桌面命令；删掉 master 上 t10 的沙箱、
+     GitHub 仓库信息与 release asset 摘要的查询（走更新下载的代理设置）；两步安装的桌面命令；manifest 与文件按
+     [w5e-extensions](w5e-extensions.md) 顶部「包的标准」校验；`desktop.toml` 换掉 `preferences.json`；扩展的设置、键值与
+     文件命令（数据在 `<home>/desktop/extension-data/<id>/`）；删掉 master 上 t10 的沙箱、
      租约、授权与审计代码。顺带下面 9a 的 `url` 升级。
    - 验收：临时 home 里装、启停、卸载主题包与扩展包；GitHub 查询用本机假服务器测四种情况（通过、哈希不符、低 star、连不上），
      不碰真实 GitHub；两个变体全量过。

@@ -27,6 +27,72 @@ Gate F 已过）加深的正是这些，不合入，留作参考。master 上已
    - star 低于阈值（先定 50）：**额外弹窗**。
    - GitHub API 连不上、被限流、仓库不存在，或地址不是 GitHub：上面几项都没查成，**额外弹窗**说明没能校验。
 
+**包的标准（2026-11-23 定）。** 主题与扩展用同一种包：一个 zip 文件（根目录有 `manifest.json`），或解开的目录。
+- `manifest.json`：`schema`（1）、`kind`（`theme` | `extension`）、`id`（小写字母、数字、`.`、`-`，3–100 个字符；建议
+  `io.github.<owner>.<name>` 这样的反向域名；也是安装目录名）、`name`、`version`（semver；GitHub release 的 tag 是
+  `v<version>` 或 `<version>`）、`author`、`description`（`name` 与 `description` 可以是字符串，或按语言的对象）、
+  可选 `repository`（`https://github.com/<owner>/<repo>`，不填即闭源）、可选 `license`（SPDX 标识）。
+- 主题：根目录 `theme.json`（ThemeSpec）、可选 `theme.css`、可选 `assets/`（图片 png、jpg、webp、gif、avif、svg 与字体
+  woff2、woff、ttf、otf），可选 `README*`、`LICENSE*`。别的文件一律不收：主题是数据，不带代码。
+- 扩展：根目录 `main.mjs`，一个自包含的 ES module，导出 `activate(api)`、可选 `deactivate()`。它用 `blob:` 地址加载，
+  相对 import 解析不了，所以要打成一个文件；建议不压缩，方便审查。可选 `assets/`（经 `api.assets` 取用）、`README*`、
+  `LICENSE*`。manifest 可选 `formats`（配对的 format 程序名，即 hello 回复里的 `name`）。
+- 公开说明（建议，待用户确认）：扩展的 manifest 可选 `network`（会连接的主机名）与 `writes`（会改的东西：`config`、
+  `instances`、`updates`、`formats` 的子集）。只是说明、不做限制：安装弹窗里显示，审查 skill 拿它对照代码，对不上就是
+  危险信号。
+
+**桌面设置文件（用户 2026-11-23）。** 界面偏好从 `preferences.json` 改成可以手改的 `<home>/desktop/desktop.toml`：
+
+```toml
+lang = "system"          # system / en / zh-CN
+mode = "system"          # system / light / dark
+palette = "standard"     # soft / standard / vivid
+mica = false
+mascot = "tumbler"
+theme = "builtin"        # builtin，或已安装主题包的 id
+
+[extensions]
+enabled = ["io.github.alice.keys-panel"]       # 启用的扩展，按这个顺序加载
+
+[extensions.settings."io.github.alice.keys-panel"]   # 扩展自己的设置，内容由扩展定
+refresh_secs = 5
+```
+
+- 窗口写它时只改动到的键，保留注释、顺序与不认识的键（与 config.toml 的写法相同，用 toml_edit）。
+- 手改之后，窗口重新获得焦点时重读并生效，不用重开窗口。
+- 语法错了：窗口沿用上一次读到的值，在设置页写明哪一行错了，修好之前不写这个文件，不覆盖用户的手改；某个键的值不对
+  只忽略那个键并提示。
+- 置顶的请求仍在 `bookmarks.json`（机器数据，不给手改）。`preferences.json` 没有随任何发布出去（W5b 在 alpha.4 之后才
+  合入），直接换掉，不做迁移。
+
+**每个扩展的数据位置（用户 2026-11-23）。**
+- 包本身：`<home>/desktop/extensions/<id>/`，装好后只读，升级时整体替换。扩展不往里写：写了，装着的字节就和 release 的
+  哈希对不上，也没法干净地升级。
+- 设置（给人改的）：`desktop.toml` 的 `[extensions.settings."<id>"]`，经 `api.settings` 读写；手改之后扩展收到变化通知。
+- 数据（给程序存的）：`<home>/desktop/extension-data/<id>/`，经 `api.storage`（JSON 键值）与 `api.files`（这个目录里的
+  文件，名字不带路径）读写。升级时保留，卸载时问要不要一起删。
+- 别的地方都不是标准：`localStorage`、`sessionStorage`、IndexedDB、cookie、Cache Storage 与 service worker 和窗口页面
+  共用一个来源，扩展写进去，用户看不到、删不掉，还碰得到界面与别的扩展的数据。不做限制，但审查 skill 把它当危险信号。
+
+**安装弹窗由 Rust 用系统对话框弹出（建议，待用户确认）。** 扩展在主窗口里没有沙箱，能直接调用窗口能调的每个桌面命令
+（`window.__TAURI_INTERNALS__.invoke`），也能点页面上的按钮；主题的 CSS 能把页面上的弹窗藏起来、改掉上面的字。弹窗若画在
+页面里，已经装上的扩展或主题就能悄悄装下一个包、跳过全部提醒，「安装前提醒」这条防线就没了。改由 Rust 在安装命令里
+弹系统原生对话框（每条提醒一个，要点确认），页面里的代码与样式都碰不到；页面另外展示详细信息。代价是原生对话框样式朴素。
+提醒的文字要具体，例如「它能改实例的上游地址，把你的请求和 API key 发到别处」，比「能做你在窗口里能做的一切」更能让人停下来。
+
+**format 的数据目录（建议，待用户确认）。** 每个 `[[format]]` 条目一个目录（home 下新增的目录，名字由条目的 `name`
+安全地映射；新增目录要对照 C1–C8 冻结的 home 布局，确认只是新增），aProxy 创建它，并把绝对路径放进环境变量
+`APROXY_FORMAT_DATA`，交给这个条目的每个进程（worker 与 control）。需要落盘的 format（worker 与 control 共享的状态、
+学到的数据、缓存）放这里；审查 skill 把写到别处当危险信号。注意 format 进程继承实例的全部环境变量（`env` 表只是追加，
+`src/transform/pool.rs:814` 没有 `env_clear`），也能读用户能读的任何文件，包括 home 里明文存着 key 的 config.toml 与
+settings.json：这正是审查 format 时要盯的地方。
+
+**审查用的三个 skill（用户 2026-11-23）。** `aproxy-audit-format`、`aproxy-audit-theme`、`aproxy-audit-extension`，放在
+`.claude/skills/`、随发布出去，给替用户操作 aProxy 的 agent 用：装之前或装之后审一个包或 format，也给作者在发布前自查。
+它们查的就是上面这些标准，加上一组通用规则（闭源是风险，编译好的闭源 format 是黑箱；混淆或加密的代码是风险，开源仓库里
+讲清楚、而且能核对的才算可以；不符合数据标准本身就是危险信号）。标准在实现时若有改动，三个 skill 跟着改：t10b、t10c
+合入时主代理逐条核对一遍。评测集放 `.agents/skill-evals/<name>/`。
+
 **只有两种包：主题和扩展（用户 2026-11-23 补充）。** 主题包只放数据（颜色、CSS、图片），简单、可以分享。扩展是代码，
 可以同时做功能和外观，两者分不清也不必分：没有单独的「主题型扩展」，任何扩展都能用下面的外观接口。
 - 外观接口：界面状态（当前页面、吉祥物心情、重试与在途数、实例状态）的订阅、主题令牌（颜色变量）的读取、在窗口里挂
@@ -73,10 +139,12 @@ Gate F 已过）加深的正是这些，不合入，留作参考。master 上已
 - 官方 aproxy-format 不做热重载（用户 2026-11-23）：只在进程启动时读一次角色文件，改了文件用上面的重启让它生效。文档按这个写。
 
 **接口暴露。** 扩展模块导出 `activate(api)`。`api` 是界面 store 的薄包装：读（实例卡片、最近请求、分页日志、请求详情）、
-订阅变化、写（启动、停止、重启实例，读写配置，检查与安装更新）、外观接口、format 控制。写操作不另加授权，安装时的提醒已经说清楚了。
+订阅变化、写（启动、停止、重启实例，读写配置，检查与安装更新）、外观接口、format 控制，以及 `api.settings`、`api.storage`、
+`api.files`、`api.assets` 与在左侧导航加一页的 `api.ui.addPage`。写操作不另加授权，安装时的提醒已经说清楚了。
 
 **分工。** Codex 做 Rust 侧：包的读取与安装、列出、启停、卸载，包文件的 sha256，GitHub 查询，format 的 control 进程（hello 回复里的 control 参数、独立进程的启动与退役、实例 IPC、桌面命令），相应的桌面命令（安装分两步：
-先「检查」返回清单摘要与可信度事实，再带检查时的句柄「安装」），并删掉 master 上 t10 的沙箱、租约、授权与审计代码。
+先「检查」返回清单摘要与可信度事实，再带检查时的句柄「安装」），并删掉 master 上 t10 的沙箱、租约、授权与审计代码；按上面的标准校验 manifest 与文件；`desktop.toml` 换掉
+`preferences.json`；扩展的设置、键值与文件三组命令；（用户同意后）安装命令里弹系统对话框、format 的数据目录。
 主代理做前端：弹窗、设置页的列表、主题包的样式与图片加载、扩展加载与 `api`。
 
 **Rust contract for 0.2.0. Baseline `9f372fc0`; the native boundary is implemented, not qualified by a real window.** This adds to [Desktop API](w5b-desktop-api.md) (W5b), not to daemon IPC v1, install C1–C8, CLI commands or their JSON. Three different acts: copying a directory discovers it; enabling trusts those exact bytes to read; authorizing permits one specified kind of write. None implies the next. There is no install-from-URL or package code in the shipped page.

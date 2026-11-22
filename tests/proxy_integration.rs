@@ -26,6 +26,7 @@ use aproxy::{config::Config, proxy::AppState};
 
 mod common;
 use common::CopiedExecutable;
+use common::ReportExit as _;
 use common::{ChildGuard, TestHome, format_echo_path, free_port};
 
 // 本机环境常带 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY（指向外部代理），会把指向
@@ -4711,6 +4712,7 @@ fn cli_config_flag_rejects_missing_file_on_start() {
         .arg("--config")
         .arg(&missing)
         .output()
+        .report_exit()
         .unwrap();
     assert!(
         !out.status.success(),
@@ -4741,6 +4743,7 @@ fn cli_config_flag_scopes_config_subcommand() {
             .arg(&cfg_file)
             .args(["set", key, value])
             .output()
+            .report_exit()
             .unwrap();
         assert!(
             out.status.success(),
@@ -4764,6 +4767,7 @@ fn cli_config_flag_scopes_config_subcommand() {
         .args(["config", "show", "--config"])
         .arg(&cfg_file)
         .output()
+        .report_exit()
         .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -4788,7 +4792,7 @@ fn stale_default_config_blocks_only_commands_that_read_it() {
         .replace('\\', "/");
     let settings_path = home.path().join("settings.json");
     std::fs::write(&settings_path, format!(r#"{{"default_config": "{gone}"}}"#)).unwrap();
-    let run = |args: &[&str]| home.cmd().args(args).output().unwrap();
+    let run = |args: &[&str]| home.cmd().args(args).output().report_exit().unwrap();
 
     let show = run(&["config", "show"]);
     assert_eq!(show.status.code(), Some(4), "要读配置的命令应报错");
@@ -4836,7 +4840,7 @@ fn corrupt_settings_json_is_never_overwritten() {
         vec!["settings", "set", "language", "en"],
         vec!["settings", "unset", "aliases.keep"],
     ] {
-        let out = home.cmd().args(&args).output().unwrap();
+        let out = home.cmd().args(&args).output().report_exit().unwrap();
         assert_eq!(out.status.code(), Some(3), "{args:?} 应拒绝修改");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
@@ -4885,7 +4889,7 @@ fn hung_instance_is_reported_and_only_force_stops_it() {
     };
     aproxy::daemon::write_instance_file_in(&run_dir, &info).unwrap();
     let record = aproxy::daemon::instance_file_path_in(&run_dir, &port.to_string());
-    let run = |args: &[&str]| home.cmd().args(args).output().unwrap();
+    let run = |args: &[&str]| home.cmd().args(args).output().report_exit().unwrap();
     let port_s = port.to_string();
 
     let status = run(&["status"]);
@@ -4908,7 +4912,7 @@ fn hung_instance_is_reported_and_only_force_stops_it() {
         String::from_utf8_lossy(&graceful.stderr)
     );
     assert!(
-        dummy.0.try_wait().unwrap().is_none(),
+        dummy.0.try_wait().report_exit().unwrap().is_none(),
         "无 --force 不得终止进程"
     );
 
@@ -4921,7 +4925,7 @@ fn hung_instance_is_reported_and_only_force_stops_it() {
     );
     let mut exited = false;
     for _ in 0..50 {
-        if dummy.0.try_wait().unwrap().is_some() {
+        if dummy.0.try_wait().report_exit().unwrap().is_some() {
             exited = true;
             break;
         }
@@ -4949,7 +4953,8 @@ fn stop_from_another_home_does_not_reach_this_instance() {
         format!("base_url = \"https://home-a.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
     )
     .unwrap();
-    let run_in = |home: &TestHome, args: &[&str]| home.cmd().args(args).output().unwrap();
+    let run_in =
+        |home: &TestHome, args: &[&str]| home.cmd().args(args).output().report_exit().unwrap();
 
     let started = run_in(&home_a, &["start", "--config", cfg_file.to_str().unwrap()]);
     assert!(
@@ -5045,7 +5050,7 @@ fn daemon_without_its_control_endpoint_exits_without_registering() {
     );
     let mut exit = None;
     for _ in 0..100 {
-        if let Some(status) = late.0.try_wait().unwrap() {
+        if let Some(status) = late.0.try_wait().report_exit().unwrap() {
             exit = Some(status);
             break;
         }
@@ -5093,6 +5098,7 @@ fn cli_config_show_rejects_missing_explicit_file() {
             .args(args)
             .arg("--json")
             .output()
+            .report_exit()
             .unwrap();
         assert_eq!(
             out.status.code(),
@@ -5171,6 +5177,7 @@ fn process_alive(pid: u32) -> bool {
     let out = Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}")])
         .output()
+        .report_exit()
         .expect("tasklist 执行失败");
     String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
 }
@@ -5183,6 +5190,7 @@ fn process_alive(pid: u32) -> bool {
     Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "stat="])
         .output()
+        .report_exit()
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -5210,7 +5218,7 @@ fn daemon_lifecycle_start_status_stop() {
         ),
     )
     .unwrap();
-    let run = |args: &[&str]| home.cmd().args(args).output().unwrap();
+    let run = |args: &[&str]| home.cmd().args(args).output().report_exit().unwrap();
     home.stop_on_drop(port);
 
     let pid = spawn_daemon_in(&home, &cfg_file);
@@ -5308,7 +5316,7 @@ fn daemon_second_instance_on_same_port_exits() {
         wait_daemon_ready_in(&run_dir, port),
         "原实例应仍在运行 (pid {pid1})"
     );
-    let out = home.cmd().arg("status").output().unwrap();
+    let out = home.cmd().arg("status").output().report_exit().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains(&port.to_string()),
@@ -5349,6 +5357,7 @@ fn start_parent_command_output_returns() {
         .arg("--config")
         .arg(&cfg_file)
         .output()
+        .report_exit()
         .expect("start 父进程执行失败");
     assert!(
         out.status.success(),
@@ -5418,7 +5427,7 @@ fn logs_follows_daemon_and_exits_on_stop() {
             saw_startup = true;
             break;
         }
-        if child.try_wait().ok().flatten().is_some() {
+        if child.try_wait().report_exit().ok().flatten().is_some() {
             break; // logs 进程提前退出：断言时以已收集内容为准
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -5430,10 +5439,14 @@ fn logs_follows_daemon_and_exits_on_stop() {
     );
 
     // stop 实例 → logs 感知实例死亡后自动退出（IPC 探活），不挂死
-    let _ = home.cmd().args(["stop", &port.to_string()]).output();
+    let _ = home
+        .cmd()
+        .args(["stop", &port.to_string()])
+        .output()
+        .report_exit();
     let mut exited = false;
     for _ in 0..150 {
-        if child.try_wait().ok().flatten().is_some() {
+        if child.try_wait().report_exit().ok().flatten().is_some() {
             exited = true;
             break;
         }
@@ -5442,7 +5455,7 @@ fn logs_follows_daemon_and_exits_on_stop() {
     if !exited {
         // 兜底清理（断言仍会失败，但不能泄漏挂死的 logs 进程）
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.wait().report_exit();
     }
     assert!(exited, "实例停止后 aproxy logs 应自动退出");
     let _ = reader.join();
@@ -5463,7 +5476,7 @@ fn logs_requires_port_when_multiple_instances() {
     let port_b = free_port();
     let home = TestHome::new();
     let run_dir = home.path().join("run");
-    let run = |args: &[&str]| home.cmd().args(args).output().unwrap();
+    let run = |args: &[&str]| home.cmd().args(args).output().report_exit().unwrap();
     let start_daemon = |port: u16, name: &str| {
         let cfg_file = home.path().join(name);
         std::fs::write(
@@ -5526,6 +5539,7 @@ fn logs_reports_missing_instance() {
         .cmd()
         .args(["logs", &port.to_string()])
         .output()
+        .report_exit()
         .unwrap();
     assert_eq!(
         out.status.code(),
@@ -5577,6 +5591,7 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
         .args(["start", "--config"])
         .arg(&cfg_file)
         .output()
+        .report_exit()
         .unwrap();
     assert!(
         out.status.success(),
@@ -5612,7 +5627,12 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     assert!(restore_path.exists(), "崩溃后恢复记录应保留");
 
     // restore：一键拉起崩溃实例
-    let out = home.cmd().args(["restore", "--json"]).output().unwrap();
+    let out = home
+        .cmd()
+        .args(["restore", "--json"])
+        .output()
+        .report_exit()
+        .unwrap();
     assert!(out.status.success(), "restore 应成功");
     let result = common::output_document(&out);
     assert_eq!(result["results"][0]["outcome"], "restored");
@@ -5623,17 +5643,32 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
 
     // 幂等：再次 restore 时已在运行 → 跳过而非报错/重复启动（隔离目录内
     // 只有本测试实例，断言确定性成立）
-    let out = home.cmd().args(["restore", "--json"]).output().unwrap();
+    let out = home
+        .cmd()
+        .args(["restore", "--json"])
+        .output()
+        .report_exit()
+        .unwrap();
     assert!(out.status.success());
     let result = common::output_document(&out);
     assert_eq!(result["results"][0]["outcome"], "already_running");
     assert_eq!(result["results"][0]["port"], port);
 
     // 优雅停止：恢复记录被删除，此后 restore 不再恢复本端口
-    let out = home.cmd().args(["stop", &port_str]).output().unwrap();
+    let out = home
+        .cmd()
+        .args(["stop", &port_str])
+        .output()
+        .report_exit()
+        .unwrap();
     assert!(out.status.success(), "stop 恢复实例应成功");
     assert!(!restore_path.exists(), "优雅停止后恢复记录应被删除");
-    let out = home.cmd().args(["restore", "--json"]).output().unwrap();
+    let out = home
+        .cmd()
+        .args(["restore", "--json"])
+        .output()
+        .report_exit()
+        .unwrap();
     assert!(out.status.success(), "restore 应静默成功（空目录）");
     let result = common::output_document(&out);
     assert_eq!(result["results"], serde_json::json!([]));
@@ -5660,6 +5695,7 @@ fn port_zero_restore_record_uses_actual_port() {
         .args(["start", "--config"])
         .arg(&cfg_file)
         .output()
+        .report_exit()
         .unwrap();
     assert!(
         out.status.success(),
@@ -5721,7 +5757,12 @@ fn port_zero_restore_record_uses_actual_port() {
     home.stop_on_drop(port.parse().unwrap());
 
     // 优雅停止后记录必须消失——「残留 + 复活」缺陷的回归断言
-    let out = home.cmd().args(["stop", &port]).output().unwrap();
+    let out = home
+        .cmd()
+        .args(["stop", &port])
+        .output()
+        .report_exit()
+        .unwrap();
     assert!(
         out.status.success(),
         "stop 应成功: status {} (code {:?}) daemon pid {} port {} stdout {:?} stderr {:?}",
@@ -5764,6 +5805,7 @@ fn alias_start_and_stop_roundtrip() {
         .args(["alias", "add", &alias])
         .arg(&cfg_file)
         .output()
+        .report_exit()
         .unwrap();
     assert!(
         out.status.success(),
@@ -5772,7 +5814,12 @@ fn alias_start_and_stop_roundtrip() {
     );
 
     // list 包含该别名
-    let out = home.cmd().args(["alias", "list"]).output().unwrap();
+    let out = home
+        .cmd()
+        .args(["alias", "list"])
+        .output()
+        .report_exit()
+        .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -5785,6 +5832,7 @@ fn alias_start_and_stop_roundtrip() {
         .cmd()
         .args(["start", &alias, "--json"])
         .output()
+        .report_exit()
         .unwrap();
     assert!(
         out.status.success(),
@@ -5811,7 +5859,7 @@ fn alias_start_and_stop_roundtrip() {
     assert!(ready, "别名启动的守护应就绪 (端口 {port})");
 
     // 别名启动的实例 config_path 应指向别名配置（status 可见）
-    let out = home.cmd().arg("status").output().unwrap();
+    let out = home.cmd().arg("status").output().report_exit().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("alias-test.example.com"),
@@ -5823,6 +5871,7 @@ fn alias_start_and_stop_roundtrip() {
         .cmd()
         .args(["stop", &alias, "--json"])
         .output()
+        .report_exit()
         .unwrap();
     assert!(
         out.status.success(),
@@ -5837,6 +5886,7 @@ fn alias_start_and_stop_roundtrip() {
         .cmd()
         .args(["stop", &alias, "--json"])
         .output()
+        .report_exit()
         .unwrap();
     assert_eq!(
         out.status.code(),
@@ -5847,7 +5897,11 @@ fn alias_start_and_stop_roundtrip() {
     assert_eq!(result["results"][0]["outcome"], "already_stopped");
 
     // 清理别名（无论如何执行，不留测试残留——隔离 home 内本就随 tempdir 删除）
-    let _ = home.cmd().args(["alias", "remove", &alias]).output();
+    let _ = home
+        .cmd()
+        .args(["alias", "remove", &alias])
+        .output()
+        .report_exit();
 }
 
 // ---------------------------------------------------------------------------
@@ -5864,6 +5918,7 @@ fn alias_errors_on_unknown_names() {
         .cmd()
         .args(["start", &unknown, "--json"])
         .output()
+        .report_exit()
         .unwrap();
     assert!(!out.status.success(), "start 未知别名应失败");
     let result = common::output_document(&out);
@@ -5875,6 +5930,7 @@ fn alias_errors_on_unknown_names() {
         .cmd()
         .args(["stop", &unknown, "--json"])
         .output()
+        .report_exit()
         .unwrap();
     assert!(!out.status.success(), "stop 未知别名应失败");
     let result = common::output_document(&out);
@@ -5888,6 +5944,7 @@ fn alias_errors_on_unknown_names() {
             .args(["alias", "add", bad])
             .arg("x.toml")
             .output()
+            .report_exit()
             .unwrap();
         assert!(!out.status.success(), "别名 {bad} 应被拒绝");
         let text = format!(
@@ -5904,6 +5961,7 @@ fn alias_errors_on_unknown_names() {
         .args(["alias", "add", &format!("bad-{}", std::process::id())])
         .arg("Z:/no/such/file.toml")
         .output()
+        .report_exit()
         .unwrap();
     assert!(!out.status.success(), "add 不存在的路径应失败");
     let text = format!(
@@ -5921,6 +5979,7 @@ fn alias_errors_on_unknown_names() {
         .cmd()
         .args(["alias", "remove", &unknown])
         .output()
+        .report_exit()
         .unwrap();
     assert!(!out.status.success(), "remove 不存在的别名应失败");
     let text = format!(
@@ -5945,6 +6004,7 @@ fn tilde_expands_to_the_c1_user_dir() {
         .args(["alias", "add", "tilde", "~/no-such-config.toml"])
         .env(aproxy_ipc::home::USER_DIR_ENV, user.path())
         .output()
+        .report_exit()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "{stderr}");
@@ -5983,6 +6043,7 @@ fn logs_via_alias_connects_and_follows() {
         .cmd()
         .args(["logs", &format!("no-such-logs-{}", std::process::id())])
         .output()
+        .report_exit()
         .unwrap();
     assert!(!out.status.success(), "logs 未知别名应失败");
     let text = format!(
@@ -5998,13 +6059,19 @@ fn logs_via_alias_connects_and_follows() {
         .args(["alias", "add", &alias])
         .arg(&cfg_file)
         .output()
+        .report_exit()
         .unwrap();
     assert!(
         out.status.success(),
         "alias add 应成功: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let out = home.cmd().args(["start", &alias]).output().unwrap();
+    let out = home
+        .cmd()
+        .args(["start", &alias])
+        .output()
+        .report_exit()
+        .unwrap();
     assert!(
         out.status.success(),
         "start 别名应成功: {}",
@@ -6064,7 +6131,7 @@ fn logs_via_alias_connects_and_follows() {
             saw_startup = true;
             break;
         }
-        if child.try_wait().ok().flatten().is_some() {
+        if child.try_wait().report_exit().ok().flatten().is_some() {
             break; // logs 进程提前退出：断言时以已收集内容为准
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -6076,7 +6143,12 @@ fn logs_via_alias_connects_and_follows() {
     );
 
     // stop <别名> → logs 感知实例死亡后自动退出（IPC 探活），不挂死
-    let out = home.cmd().args(["stop", &alias]).output().unwrap();
+    let out = home
+        .cmd()
+        .args(["stop", &alias])
+        .output()
+        .report_exit()
+        .unwrap();
     assert!(
         out.status.success(),
         "stop 别名应成功: {}",
@@ -6084,7 +6156,7 @@ fn logs_via_alias_connects_and_follows() {
     );
     let mut exited = false;
     for _ in 0..150 {
-        if child.try_wait().ok().flatten().is_some() {
+        if child.try_wait().report_exit().ok().flatten().is_some() {
             exited = true;
             break;
         }
@@ -6093,7 +6165,7 @@ fn logs_via_alias_connects_and_follows() {
     if !exited {
         // 兜底清理（断言仍会失败，但不能泄漏挂死的 logs 进程）
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.wait().report_exit();
     }
     assert!(exited, "实例停止后 aproxy logs 应自动退出");
     let _ = reader.join();
@@ -6105,7 +6177,12 @@ fn logs_via_alias_connects_and_follows() {
     );
 
     // 已停止后再 logs 别名：按配置匹配不到运行实例，报「未在运行」
-    let out = home.cmd().args(["logs", &alias]).output().unwrap();
+    let out = home
+        .cmd()
+        .args(["logs", &alias])
+        .output()
+        .report_exit()
+        .unwrap();
     assert!(!out.status.success(), "别名配置未运行时 logs 应失败");
     let text = format!(
         "{}{}",
@@ -6115,7 +6192,11 @@ fn logs_via_alias_connects_and_follows() {
     assert!(text.contains("has no running instance"), "实际: {text}");
 
     // 清理别名（隔离 home 内本就随 tempdir 删除，此处对齐既有别名测试的收尾）
-    let _ = home.cmd().args(["alias", "remove", &alias]).output();
+    let _ = home
+        .cmd()
+        .args(["alias", "remove", &alias])
+        .output()
+        .report_exit();
 }
 
 // ---------------------------------------------------------------------------
@@ -6176,7 +6257,7 @@ fn watchdog_respawns_killed_daemon() {
     // 强杀守护（模拟崩溃——.restore 残留 = 异常死亡信号）。守护是本测试的直接子进程：
     // 经句柄结束并立即回收，unix 上不回收它就一直是僵尸
     let _ = daemon_child.kill();
-    let _ = daemon_child.wait();
+    let _ = daemon_child.wait().report_exit();
     let new_ready = {
         let mut ok = false;
         for _ in 0..150 {
@@ -6195,11 +6276,18 @@ fn watchdog_respawns_killed_daemon() {
     let live = ipc_ping_in_dir(&rt, port, home.path()).unwrap();
     assert_ne!(live.instance.pid, orig_pid, "应是被重拉的新进程");
     // 看护者仍在运行（收养新实例继续看护）
-    assert!(wd_child.try_wait().unwrap().is_none(), "看护者不应退出");
+    assert!(
+        wd_child.try_wait().report_exit().unwrap().is_none(),
+        "看护者不应退出"
+    );
 
     // 清理：优雅 stop（.restore 删除）→ 看护者不得复活它；随后闲置自灭前
     // 先杀看护者防泄漏。stop 须带同一 APROXY_HOME（unix 的 UDS socket 在其中）
-    let _ = home.cmd().args(["stop", &port.to_string()]).output();
+    let _ = home
+        .cmd()
+        .args(["stop", &port.to_string()])
+        .output()
+        .report_exit();
     std::thread::sleep(Duration::from_secs(3));
     assert!(
         ipc_ping_in_dir(&rt, port, home.path()).is_err(),
@@ -6271,6 +6359,7 @@ fn watchdog_readiness_does_not_accept_a_starting_ping() {
         home.cmd()
             .args(["stop", &port.to_string()])
             .output()
+            .report_exit()
             .unwrap()
             .status
             .success()
@@ -6358,7 +6447,7 @@ fn watchdog_respawns_on_death_event_and_force_stop_stays_stopped() {
     // 模拟崩溃。守护是本测试的直接子进程：unix 上不 wait 就是僵尸，看护者
     // 的死亡等待要到收割后才触发——kill 后立即 wait
     let _ = daemon_child.kill();
-    let _ = daemon_child.wait();
+    let _ = daemon_child.wait().report_exit();
     let respawned = wait_ping(15).unwrap_or_else(|last| {
         panic!(
             "看护者应在扫描周期之前（死亡事件到达即）重拉守护；last ping: {last:?}\n{}",
@@ -6372,6 +6461,7 @@ fn watchdog_respawns_on_death_event_and_force_stop_stays_stopped() {
         .cmd()
         .args(["stop", &port.to_string(), "--force"])
         .output()
+        .report_exit()
         .unwrap();
     assert!(
         out.status.success(),
@@ -6392,7 +6482,10 @@ fn watchdog_respawns_on_death_event_and_force_stop_stays_stopped() {
             .exists(),
         "强停后不应留下恢复记录"
     );
-    assert!(wd_child.0.try_wait().unwrap().is_none(), "看护者不应退出");
+    assert!(
+        wd_child.0.try_wait().report_exit().unwrap().is_none(),
+        "看护者不应退出"
+    );
     drop(wd_child);
     let _ = std::fs::remove_file(home.path().join("run").join("watchdog.json"));
 }
@@ -6472,8 +6565,12 @@ fn identity_check_tolerates_swapped_binary() {
     // 经 IPC 优雅停掉守护（不等 TestHome 析构：下一步要等它退出）；守护是本测试
     // 直接 spawn 的子进程，退出后必须 wait 回收，否则在 unix 上留下僵尸
     // （clippy::zombie_processes 即为此）
-    let _ = home.cmd().args(["stop", &port.to_string()]).output();
-    let _ = daemon_child.wait();
+    let _ = home
+        .cmd()
+        .args(["stop", &port.to_string()])
+        .output()
+        .report_exit();
+    let _ = daemon_child.wait().report_exit();
 }
 
 #[test]
@@ -6493,9 +6590,12 @@ fn watchdog_lease_prevents_duplicate_watchdogs() {
     std::thread::sleep(Duration::from_secs(2));
     let mut c2 = watchdog();
     std::thread::sleep(Duration::from_secs(3));
-    assert!(c1.try_wait().unwrap().is_none(), "先任看护者应持续在任");
     assert!(
-        c2.try_wait().unwrap().is_some(),
+        c1.try_wait().report_exit().unwrap().is_none(),
+        "先任看护者应持续在任"
+    );
+    assert!(
+        c2.try_wait().report_exit().unwrap().is_some(),
         "后任看护者应因看护者记录已被占而退出"
     );
     let _ = c1.kill();
@@ -6521,12 +6621,16 @@ fn ipc_ping_in_dir(
 fn kill_pid(pid: u32) {
     let _ = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/F"])
-        .output();
+        .output()
+        .report_exit();
 }
 
 #[cfg(unix)]
 fn kill_pid(pid: u32) {
-    let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+    let _ = Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .output()
+        .report_exit();
 }
 
 // ---------------------------------------------------------------------------
@@ -6590,6 +6694,7 @@ fn ipc_stats_reflect_real_traffic() {
         .arg("--config")
         .arg(&cfg_file)
         .output()
+        .report_exit()
         .unwrap();
     assert!(
         out.status.success(),
@@ -6715,6 +6820,7 @@ fn ipc_stats_reflect_forward_only_traffic() {
         .arg("--config")
         .arg(&cfg_file)
         .output()
+        .report_exit()
         .unwrap();
     assert!(
         out.status.success(),
@@ -6846,6 +6952,7 @@ fn credentials_masked_in_start_output_registry_and_daemon_log() {
         .args(["start", "--config"])
         .arg(&cfg_file)
         .output()
+        .report_exit()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(
@@ -6972,6 +7079,7 @@ fn config_show_masks_url_credentials_and_transform_secrets() {
             .arg(&cfg_file)
             .args(args)
             .output()
+            .report_exit()
             .unwrap();
         assert!(
             out.status.success(),
@@ -7024,6 +7132,7 @@ fn non_loopback_listen_warns_on_start_and_in_startup_log() {
         .args(["start", "--config"])
         .arg(&cfg_file)
         .output()
+        .report_exit()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(!out.status.success(), "192.0.2.1 不可绑定，start 应失败");
@@ -7044,7 +7153,7 @@ fn non_loopback_listen_warns_on_start_and_in_startup_log() {
         .unwrap();
     let mut exited = false;
     for _ in 0..150 {
-        if child.try_wait().unwrap().is_some() {
+        if child.try_wait().report_exit().unwrap().is_some() {
             exited = true;
             break;
         }
@@ -7052,7 +7161,7 @@ fn non_loopback_listen_warns_on_start_and_in_startup_log() {
     }
     if !exited {
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.wait().report_exit();
         panic!("守护子进程绑定 192.0.2.1 竟未失败，测试前提不成立");
     }
     let startup_log =
@@ -7318,6 +7427,7 @@ fn unknown_config_keys_fail_start_naming_file_and_key() {
             .arg("--config")
             .arg(&cfg_file)
             .output()
+            .report_exit()
             .unwrap();
         assert!(!out.status.success(), "{key}: 应启动失败");
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -7329,7 +7439,7 @@ fn unknown_config_keys_fail_start_naming_file_and_key() {
             "{key}: 报错应指出文件、行与键，实际:\n{stderr}"
         );
     }
-    let status = home.cmd().arg("status").output().unwrap();
+    let status = home.cmd().arg("status").output().report_exit().unwrap();
     assert!(
         !String::from_utf8_lossy(&status.stdout).contains("127.0.0.1:"),
         "不应有实例被拉起"
@@ -7351,6 +7461,7 @@ fn config_command_edits_in_place_and_unsets_unknown_keys() {
             .arg(&cfg_file)
             .args(args)
             .output()
+            .report_exit()
             .unwrap()
     };
 
@@ -7470,7 +7581,7 @@ fn concurrent_config_writers_do_not_lose_updates() {
         })
         .collect();
     for child in children {
-        let out = child.wait_with_output().unwrap();
+        let out = child.wait_with_output().report_exit().unwrap();
         assert!(
             out.status.success(),
             "{}",
@@ -7775,7 +7886,7 @@ fn invalid_settings_block_start_but_not_stop_status_or_repair() {
         format!("base_url = \"https://api.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
     )
     .unwrap();
-    let run = |args: &[&str]| home.cmd().args(args).output().unwrap();
+    let run = |args: &[&str]| home.cmd().args(args).output().report_exit().unwrap();
     let cfg_arg = cfg_file.to_str().unwrap();
 
     // 先在有效的 settings 下起一个实例
@@ -7875,7 +7986,14 @@ fn invalid_settings_block_start_but_not_stop_status_or_repair() {
 fn settings_command_reads_writes_and_never_shows_secrets() {
     let home = TestHome::unborn();
     let settings_path = home.path().join("settings.json");
-    let run = |args: &[&str]| home.cmd().arg("settings").args(args).output().unwrap();
+    let run = |args: &[&str]| {
+        home.cmd()
+            .arg("settings")
+            .args(args)
+            .output()
+            .report_exit()
+            .unwrap()
+    };
     let ok = |args: &[&str]| {
         let out = run(args);
         assert!(
@@ -7937,7 +8055,7 @@ fn settings_command_reads_writes_and_never_shows_secrets() {
             .write_all(b"sk-SETTINGSSECRET-0123456789abcdef\n")
             .unwrap();
     }
-    let out = child.wait_with_output().unwrap();
+    let out = child.wait_with_output().report_exit().unwrap();
     assert!(
         out.status.success(),
         "{}",
@@ -8023,6 +8141,7 @@ fn settings_defaults_reach_config_and_credentials_follow_their_target() {
             .arg(&cfg_file)
             .args(["show", "--effective"])
             .output()
+            .report_exit()
             .unwrap();
         assert!(
             out.status.success(),

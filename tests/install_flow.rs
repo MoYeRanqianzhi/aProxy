@@ -10,6 +10,7 @@
 
 mod common;
 use common::CopiedExecutable;
+use common::ReportExit as _;
 use common::{TestHome, free_port};
 
 use std::process::{Command, Stdio};
@@ -161,6 +162,7 @@ fn install_from_without_instances_fast_path() {
     let out = env
         .install_cmd(&["--from", &from.display().to_string(), "--no-skills"])
         .output()
+        .report_exit()
         .unwrap();
     assert!(
         out.status.success(),
@@ -245,7 +247,7 @@ fn install_from_with_instance_rolling_restart() {
     let mut output = String::new();
     let _ = installer.stdout.take().unwrap().read_to_string(&mut output);
     let _ = installer.stderr.take().unwrap().read_to_string(&mut output);
-    let status = installer.wait().unwrap();
+    let status = installer.wait().report_exit().unwrap();
     assert!(
         done,
         "安装未在预期时间内完成（状态文件残留）; 输出: {output}"
@@ -287,7 +289,8 @@ fn install_from_with_instance_rolling_restart() {
         .home
         .cmd()
         .args(["stop", &env.port.to_string()])
-        .output();
+        .output()
+        .report_exit();
 }
 
 // ---------------------------------------------------------------------------
@@ -348,7 +351,11 @@ async fn jurisdiction_check_rejects_foreign_binary() {
             .is_ok()
     );
     // 在线路径同样拒绝，且在任何下载之前（显式版本号跳过 latest 查询）
-    let out = env.install_cmd(&["9.9.9", "--no-skills"]).output().unwrap();
+    let out = env
+        .install_cmd(&["9.9.9", "--no-skills"])
+        .output()
+        .report_exit()
+        .unwrap();
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -365,7 +372,8 @@ async fn jurisdiction_check_rejects_foreign_binary() {
         .home
         .cmd()
         .args(["stop", &env.port.to_string()])
-        .output();
+        .output()
+        .report_exit();
 }
 
 /// Windows：路径的 8.3 短名写法（GetShortPathNameW）。卷上没有生成短名时，返回的与
@@ -444,9 +452,10 @@ async fn jurisdiction_accepts_an_instance_started_through_a_short_path() {
         .home
         .cmd()
         .args(["stop", &env.port.to_string()])
-        .output();
+        .output()
+        .report_exit();
     let _ = child.kill();
-    let _ = child.wait();
+    let _ = child.wait().report_exit();
 
     assert!(ready, "实例未就绪");
     assert!(
@@ -511,6 +520,7 @@ fn adopt_migrates_foreign_instance() {
     let out = env
         .install_cmd(&["--adopt", "--no-skills"])
         .output()
+        .report_exit()
         .unwrap();
     assert!(
         out.status.success(),
@@ -546,7 +556,8 @@ fn adopt_migrates_foreign_instance() {
         .home
         .cmd()
         .args(["stop", &env.port.to_string()])
-        .output();
+        .output()
+        .report_exit();
 }
 
 // ---------------------------------------------------------------------------
@@ -569,7 +580,11 @@ fn abort_rolls_back_cleanly_before_swap() {
     state.staged_path = Some(staged.display().to_string());
     aproxy::install::state::write_in(&home, &mut state).unwrap();
 
-    let out = env.install_cmd(&["--abort"]).output().unwrap();
+    let out = env
+        .install_cmd(&["--abort"])
+        .output()
+        .report_exit()
+        .unwrap();
     assert!(out.status.success(), "abort 应成功");
     assert!(
         !aproxy::install::state::state_path_in(&home).exists(),
@@ -592,7 +607,11 @@ fn abort_rejected_after_swap_phase() {
     state.phase = aproxy::install::state::InstallPhase::Swapped;
     aproxy::install::state::write_in(&home, &mut state).unwrap();
 
-    let out = env.install_cmd(&["--abort"]).output().unwrap();
+    let out = env
+        .install_cmd(&["--abort"])
+        .output()
+        .report_exit()
+        .unwrap();
     assert_eq!(out.status.code(), Some(1), "swapping 后 abort 应拒绝");
     assert!(
         aproxy::install::state::state_path_in(&home).exists(),
@@ -660,6 +679,7 @@ fn install_instance_failure_exits_nonzero_and_keeps_restore() {
     let out = env
         .install_cmd(&["--from", &from.display().to_string(), "--no-skills"])
         .output()
+        .report_exit()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -682,7 +702,10 @@ fn install_instance_failure_exits_nonzero_and_keeps_restore() {
         started.elapsed() < Duration::from_secs(120),
         "失败应在有限时间内报告"
     );
-    assert!(child.try_wait().unwrap().is_none(), "原进程应继续服务");
+    assert!(
+        child.try_wait().report_exit().unwrap().is_none(),
+        "原进程应继续服务"
+    );
 
     // .restore 以原参数保住（修复前被删）
     let restore_after = std::fs::read_to_string(aproxy::spec::restore_path_in(
@@ -755,6 +778,7 @@ fn unix_install_rolls_back_instance_to_preserved_old_binary() {
     let out = env
         .install_cmd(&["--from", &fake.display().to_string(), "--no-skills"])
         .output()
+        .report_exit()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "应非零退出: {stderr}");
@@ -762,7 +786,7 @@ fn unix_install_rolls_back_instance_to_preserved_old_binary() {
         stderr.contains("old binary"),
         "应说明已用旧二进制拉回: {stderr}"
     );
-    let _ = child.wait();
+    let _ = child.wait().report_exit();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -821,7 +845,7 @@ fn start_bin_instance(env: &TestEnv, name: &str) -> std::process::Child {
         std::thread::sleep(Duration::from_millis(100));
     }
     let _ = child.kill();
-    let _ = child.wait();
+    let _ = child.wait().report_exit();
     panic!("实例未就绪");
 }
 
@@ -862,6 +886,7 @@ fn handover_to_a_target_that_never_takes_over_fails_without_touching_anything() 
     let out = env
         .install_cmd(&["--from", &fake.display().to_string(), "--no-skills"])
         .output()
+        .report_exit()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "应非零退出: {stderr}");
@@ -898,7 +923,7 @@ fn handover_to_a_target_that_never_takes_over_fails_without_touching_anything() 
         &env.port.to_string(),
         Duration::from_secs(20),
     ));
-    let _ = child.wait();
+    let _ = child.wait().report_exit();
 }
 
 // ---------------------------------------------------------------------------
@@ -936,6 +961,7 @@ fn staged_target_drives_the_install_and_its_failure_reaches_the_installer() {
     let out = env
         .install_cmd(&["--from", &wrapper.display().to_string(), "--no-skills"])
         .output()
+        .report_exit()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -986,7 +1012,7 @@ fn staged_target_drives_the_install_and_its_failure_reaches_the_installer() {
         &env.port.to_string(),
         Duration::from_secs(20),
     ));
-    let _ = child.wait();
+    let _ = child.wait().report_exit();
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,6 +1033,7 @@ fn concurrent_install_rejected_by_lock() {
     let out = env
         .install_cmd(&["--json", "--from", &from.display().to_string()])
         .output()
+        .report_exit()
         .unwrap();
     assert_eq!(out.status.code(), Some(1), "并发安装应被锁拒绝");
     let stdout = std::str::from_utf8(&out.stdout).unwrap();
@@ -1026,7 +1053,7 @@ fn version_flag_does_not_resume_a_leftover_install() {
     std::fs::create_dir_all(state.parent().unwrap()).unwrap();
     std::fs::write(&state, r#"{"phase":"aborted","target_version":"0.2.0"}"#).unwrap();
     let run = |arg: &str| {
-        let out = env.home.cmd().arg(arg).output().unwrap();
+        let out = env.home.cmd().arg(arg).output().report_exit().unwrap();
         assert!(
             out.status.success(),
             "{arg}: {}",
@@ -1093,7 +1120,7 @@ fn install_refuses_versions_below_0_2_0() {
         vec!["--from", below.as_str(), "--allow-downgrade", "--no-skills"],
         vec!["0.1.0", "--allow-downgrade", "--no-skills"],
     ] {
-        let out = env.install_cmd(&args).output().unwrap();
+        let out = env.install_cmd(&args).output().report_exit().unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
         assert!(
@@ -1128,6 +1155,7 @@ fn install_from_checks_the_variant() {
     let out = env
         .install_cmd(&["--from", from.as_str(), "--variant", other, "--no-skills"])
         .output()
+        .report_exit()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
@@ -1157,7 +1185,7 @@ fn a_desktop_build_no_channel_delivers_is_not_replaced() {
     )
     .unwrap();
     let run = |args: &[&str]| {
-        let out = env.install_cmd(args).output().unwrap();
+        let out = env.install_cmd(args).output().report_exit().unwrap();
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),

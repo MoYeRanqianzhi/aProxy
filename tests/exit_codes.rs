@@ -4,6 +4,7 @@
 //! 退出码一公布就是契约：agent 与脚本靠它与 `--json` 判断结果，不读给人看的文字。
 
 mod common;
+use common::ReportExit as _;
 use common::{ChildGuard, TestHome, free_port};
 
 use std::path::PathBuf;
@@ -18,7 +19,12 @@ fn text(bytes: &[u8]) -> String {
 
 /// 在 `home` 里运行当前构建，stdin 为空
 fn run(home: &TestHome, args: &[&str]) -> Output {
-    home.cmd().args(args).stdin(Stdio::null()).output().unwrap()
+    home.cmd()
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .report_exit()
+        .unwrap()
 }
 
 /// stdout 上恰好是一行 JSON，`schema` 为 1
@@ -249,9 +255,13 @@ fn crash(pid: u64, port: u16) {
     let status = Command::new("taskkill")
         .args(["/F", "/PID", &pid.to_string()])
         .stdout(Stdio::null())
-        .status();
+        .status()
+        .report_exit();
     #[cfg(unix)]
-    let status = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    let status = Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .report_exit();
     assert!(status.unwrap().success(), "结束 pid {pid} 失败");
     for _ in 0..100 {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
@@ -354,7 +364,7 @@ fn stop_exits_1_when_the_instance_cannot_be_stopped() {
     assert_eq!(items[0]["error"]["details"]["pid"], dummy.0.id(), "{doc}");
     plain_failure(&home, &["stop", &p], 1);
     assert!(
-        dummy.0.try_wait().unwrap().is_none(),
+        dummy.0.try_wait().report_exit().unwrap().is_none(),
         "不带 --force 不得结束进程"
     );
 }
@@ -750,4 +760,19 @@ fn doctor_exit_codes() {
             );
         }
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_abnormal_exit_is_not_a_cli_exit_code() {
+    use std::os::windows::process::ExitStatusExt;
+    use std::process::ExitStatus;
+    assert_eq!(
+        common::status_text(ExitStatus::from_raw(0xC0000374)),
+        "abnormal termination: 0xC0000374"
+    );
+    assert_eq!(
+        common::status_text(ExitStatus::from_raw(2)),
+        "exit status: 0x00000002"
+    );
 }

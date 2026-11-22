@@ -6,6 +6,7 @@ use aproxy::{
     spawn::{READY_TIMEOUT, SpawnError, spawn_from_spec},
     spec,
 };
+use common::ReportExit as _;
 use common::TestHome;
 use std::path::PathBuf;
 
@@ -37,6 +38,7 @@ async fn launch_slot_and_fallback_are_compatible_across_writers() {
             .arg("--spec")
             .arg(&path)
             .output()
+            .report_exit()
             .unwrap();
         assert_eq!(out.status.code(), Some(1));
         let payload: serde_json::Value =

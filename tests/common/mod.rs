@@ -19,6 +19,44 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, PoisonError};
 
+/// 保留子进程的原始结果，同时给测试的捕获日志留一份状态；子进程崩溃时两个流可能都为空。
+pub trait ReportExit {
+    fn report_exit(self) -> Self;
+}
+
+/// Windows 的异常退出保留状态字的全部位，不把负的十进制数误认为 CLI 退出码。
+pub fn status_text(status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) if cfg!(windows) && code < 0 => {
+            format!("abnormal termination: 0x{:08X}", code as u32)
+        }
+        Some(code) => format!("exit status: 0x{:08X}", code as u32),
+        None => format!("abnormal termination: {status}"),
+    }
+}
+
+impl ReportExit for std::io::Result<std::process::Output> {
+    fn report_exit(self) -> Self {
+        self.inspect(|out| eprintln!("{}", status_text(out.status)))
+    }
+}
+
+impl ReportExit for std::io::Result<std::process::ExitStatus> {
+    fn report_exit(self) -> Self {
+        self.inspect(|status| eprintln!("{}", status_text(*status)))
+    }
+}
+
+impl ReportExit for std::io::Result<Option<std::process::ExitStatus>> {
+    fn report_exit(self) -> Self {
+        self.inspect(|status| {
+            if let Some(status) = status {
+                eprintln!("{}", status_text(*status));
+            }
+        })
+    }
+}
+
 /// 结构化命令的 stdout 只能有一个完整文档，不能混入给终端的说明。
 pub fn output_document(out: &std::process::Output) -> serde_json::Value {
     serde_json::from_slice(&out.stdout)
@@ -52,7 +90,7 @@ impl CopiedExecutable for Command {
         retry_exec(|| self.spawn())
     }
     fn output_ready(&mut self) -> std::io::Result<std::process::Output> {
-        retry_exec(|| self.output())
+        retry_exec(|| self.output().report_exit())
     }
 }
 
@@ -303,7 +341,7 @@ impl Drop for TestHome {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn_ready()
-                .and_then(|mut child| child.wait());
+                .and_then(|mut child| child.wait().report_exit());
         }
         // 兜底：台账里仍在运行的进程。条目只可能由带着这个 APROXY_HOME 运行的进程（或测试
         // 自己）写进来；ledger::terminate 只认 pid 加启动标记，并核对属主是当前用户，核验
@@ -327,7 +365,7 @@ pub struct ChildGuard(pub Child);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.0.wait().report_exit();
     }
 }
 

@@ -20,6 +20,7 @@
 
 mod common;
 use common::CopiedExecutable;
+use common::ReportExit as _;
 use common::{ChildGuard, TestHome, free_port};
 
 use std::path::{Path, PathBuf};
@@ -109,6 +110,7 @@ fn restart_after_port_change_reports_new_port() {
         .cmd()
         .args(["restart", &port_a.to_string()])
         .output()
+        .report_exit()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -158,6 +160,7 @@ fn restart_not_running_port_fails() {
         .cmd()
         .args(["restart", &port.to_string(), "--json"])
         .output()
+        .report_exit()
         .unwrap();
     assert_eq!(out.status.code(), Some(4), "未启动的 target 应退出 4");
     let failure = common::output_document(&out);
@@ -564,7 +567,7 @@ fn release_asset_named_instance_is_adopted_respawned_and_force_stoppable() {
 
     // 崩溃：强杀测试自己 spawn 的守护（句柄即身份）
     daemon.0.kill().unwrap();
-    daemon.0.wait().unwrap();
+    daemon.0.wait().report_exit().unwrap();
     assert!(
         wait_for(Duration::from_secs(20), || ipc_ping_in_dir(&rt, port, home)
             .is_ok_and(|i| i.instance.pid != orig_pid)),
@@ -657,7 +660,7 @@ fn watchdog_respawn_onto_changed_port_retires_old_record() {
 
     write_cfg(&cfg, &format!("127.0.0.1:{port_b}"));
     daemon.0.kill().unwrap();
-    daemon.0.wait().unwrap();
+    daemon.0.wait().report_exit().unwrap();
     assert!(
         wait_for(Duration::from_secs(20), || ipc_ping_in_dir(
             &rt, port_b, home
@@ -731,7 +734,7 @@ fn watchdog_respawn_with_port_zero_returns_to_the_same_port() {
     );
 
     daemon.0.kill().unwrap();
-    daemon.0.wait().unwrap();
+    daemon.0.wait().report_exit().unwrap();
     let mut port_2 = 0u16;
     assert!(
         wait_for(Duration::from_secs(20), || {
@@ -782,7 +785,7 @@ fn restore_onto_changed_port_retires_old_record() {
     test_home.stop_on_drop(port_b);
     assert!(wait_daemon_ready(&rt, port_a, home), "守护未就绪");
     daemon.0.kill().unwrap();
-    daemon.0.wait().unwrap();
+    daemon.0.wait().report_exit().unwrap();
     assert!(has_restore(home, port_a), "崩溃应留下恢复记录");
 
     write_cfg(&cfg, &format!("127.0.0.1:{port_b}"));
@@ -1031,11 +1034,13 @@ fn process_command_line(pid: u32) -> String {
             &format!("(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"),
         ])
         .output()
+        .report_exit()
         .expect("运行 powershell 失败");
     #[cfg(unix)]
     let out = std::process::Command::new("ps")
         .args(["-ww", "-o", "args=", "-p", &pid.to_string()])
         .output()
+        .report_exit()
         .expect("运行 ps 失败");
     text(&out.stdout).trim().to_string()
 }
@@ -1190,7 +1195,7 @@ fn restore_keeps_the_record_while_the_config_is_missing() {
     assert!(wait_daemon_ready(&rt, port, home), "实例未就绪");
     assert!(wait_for(Duration::from_secs(5), || has_restore(home, port)));
     daemon.0.kill().unwrap();
-    daemon.0.wait().unwrap();
+    daemon.0.wait().report_exit().unwrap();
 
     let parked = home.join("late-mount.toml.away");
     std::fs::rename(&cfg, &parked).unwrap();
@@ -1290,7 +1295,7 @@ fn stop_of_a_crashed_instance_deletes_its_record() {
         assert!(wait_daemon_ready(&rt, port, home), "实例未就绪");
         assert!(wait_for(Duration::from_secs(5), || has_restore(home, port)));
         daemon.0.kill().unwrap();
-        daemon.0.wait().unwrap();
+        daemon.0.wait().report_exit().unwrap();
         assert!(has_restore(home, port), "崩溃应留下期望状态记录");
 
         let out = run_cli(&test_home, &exe, &["stop", target]);
@@ -1438,14 +1443,18 @@ fn instance_survives_sigint_to_the_launchers_process_group() {
         .stderr(Stdio::null());
     let mut child = start.spawn().unwrap();
     let pgid = child.id();
-    assert!(child.wait().unwrap().success(), "start 应成功");
+    assert!(
+        child.wait().report_exit().unwrap().success(),
+        "start 应成功"
+    );
     assert!(wait_daemon_ready(&rt, port, home), "实例未就绪");
     let pid = restore_pid(home, port);
 
     // 组里已经没有进程时 kill 会报错，这正是期望的结果，不看它的退出码
     let _ = std::process::Command::new("kill")
         .args(["-INT", "--", &format!("-{pgid}")])
-        .status();
+        .status()
+        .report_exit();
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(
         ipc_ping_in_dir(&rt, port, home)
@@ -1486,6 +1495,7 @@ fn watchdog_exits_once_it_is_disabled_in_settings() {
         wait_for(Duration::from_secs(10), || wd
             .0
             .try_wait()
+            .report_exit()
             .unwrap()
             .is_some()),
         "开关关掉后看护者应退出；看护者日志:

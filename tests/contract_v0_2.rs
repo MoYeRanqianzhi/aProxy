@@ -17,6 +17,7 @@
 //! 隔离：每个测试一个 `common::TestHome`，端口向系统要，结束时按端口 stop。
 
 mod common;
+use common::ReportExit as _;
 use common::{TestHome, free_port};
 
 use serde_json::{Value, json};
@@ -263,6 +264,7 @@ fn start<'a>(home: &'a TestHome, port: u16, args: &[&str]) -> Instance<'a> {
         .args(args)
         .env("NO_COLOR", "1")
         .output()
+        .report_exit()
         .expect("运行 aproxy 失败");
     assert!(
         out.status.success(),

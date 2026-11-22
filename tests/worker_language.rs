@@ -1,5 +1,6 @@
 //! 两个独立运行的实例继承不同的语言。控制帧、错误体、清点文档与日志都来自真实写端。
 mod common;
+use common::ReportExit as _;
 use common::{ChildGuard, TestHome};
 use serde_json::{Value, json};
 use std::{path::Path, process::Stdio, time::Duration};
@@ -76,6 +77,7 @@ async fn observe(lang: &str, upstream: std::net::SocketAddr) -> Observed {
             .env("APROXY_LANG", reader)
             .args(["status", "--json"])
             .output()
+            .report_exit()
             .unwrap();
         assert!(out.status.success());
         out.stdout

@@ -8,6 +8,7 @@
 //! 不串包 / 复用到死 worker 时换新重试）。
 
 mod common;
+use common::ReportExit as _;
 #[path = "common/manual_clock.rs"]
 mod manual_clock;
 use common::{TestHome, format_echo_path};
@@ -1368,6 +1369,7 @@ fn forward_and_format_start_together() {
         .args(["start", "--json", "--config"])
         .arg(cfg_path)
         .output()
+        .report_exit()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
     let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();

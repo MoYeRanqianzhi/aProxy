@@ -9,6 +9,7 @@
 
 mod common;
 use common::CopiedExecutable;
+use common::ReportExit as _;
 use common::{TestHome, free_port};
 
 use aproxy::install::force::{self, Manifest, ManifestAsset, OnlineSpec};
@@ -130,6 +131,7 @@ impl ForceHome {
         let out = self
             .command(Path::new(env!("CARGO_BIN_EXE_aproxy")), &full)
             .output()
+            .report_exit()
             .unwrap();
         let text = format!(
             "{}{}",
@@ -247,7 +249,7 @@ fn write_entry(home: &Path, pid: u32, start: String, role: &str) -> PathBuf {
 fn exited_within(child: &mut Child, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if child.try_wait().unwrap().is_some() {
+        if child.try_wait().report_exit().unwrap().is_some() {
             return true;
         }
         if Instant::now() >= deadline {
@@ -441,9 +443,9 @@ fn only_verified_ledger_processes_are_stopped() {
     // 结束测试自己的子进程放在断言之前：断言失败也不留下进程
     let installer_gone = exited_within(&mut installer, Duration::from_secs(5));
     let future_gone = exited_within(&mut future, Duration::from_secs(5));
-    let stranger_alive = stranger.try_wait().unwrap().is_none();
-    let foreigner_alive = foreigner.try_wait().unwrap().is_none();
-    let stray_alive = stray.try_wait().unwrap().is_none();
+    let stranger_alive = stranger.try_wait().report_exit().unwrap().is_none();
+    let foreigner_alive = foreigner.try_wait().report_exit().unwrap().is_none();
+    let stray_alive = stray.try_wait().report_exit().unwrap().is_none();
     for child in [
         &mut installer,
         &mut future,
@@ -452,7 +454,7 @@ fn only_verified_ledger_processes_are_stopped() {
         &mut stray,
     ] {
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.wait().report_exit();
     }
 
     assert_eq!(code, Some(force::EXIT_DONE), "{output}");
@@ -535,13 +537,14 @@ fn refusals_end_with_10_and_change_nothing() {
     let no_confirmation = home
         .command(exe, &["install", "--force", "--from", next])
         .output()
+        .report_exit()
         .unwrap();
     let (legacy_code, legacy_out) = home.force_install(&["--from", legacy.to_str().unwrap()]);
     let (variant_code, variant_out) =
         home.force_install(&["--from", next, "--variant", other_variant]);
-    let still_running = running.try_wait().unwrap().is_none();
+    let still_running = running.try_wait().report_exit().unwrap().is_none();
     let _ = running.kill();
-    let _ = running.wait();
+    let _ = running.wait().report_exit();
 
     let no_confirmation_err = String::from_utf8_lossy(&no_confirmation.stderr);
     assert_eq!(
@@ -602,7 +605,7 @@ fn a_held_bin_ends_with_10_or_11_and_keeps_the_old_binary() {
     let (code, output) = home.force_install(&["--from", next.to_str().unwrap()]);
     drop(held);
     let _ = running.kill();
-    let _ = running.wait();
+    let _ = running.wait().report_exit();
     assert_eq!(idle_code, Some(force::EXIT_UNCHANGED), "{idle_output}");
     assert_eq!(code, Some(force::EXIT_STOPPED), "{output}");
     assert_eq!(std::fs::read(&bin).unwrap(), original);
@@ -633,7 +636,7 @@ fn a_read_only_bin_dir_ends_with_10_or_11_and_keeps_the_old_binary() {
     let (code, output) = home.force_install(&["--from", next.to_str().unwrap()]);
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     let _ = running.kill();
-    let _ = running.wait();
+    let _ = running.wait().report_exit();
     assert_eq!(idle_code, Some(force::EXIT_UNCHANGED), "{idle_output}");
     assert_eq!(code, Some(force::EXIT_STOPPED), "{output}");
     assert_eq!(std::fs::read(&bin).unwrap(), original);
@@ -694,6 +697,7 @@ fn a_closed_output_pipe_does_not_change_the_exit_code() {
             .stdout(writer.try_clone().unwrap())
             .stderr(writer)
             .status()
+            .report_exit()
             .unwrap()
             .code()
     };

@@ -10,6 +10,7 @@
 //!   由 `src/daemon.rs` 的单测读回 DACL 核对。
 
 mod common;
+use common::ReportExit as _;
 use common::TestHome;
 #[cfg(unix)]
 use common::free_port;
@@ -19,7 +20,12 @@ use std::process::Command;
 
 /// 在 `home` 里运行一条 aproxy 命令，要求它成功，返回 stdout。
 fn aproxy_ok(home: &TestHome, args: &[&str]) -> String {
-    let out = home.cmd().args(args).output().expect("运行 aproxy 失败");
+    let out = home
+        .cmd()
+        .args(args)
+        .output()
+        .report_exit()
+        .expect("运行 aproxy 失败");
     assert!(
         out.status.success(),
         "{args:?} 失败：{}{}",
@@ -45,6 +51,7 @@ fn loosen(home: &Path) {
             .arg(home)
             .args(["/grant", "*S-1-1-0:(OI)(CI)R"])
             .output()
+            .report_exit()
             .expect("运行 icacls 失败");
         assert!(
             out.status.success(),
@@ -140,6 +147,7 @@ fn connect_as(sudo_args: &[&str], socket: &Path) -> String {
         .arg(CLIENT)
         .arg(socket)
         .output()
+        .report_exit()
         .expect("运行 python3 客户端失败");
     assert!(
         out.status.success(),
@@ -176,6 +184,7 @@ fn control_socket_refuses_other_users_and_admits_root() {
         .cmd()
         .args(["start", "--config", cfg.to_str().unwrap()])
         .output()
+        .report_exit()
         .expect("运行 aproxy 失败");
     assert!(
         out.status.success(),

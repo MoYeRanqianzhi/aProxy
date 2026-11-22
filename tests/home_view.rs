@@ -6,6 +6,7 @@ use aproxy_ipc::{
     wire::{Part, ReadOp},
 };
 use axum::{Router, routing::post};
+use common::ReportExit as _;
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -42,6 +43,7 @@ async fn view_matches_instance_history_and_plain_logs() {
         .args(["start", "--json", "--config"])
         .arg(cfg)
         .output()
+        .report_exit()
         .unwrap();
     assert!(start.status.success(), "{:?}", start);
     let doc: Value = serde_json::from_slice(&start.stdout).unwrap();
@@ -112,6 +114,7 @@ async fn view_matches_instance_history_and_plain_logs() {
         .cmd()
         .args(["logs", &port.to_string()])
         .output()
+        .report_exit()
         .unwrap();
     assert!(logs.status.success(), "{logs:?}");
     let log = String::from_utf8(logs.stdout).unwrap();

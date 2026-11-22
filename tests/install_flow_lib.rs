@@ -3,6 +3,7 @@
 
 mod common;
 use common::CopiedExecutable;
+use common::ReportExit as _;
 use common::{TestHome, free_port};
 
 use std::path::Path;
@@ -74,7 +75,7 @@ async fn continue_from_restarting_reclaims_instance() {
     std::thread::sleep(Duration::from_millis(500));
     println!(
         "--- 守护早期存活: {:?} stderr: {}",
-        child.try_wait(),
+        child.try_wait().report_exit(),
         std::fs::read_to_string(home.join("daemon-stderr.log")).unwrap_or_default()
     );
     let old_pid = child.id();
@@ -188,7 +189,7 @@ async fn continue_from_restarting_reclaims_instance() {
     )
     .await;
     let _ = child.kill();
-    let _ = child.wait();
+    let _ = child.wait().report_exit();
 }
 
 /// 恢复矩阵行「swapping 中（Windows bin 空窗）」的**有实例版本**：实例已
@@ -299,7 +300,7 @@ async fn continue_from_swapping_with_live_instance_redoes_swap() {
     )
     .await;
     let _ = child.kill();
-    let _ = child.wait();
+    let _ = child.wait().report_exit();
 }
 
 // ---------------------------------------------------------------------------
@@ -838,7 +839,7 @@ async fn rollback_case(kind: BrokenNew) {
         Duration::from_secs(20),
     )
     .await;
-    let _ = child.wait();
+    let _ = child.wait().report_exit();
 }
 
 /// 交换后用户停掉快照中的一个端口，只滚动仍在服务的另一个；终验不把被停端口拉回来。
@@ -912,7 +913,7 @@ async fn rolling_restart_skips_a_port_stopped_during_the_install() {
             .is_err()
     );
     assert!(restore_spec_of(&run_dir, stopped).is_none());
-    child.wait().unwrap();
+    child.wait().report_exit().unwrap();
     assert!(!aproxy::install::state::state_path_in(home).exists());
 }
 
@@ -959,7 +960,7 @@ async fn halted_failure_is_cleaned_up_when_the_fleet_already_runs_the_target() {
         Duration::from_secs(20),
     )
     .await;
-    let _ = child.wait();
+    let _ = child.wait().report_exit();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1016,7 +1017,7 @@ async fn rolling_restart_keeps_restore_when_rollback_also_fails() {
         err.message.contains("aproxy restore"),
         "错误应指引 restore: {err}"
     );
-    let _ = child.wait();
+    let _ = child.wait().report_exit();
 
     assert!(
         aproxy::daemon::ipc_ping_in(&run_dir, &port.to_string())
@@ -1067,7 +1068,7 @@ async fn continue_restores_instance_stopped_mid_restart() {
     aproxy::install::restart::stop_and_wait(&run_dir, &port.to_string(), Duration::from_secs(20))
         .await
         .unwrap();
-    let _ = child.wait();
+    let _ = child.wait().report_exit();
     assert_eq!(
         restore_spec_of(&run_dir, port).as_ref(),
         Some(&spec),

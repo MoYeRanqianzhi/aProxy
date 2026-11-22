@@ -1,5 +1,6 @@
 //! 在隔离 home 用环回镜像运行真正的 CLI，验证文档的原始字节、退出码与安装支线。
 mod common;
+use common::ReportExit as _;
 use common::{TestHome, free_port};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -61,7 +62,7 @@ async fn serve(h: &TestHome, app: axum::Router) {
 }
 /// 对 stdout 与 stderr 分别断言，避免看似正确的输出夹带诊断。
 fn run(h: &TestHome, args: &[&str], code: i32) -> Output {
-    let o = h.cmd().args(args).output().unwrap();
+    let o = h.cmd().args(args).output().report_exit().unwrap();
     assert_eq!(
         o.status.code(),
         Some(code),
@@ -297,9 +298,10 @@ async fn binary_and_standalone_install_share_the_download_lock() {
     )
     .await
     .expect("文档安装竞争者未退出")
+    .report_exit()
     .unwrap();
     release.notify_one();
-    let first = first.wait_with_output().await.unwrap();
+    let first = first.wait_with_output().await.report_exit().unwrap();
     assert!(
         first.status.success(),
         "{}",
@@ -388,6 +390,7 @@ async fn checksum_response_is_bounded() {
             .env("APROXY_LANG", lang)
             .args(["skill", "install", "--json"])
             .output()
+            .report_exit()
             .unwrap();
         assert_eq!(out.status.code(), Some(1));
         let stderr = String::from_utf8(out.stderr).unwrap();
@@ -442,6 +445,7 @@ fn absent_skills_follow_the_readers_language() {
             .env("APROXY_LANG", lang)
             .args(["skill", "show", "missing"])
             .output()
+            .report_exit()
             .unwrap();
         assert_eq!(show.status.code(), Some(4));
         assert!(show.stdout.is_empty());

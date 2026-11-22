@@ -2,6 +2,7 @@
 //! 密钥的占位与写回、退出码。就地编辑保留注释这类写回本身的性质在 proxy_integration 里。
 
 mod common;
+use common::ReportExit as _;
 use common::{TestHome, free_port};
 
 use std::io::Write as _;
@@ -25,6 +26,7 @@ fn config(home: &TestHome, file: &Path, args: &[&str]) -> Output {
         .args(args)
         .stdin(Stdio::null())
         .output()
+        .report_exit()
         .unwrap()
 }
 
@@ -120,6 +122,7 @@ fn get_prints_the_effective_value_and_its_source() {
         .cmd()
         .args(["alias", "add", "work", file.to_str().unwrap()])
         .output()
+        .report_exit()
         .unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
     let get = |args: &[&str]| {
@@ -128,6 +131,7 @@ fn get_prints_the_effective_value_and_its_source() {
             .args(args)
             .args(["--config", "work"])
             .output()
+            .report_exit()
             .unwrap()
     };
 
@@ -199,7 +203,7 @@ fn secrets_are_read_as_placeholders_and_written_back_unchanged() {
         .unwrap()
         .write_all(format!("{SECRET}\n").as_bytes())
         .unwrap();
-    let out = child.wait_with_output().unwrap();
+    let out = child.wait_with_output().report_exit().unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
     let placeholder = json!({"secret": true, "hint": "sk-C…cdef"});
     let written = document(&out, &["set"]);
@@ -381,6 +385,7 @@ fn writes_report_the_instances_to_restart() {
             .args(["start", cfg.to_str().unwrap()])
             .stdin(Stdio::null())
             .output()
+            .report_exit()
             .unwrap();
         assert!(
             out.status.success(),
@@ -446,6 +451,7 @@ fn the_default_config_is_chosen_through_settings() {
         .current_dir(home.path())
         .args(["settings", "set", "default_config", "main.toml"])
         .output()
+        .report_exit()
         .unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
     let settings: Value =
@@ -461,12 +467,14 @@ fn the_default_config_is_chosen_through_settings() {
         .cmd()
         .args(["config", "get", "max_request_mb"])
         .output()
+        .report_exit()
         .unwrap();
     assert_eq!(text(&out.stdout).trim_end(), "16", "{}", text(&out.stderr));
     let out = home
         .cmd()
         .args(["settings", "unset", "default_config"])
         .output()
+        .report_exit()
         .unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
     // 回到 <home>/config.toml：它还不存在，get 以 4 退出
@@ -474,6 +482,7 @@ fn the_default_config_is_chosen_through_settings() {
         .cmd()
         .args(["config", "get", "max_request_mb"])
         .output()
+        .report_exit()
         .unwrap();
     assert_eq!(out.status.code(), Some(4), "{}", text(&out.stderr));
 }

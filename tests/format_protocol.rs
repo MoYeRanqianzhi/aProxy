@@ -1,5 +1,6 @@
 //! 真正通过启动命令协商协议，区分子进程不可用与静态不兼容。每个实例都有自己的 home。
 mod common;
+use common::ReportExit as _;
 #[path = "common/manual_clock.rs"]
 mod manual_clock;
 use common::{TestHome, format_echo_path, free_port};
@@ -87,6 +88,7 @@ fn start(mode: &str, required: bool) -> (TestHome, std::process::Output) {
         .args(["start", "--json", "--config"])
         .arg(cfg)
         .output()
+        .report_exit()
         .unwrap();
     if !out.status.success() {
         eprintln!("{}", launch_evidence(&home, port));
@@ -200,6 +202,7 @@ async fn failed_start_exits_while_descendant_still_holds_stderr() {
     assert_eq!(
         exited
             .expect("runtime waited for descendant EOF")
+            .report_exit()
             .unwrap()
             .code(),
         Some(3)
@@ -244,6 +247,7 @@ async fn restart_keeps_the_replacement_generation() {
         .args(["--exact", "restart_stale_selection", "--ignored"])
         .env("FIXTURE_STALE_PORT", &port)
         .output()
+        .report_exit()
         .unwrap();
     assert!(
         replay.status.success(),
@@ -310,6 +314,7 @@ fn launch_with_backoff(
         .args(["start", "--json", "--config"])
         .arg(cfg)
         .output()
+        .report_exit()
         .unwrap();
     if !out.status.success() {
         eprintln!("{}", launch_evidence(home, port));
@@ -1512,6 +1517,7 @@ async fn startup_probes_run_in_parallel_and_respect_worker_lifetimes() {
         .args(["start", "--json", "--config"])
         .arg(sibling_cfg)
         .output()
+        .report_exit()
         .unwrap();
     assert!(started.status.success(), "{started:?}");
     let port_from = |value: &Value| u16::try_from(value.as_u64().unwrap()).unwrap();
@@ -1543,6 +1549,7 @@ async fn startup_probes_run_in_parallel_and_respect_worker_lifetimes() {
         .cmd()
         .args(["restart", &key, "--json"])
         .output()
+        .report_exit()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(
@@ -1573,6 +1580,7 @@ async fn startup_probes_run_in_parallel_and_respect_worker_lifetimes() {
             .cmd()
             .args(["restart", target, "--json"])
             .output()
+            .report_exit()
             .unwrap();
         assert_eq!(out.status.code(), Some(code), "{out:?}");
         assert!(
@@ -1604,7 +1612,7 @@ async fn startup_probes_run_in_parallel_and_respect_worker_lifetimes() {
         serving_pid
     );
     std::fs::write(gate, b"").unwrap();
-    let out = parent.wait_with_output().unwrap();
+    let out = parent.wait_with_output().report_exit().unwrap();
     assert!(out.status.success(), "{out:?}");
     assert_eq!(
         aproxy::daemon::ipc_ping_in(&run, &key).await.unwrap().state,
@@ -1658,8 +1666,8 @@ async fn second_start_waits_for_failed_hello_and_prepare_swap_changes_nothing() 
     );
     let second = observing_start(&home, &path).await;
     std::fs::write(home.path().join("advance-hello"), b"").unwrap();
-    let original = first.wait_with_output().unwrap();
-    let observer = second.wait_with_output().unwrap();
+    let original = first.wait_with_output().report_exit().unwrap();
+    let observer = second.wait_with_output().report_exit().unwrap();
     assert_eq!(
         original.status.code(),
         Some(1),
@@ -1785,7 +1793,14 @@ async fn stopping_during_hello_cancels_the_probe_and_child() {
     })
     .await
     .unwrap();
-    assert!(!parent.wait_with_output().unwrap().status.success());
+    assert!(
+        !parent
+            .wait_with_output()
+            .report_exit()
+            .unwrap()
+            .status
+            .success()
+    );
 }
 
 /// 按请求标识读取实际实例的完成记录，避免把别的请求的规则或报告误判为本次结果。
@@ -3497,7 +3512,7 @@ async fn observing_start(home: &TestHome, config: &std::path::Path) -> std::proc
                 break;
             }
             assert!(
-                child.try_wait().unwrap().is_none(),
+                child.try_wait().report_exit().unwrap().is_none(),
                 "observer exited before readiness wait: {text}"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -3527,7 +3542,7 @@ async fn observing_start_preserves_a_static_handshake_failure() {
     std::fs::write(gate, b"").unwrap();
     let mut errors = Vec::new();
     for child in [first, second] {
-        let out = child.wait_with_output().unwrap();
+        let out = child.wait_with_output().report_exit().unwrap();
         assert_eq!(out.status.code(), Some(3), "{out:?}");
         let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(doc["error"]["code"], "format_stage_unsupported");
@@ -7119,6 +7134,7 @@ fn format_trial(home: &TestHome, config: &str, sample: Value) -> std::process::O
         .arg(home.path())
         .arg("--allow-external")
         .output()
+        .report_exit()
         .unwrap()
 }
 /// 两种重选票都不能跳过尚未完成的请求层，也不能重新执行已成功的前缀。

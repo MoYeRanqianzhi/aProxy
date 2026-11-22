@@ -8,6 +8,7 @@
 //! 隔离：APROXY_HOME 相关函数全部显式传 tempdir，绝不触碰真实 ~/.aproxy。
 
 mod common;
+use common::ReportExit as _;
 use common::TestHome;
 
 use std::path::Path;
@@ -83,7 +84,7 @@ fn stage_from_rejects_version_mismatch_and_cleans_up() {
 fn version_flag_prints_the_permanent_line_and_touches_no_home() {
     let home = TestHome::unborn();
     for flag in ["--version", "-V"] {
-        let out = home.cmd().arg(flag).output().unwrap();
+        let out = home.cmd().arg(flag).output().report_exit().unwrap();
         assert!(out.status.success(), "{flag}");
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),

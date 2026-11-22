@@ -2,6 +2,7 @@
 mod common;
 use aproxy::{desktop::DesktopHome, spec};
 use aproxy_ipc::enumerate::{Enumerated, Liveness};
+use common::ReportExit as _;
 use common::{TestHome, free_port};
 use serde_json::json;
 
@@ -251,7 +252,7 @@ async fn force_targets_only_the_owned_unresponsive_test_process() {
     if result.is_err() {
         let _ = child.kill();
     }
-    child.wait().unwrap();
+    child.wait().report_exit().unwrap();
     result.unwrap();
     assert!(aproxy::daemon::read_instance_file_in(&dir, &port.to_string()).is_none());
 }
@@ -496,6 +497,7 @@ async fn update_children_are_home_bound_confirmed_bounded_and_terminal_only_afte
         .arg("-o")
         .arg(&exe)
         .output()
+        .report_exit()
         .unwrap();
     assert!(
         built.status.success(),
@@ -678,7 +680,7 @@ fn hidden_login_restore_uses_the_argument_home_and_refuses_relative_paths() {
     let decoy = TestHome::new();
     let actual = TestHome::new();
     decoy.settings("{not settings");
-    let restore = |args: &[&str]| decoy.cmd().args(args).output().unwrap();
+    let restore = |args: &[&str]| decoy.cmd().args(args).output().report_exit().unwrap();
     let rel = restore(&["restore-at-login", "--home", "relative"]);
     assert_ne!(rel.status.code(), Some(0));
     let empty = restore(&[
@@ -699,7 +701,7 @@ fn hidden_login_restore_uses_the_argument_home_and_refuses_relative_paths() {
         "--home",
         actual.path().to_str().unwrap(),
     ]);
-    let public = actual.cmd().arg("restore").output().unwrap();
+    let public = actual.cmd().arg("restore").output().report_exit().unwrap();
     assert_eq!(login.status.code(), public.status.code());
     assert_eq!(login.stdout, public.stdout);
     assert_eq!(login.stderr, public.stderr);
@@ -986,6 +988,7 @@ async fn run_form_binds_the_read_destination_and_keeps_launch_overrides_private(
             .arg(&dir)
             .arg(&replacement)
             .output()
+            .report_exit()
             .unwrap()
             .status
             .success()

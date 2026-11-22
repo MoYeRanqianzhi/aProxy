@@ -2,6 +2,7 @@
 //! 文档形状只要变了就是破坏性变更。
 
 mod common;
+use common::ReportExit as _;
 use common::{TestHome, free_port};
 
 use std::fs;
@@ -13,7 +14,13 @@ use serde_json::{Value, json};
 
 /// 在隔离的 home 里运行命令，核对退出码为 0，并保留两个输出流供分别检查。
 fn run(home: &TestHome, args: &[&str]) -> Output {
-    let out = home.cmd().args(args).stdin(Stdio::null()).output().unwrap();
+    let out = home
+        .cmd()
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .report_exit()
+        .unwrap();
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -33,7 +40,13 @@ fn document(out: &Output) -> Value {
 
 /// 失败也只能给一份文档；分别保留解析结果和 stderr，便于核对退出码对应的诊断与修法。
 fn failed_document(home: &TestHome, args: &[&str], code: i32) -> (Value, String) {
-    let out = home.cmd().args(args).stdin(Stdio::null()).output().unwrap();
+    let out = home
+        .cmd()
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .report_exit()
+        .unwrap();
     assert_eq!(
         out.status.code(),
         Some(code),
@@ -59,9 +72,13 @@ fn crash(pid: u64, port: u16) {
     let status = Command::new("taskkill")
         .args(["/F", "/PID", &pid.to_string()])
         .stdout(Stdio::null())
-        .status();
+        .status()
+        .report_exit();
     #[cfg(unix)]
-    let status = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    let status = Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .report_exit();
     assert!(status.unwrap().success(), "结束 pid {pid} 失败");
     for _ in 0..100 {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
@@ -512,7 +529,7 @@ fn doctor_json_document() {
         .filter(|d| d["severity"] == "warning")
         .count();
     assert_eq!(doc["summary"]["warnings"], warnings);
-    let plain = home.cmd().arg("doctor").output().unwrap();
+    let plain = home.cmd().arg("doctor").output().report_exit().unwrap();
     assert_eq!(plain.status.code(), Some(3));
     let stdout = String::from_utf8(plain.stdout).unwrap();
     for fragment in [
@@ -575,6 +592,7 @@ fn machine_errors_do_not_inherit_the_terminal_language() {
                 .env("APROXY_LANG", lang)
                 .args(&args)
                 .output()
+                .report_exit()
                 .unwrap()
         };
         let english = call("en");
@@ -615,6 +633,7 @@ fn local_reports_follow_the_reader() {
                 .env("APROXY_LANG", lang)
                 .args(&args)
                 .output()
+                .report_exit()
                 .unwrap();
             let stdout = String::from_utf8(out.stdout).unwrap();
             assert!(
@@ -636,6 +655,7 @@ fn nested_diagnostics_localize_without_changing_public_documents() {
             .env("APROXY_LANG", lang)
             .args(args)
             .output()
+            .report_exit()
             .unwrap()
     };
     for (args, plain, key, en, zh) in [
@@ -719,6 +739,7 @@ fn log_replay_is_independent_of_notice_language() {
             .env("APROXY_LANG", lang)
             .arg("logs")
             .output()
+            .report_exit()
             .unwrap();
         assert!(out.status.success());
         assert_eq!(out.stdout, content.as_bytes());
@@ -728,6 +749,7 @@ fn log_replay_is_independent_of_notice_language() {
             .env("APROXY_LANG", lang)
             .arg("status")
             .output()
+            .report_exit()
             .unwrap();
         assert!(status.status.success());
         assert!(String::from_utf8(status.stdout).unwrap().contains(pending));
@@ -743,6 +765,7 @@ fn start_and_restore_choose_language_only_for_the_terminal() {
             .env("APROXY_LANG", language)
             .args(args)
             .output()
+            .report_exit()
             .unwrap()
     };
     let target = "absent-alias";
@@ -778,6 +801,7 @@ fn stop_and_restart_render_their_own_terminal_notices() {
             .env("APROXY_LANG", lang)
             .args(args)
             .output()
+            .report_exit()
             .unwrap()
     };
     for (lang, none, restart) in [

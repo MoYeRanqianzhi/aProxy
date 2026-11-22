@@ -5,6 +5,7 @@
 //! 测的是文件布局与改名步骤，不是版本差异）。
 
 mod common;
+use common::ReportExit as _;
 
 use std::path::{Path, PathBuf};
 
@@ -375,6 +376,7 @@ mod windows_swap {
                 "--version",
             ])
             .output()
+            .report_exit()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
         std::fs::rename(dir.join("aproxy.exe.away"), dir.join("aproxy.exe")).unwrap();

@@ -2,6 +2,7 @@
 //! 只看命令行这一层——解析、退出码、输出落在哪一路；各命令做的事在各自的集成测试里。
 
 mod common;
+use common::ReportExit as _;
 use common::{TestHome, free_port};
 
 use std::io::Write as _;
@@ -14,7 +15,12 @@ fn text(bytes: &[u8]) -> String {
 
 /// 在 `home` 里运行当前构建，stdin 为空
 fn run(home: &TestHome, args: &[&str]) -> Output {
-    home.cmd().args(args).stdin(Stdio::null()).output().unwrap()
+    home.cmd()
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .report_exit()
+        .unwrap()
 }
 
 /// 写一份指向不存在的上游、监听 `port` 的配置，返回它的路径
@@ -125,7 +131,7 @@ fn start_reads_the_api_key_from_stdin() {
         .unwrap()
         .write_all(format!("{SECRET}\n").as_bytes())
         .unwrap();
-    let out = child.wait_with_output().unwrap();
+    let out = child.wait_with_output().report_exit().unwrap();
     assert!(
         out.status.success(),
         "{}{}",
@@ -327,7 +333,7 @@ stop: --idle-threshold-secs --force --json -h --help"#;
             if chinese {
                 cmd.env_remove("APROXY_LANG");
             }
-            let out = cmd.args(&args).output().unwrap();
+            let out = cmd.args(&args).output().report_exit().unwrap();
             let help = text(&out.stdout);
             assert!(
                 out.status.success() && out.stderr.is_empty(),
@@ -389,6 +395,7 @@ fn cli_logs_stay_off_stdout() {
             .args(args)
             .stdin(Stdio::null())
             .output()
+            .report_exit()
             .unwrap()
     };
     let start = ["start", cfg, "--json"];
@@ -434,6 +441,7 @@ fn cli_logs_stay_off_stdout() {
         .args(start)
         .stdin(Stdio::null())
         .output()
+        .report_exit()
         .unwrap();
     assert!(
         quiet.status.success(),
@@ -457,6 +465,7 @@ fn status_json_survives_a_closed_diagnostic_pipe() {
         .env("RUST_LOG", "info")
         .stderr(writer)
         .output()
+        .report_exit()
         .unwrap();
     assert!(
         out.status.success(),
@@ -539,7 +548,7 @@ fn json_commands_finish_with_one_document_even_without_stderr() {
                     drop(reader);
                     command.stderr(writer);
                 }
-                let out = command.output().unwrap();
+                let out = command.output().report_exit().unwrap();
                 let stdout = text(&out.stdout);
                 assert_eq!(
                     stdout.lines().count(),
@@ -603,6 +612,7 @@ fn json_command_io_errors_keep_a_result_after_preflight() {
             .stdin(reader)
             .stderr(diagnostic)
             .output()
+            .report_exit()
             .unwrap();
         assert_eq!(
             out.status.code(),

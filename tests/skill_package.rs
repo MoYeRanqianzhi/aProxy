@@ -1,5 +1,6 @@
 //! 用仓库真实的 Git 对象生成发布包，再从环回镜像安装；没有 Python 时明确报告跳过。
 mod common;
+use common::ReportExit as _;
 use common::{TestHome, free_port};
 use sha2::{Digest, Sha256};
 use std::{
@@ -19,6 +20,7 @@ fn python(h: &TestHome) -> Option<&'static str> {
         if h.cmd_with(exe)
             .args(["-c", probe])
             .status()
+            .report_exit()
             .is_ok_and(|s| s.success())
         {
             return Some(exe);
@@ -37,6 +39,7 @@ fn package(h: &TestHome, exe: &str, dir: &str) -> PathBuf {
         .arg(&out)
         .args(["--validator", common::APROXY])
         .output()
+        .report_exit()
         .unwrap();
     assert!(
         cmd.status.success(),
@@ -88,6 +91,7 @@ async fn packaged_index_installs_through_the_download_chain() {
         .cmd()
         .args(["skill", "install", "--json"])
         .output()
+        .report_exit()
         .unwrap();
     assert!(
         installed.status.success(),
@@ -99,6 +103,7 @@ async fn packaged_index_installs_through_the_download_chain() {
         .cmd_with("git")
         .args(["ls-files", "--stage", "-z", "--", ".claude/skills/"])
         .output()
+        .report_exit()
         .unwrap();
     assert!(result.status.success());
     let root = h.path().join("skills");
@@ -110,6 +115,7 @@ async fn packaged_index_installs_through_the_download_chain() {
             .cmd_with("git")
             .args(["cat-file", "blob", oid])
             .output()
+            .report_exit()
             .unwrap();
         assert!(raw.status.success());
         let rel = Path::new(path).strip_prefix(".claude/skills").unwrap();
@@ -135,6 +141,7 @@ fn package_validation_precedes_publication() {
             .arg(flag)
             .arg(validator)
             .output()
+            .report_exit()
             .unwrap()
     };
     assert!(
@@ -183,6 +190,7 @@ fn fixture_checks_git_objects_attributes_and_zip_metadata() {
             .current_dir(&root)
             .args(args)
             .output()
+            .report_exit()
             .unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         String::from_utf8(o.stdout).unwrap()
@@ -215,6 +223,7 @@ fn fixture_checks_git_objects_attributes_and_zip_metadata() {
             .arg(&out)
             .args(["--validator", common::APROXY])
             .output()
+            .report_exit()
             .unwrap()
     };
     let result = run();

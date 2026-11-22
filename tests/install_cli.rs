@@ -1,6 +1,7 @@
 //! 安装入口与交棒后的安全检查：实例、台账、控制端点与二进制都在独立的临时 home 中。
 mod common;
 use common::CopiedExecutable;
+use common::ReportExit as _;
 
 #[test]
 fn copied_executable_retries_only_the_pre_exec_busy_error() {
@@ -55,7 +56,7 @@ fn fixture() -> (TestHome, PathBuf, PathBuf) {
 
 /// 失败时把子进程输出带进断言，尤其是无控制台的交棒结局。
 fn run(h: &TestHome, args: &[&str], code: i32) -> Output {
-    let out = h.cmd().args(args).output().unwrap();
+    let out = h.cmd().args(args).output().report_exit().unwrap();
     assert_eq!(out.status.code(), Some(code), "{out:?}");
     out
 }
@@ -215,6 +216,7 @@ async fn install_refuses_foreground_instances_before_touching_anything() {
             "--json",
         ])
         .output()
+        .report_exit()
         .unwrap();
     assert_eq!(zh.status.code(), Some(1));
     assert_eq!(events(&zh), lines);

@@ -15,7 +15,12 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
   import { ui } from '../lib/state.svelte';
-  import { store } from '../lib/legacy.svelte';
+  import { store } from '../lib/store.svelte';
+  // 扩展的安装、授权还没接上桌面契约，这一块暂时仍读旧数据源
+  import { store as legacy } from '../lib/legacy.svelte';
+  import { toFailure } from '../lib/backend/link';
+  import { faultText } from '../lib/faults';
+  import { aliasOf } from '../lib/view';
   import { overlays, copyText } from '../lib/overlays.svelte';
   import { pop } from '../lib/motion';
   import { BUILTIN_THEME, SAMPLE_THEME, parseTheme, serializeTheme, type ThemeError } from '../lib/theme';
@@ -28,14 +33,70 @@
 
   const micaUnsupported = $derived(ui.micaSupport === 'unsupported');
 
+  /**
+   * 诊断信息：贴进问题报告里用。只放版本、系统、实例数与界面状态。
+   * home 路径里常带着用户名，所以不原样写出，只说它是不是默认位置（~/.aproxy）。
+   */
   async function copyDiag() {
-    await copyText(
-      ['aProxy 0.2.0 (desktop)', 'Windows 11 build 26200', `mica: ${ui.micaSupport}`, `mode: ${ui.variant}`, `theme: ${ui.themeSpec?.name ?? 'aProxy'}`].join(
-        '\n',
-      ),
-    );
+    const a = store.about;
+    const reg = store.autostart;
+    const lines = [
+      a ? `aProxy ${a.version} (${a.variant})` : 'aProxy (version unknown)',
+      ui.windowsBuild === null ? 'platform: not Windows' : `Windows build ${ui.windowsBuild}`,
+      `home: ${a ? (/[\\/]\.aproxy$/.test(a.home) ? 'default' : 'custom') : 'unknown'}`,
+      `instances: ${store.cards.length}`,
+      `watchdog: ${store.settings ? store.watchdogOn : 'unknown'}`,
+      `autostart: ${reg ? `${reg.enabled}${reg.issue ? ` (${reg.issue})` : ''}` : 'unknown'}`,
+      `mica: ${ui.micaSupport}`,
+      `mode: ${ui.variant}`,
+      `theme: ${ui.themeSpec?.name ?? 'aProxy'}`,
+    ];
+    await copyText(lines.join('\n'));
     overlays.toast(t('toast.copied'));
   }
+
+  // ---------------------------------------------------------------------------
+  // 后台：看护者与开机自启
+  // ---------------------------------------------------------------------------
+
+  // 开关组件按下就先翻过去。写失败时要翻回来，所以这里各留一份本地值：
+  // 平时由 store 里读回的值驱动（写成功、别处改了都会带过来），写失败时在 finally 里拉回 store 的值。
+  let watchdog = $state(false);
+  let autostart = $state(false);
+  let busy = $state<'watchdog' | 'autostart' | null>(null);
+  $effect(() => {
+    watchdog = store.watchdogOn;
+  });
+  $effect(() => {
+    autostart = store.autostart?.enabled ?? false;
+  });
+
+  async function setWatchdog(on: boolean) {
+    busy = 'watchdog';
+    try {
+      await store.setWatchdog(on);
+    } catch (raw) {
+      overlays.toast(faultText(toFailure(raw)), 'coral');
+    } finally {
+      watchdog = store.watchdogOn;
+      busy = null;
+    }
+  }
+
+  async function setAutostart(on: boolean) {
+    busy = 'autostart';
+    try {
+      await store.setAutostart(on);
+    } catch (raw) {
+      overlays.toast(faultText(toFailure(raw)), 'coral');
+    } finally {
+      autostart = store.autostart?.enabled ?? false;
+      busy = null;
+    }
+  }
+
+  /** settings.json 里写错的地方：这时开关显示的不一定是文件里想写的值，要提醒一句 */
+  const settingsProblems = $derived(store.settings?.diagnostics.filter((d) => d.severity === 'error').length ?? 0);
 
   /** 扩展、发布说明这类后端给的文字：按界面语言取，缺了退回英文 */
   const loc = (x: LocalizedText) => x[ui.lang] ?? x.en;
@@ -136,8 +197,8 @@
   // ---------------------------------------------------------------------------
 
   let openExt = $state<string | null>(null);
-  const customMascots = $derived(store.extensions.filter((e) => e.kind === 'mascot'));
-  const packages = $derived(store.extensions.filter((e) => e.kind === 'extension'));
+  const customMascots = $derived(legacy.extensions.filter((e) => e.kind === 'mascot'));
+  const packages = $derived(legacy.extensions.filter((e) => e.kind === 'extension'));
 
   const CAP_ICON: Record<WriteCapability, IconName> = { control: 'power', config: 'sliders', install: 'download' };
   const CAP_TONE: Record<WriteCapability, string> = { control: 'sky', config: 'butter', install: 'lilac' };
@@ -147,7 +208,8 @@
   }
 
   function target(port: number): string {
-    const alias = store.instance(port)?.alias;
+    const card = store.card(port);
+    const alias = card ? aliasOf(card) : null;
     if (!alias) return String(port);
     return ui.lang === 'en' ? `${port} (${alias})` : `${port}（${alias}）`;
   }
@@ -162,17 +224,25 @@
   const dayTime = $derived(new Intl.DateTimeFormat(ui.lang, { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }));
 
   async function toggleExt(ext: ExtensionInfo, on: boolean) {
-    await store.setExtensionEnabled(ext.id, on);
+    await legacy.setExtensionEnabled(ext.id, on);
     overlays.toast(t(on ? 'toast.extOn' : 'toast.extOff', { name: loc(ext.name) }), on ? 'mint' : 'lilac');
   }
 
   async function revoke(ext: ExtensionInfo, cap: WriteCapability) {
-    await store.revokeGrant(ext.id, cap);
+    await legacy.revokeGrant(ext.id, cap);
     overlays.toast(t('toast.revoked', { name: loc(ext.name), cap: t(`ext.capName.${cap}`) }), 'lilac');
   }
 </script>
 
 <h1>{t('nav.settings')}</h1>
+
+{#if store.reset.length}
+  <!-- 界面偏好或置顶的文件坏了、被重置成默认：用户之前的设置没了，得说一声 -->
+  <div class="reset-note" role="status">
+    <Icon name="alert" size={16} />
+    <p>{store.reset.map((file) => t(`set.reset.${file}`)).join(ui.lang === 'en' ? ' ' : '')}</p>
+  </div>
+{/if}
 
 <section class="panel group">
   <h2><Icon name="sun" size={17} />{t('set.appearance')}</h2>
@@ -276,16 +346,22 @@
     <div class="txt">
       <span class="name">{t('set.watchdog')}</span>
       <span class="desc">{t('set.watchdog.desc')}</span>
+      {#if settingsProblems}
+        <span class="note warn"><Icon name="alert" size={14} />{t('set.settingsProblems', { n: settingsProblems })}</span>
+      {/if}
     </div>
-    <!-- 看护者与开机自启是守护进程那边的设置（settings.json），经 Backend 读写 -->
-    <Switch checked={store.watchdogOn} onchange={(v) => store.updateSettings({ watchdog: v })} label={t('set.watchdog')} />
+    <!-- 看护者写在 settings.json 里，所有实例共用；开机自启是系统里的登录项，每次都现查 -->
+    <Switch bind:checked={watchdog} disabled={!store.settings || busy === 'watchdog'} onchange={setWatchdog} label={t('set.watchdog')} />
   </div>
   <div class="row">
     <div class="txt">
       <span class="name">{t('set.autostart')}</span>
       <span class="desc">{t('set.autostart.desc')}</span>
+      {#if store.autostart?.issue}
+        <span class="note warn"><Icon name="alert" size={14} />{t(`set.autostart.${store.autostart.issue}`)}</span>
+      {/if}
     </div>
-    <Switch checked={store.settings?.autostart ?? false} onchange={(v) => store.updateSettings({ autostart: v })} label={t('set.autostart')} />
+    <Switch bind:checked={autostart} disabled={!store.autostart || busy === 'autostart'} onchange={setAutostart} label={t('set.autostart')} />
   </div>
 </section>
 
@@ -502,13 +578,14 @@
     <div class="about-text">
       <div class="about-name">
         <strong>aProxy</strong>
-        <span class="chip">v0.2.0</span>
-        <span class="chip lilac"><Icon name="monitor" size={12} stroke={2.4} />{t('up.variant.desktop')}</span>
+        {#if store.about}
+          <span class="chip">v{store.about.version}</span>
+          <span class="chip lilac"><Icon name="monitor" size={12} stroke={2.4} />{t(`up.variant.${store.about.variant}`)}</span>
+        {/if}
       </div>
       <p>{t('set.about.desc')}</p>
       <div class="links">
-        <button class="btn sm" onclick={() => overlays.toast(t('toast.protoOnly'), 'lilac')}><Icon name="external" size={14} />{t('set.homepage')}</button>
-        <button class="btn sm" onclick={() => ui.go('update')}><Icon name="file" size={14} />{t('set.changelog')}</button>
+        <button class="btn sm" onclick={() => ui.go('update')}><Icon name="download" size={14} />{t('set.checkUpdate')}</button>
         <button class="btn sm" onclick={copyDiag}><Icon name="copy" size={14} />{t('set.copyDiag')}</button>
         <span class="license">{t('set.license')}</span>
       </div>
@@ -576,6 +653,21 @@
   .row.disabled .name,
   .row.disabled .desc {
     color: var(--text-3);
+  }
+  .reset-note {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: 820px;
+    margin-bottom: 16px;
+    padding: 10px 14px;
+    border-radius: var(--r-md);
+    background: var(--butter-soft);
+    color: var(--text);
+  }
+  .reset-note p {
+    flex: 1;
+    margin: 0;
   }
   .note {
     display: flex;

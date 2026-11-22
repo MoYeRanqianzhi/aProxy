@@ -4,11 +4,15 @@
   用户自己的 agent 会话很可能就经某个实例转发，误停等于切断自己。
 -->
 <script lang="ts">
-  import { t, ago, durLong, uptime } from '../lib/i18n';
+  import { untrack } from 'svelte';
+  import { t, ago, durLong, uptime, fmtNum } from '../lib/i18n';
   import { ui } from '../lib/state.svelte';
-  import { store } from '../lib/legacy.svelte';
+  import { refKey, runKey, store } from '../lib/store.svelte';
   import { overlays } from '../lib/overlays.svelte';
-  import type { Instance, LogEntry } from '../lib/types';
+  import type { Card, HistoryCode, Row, Run } from '../lib/backend/contract';
+  import { toFailure, type Failure } from '../lib/backend/link';
+  import { codeText, faultText } from '../lib/faults';
+  import { aliasOf, controllable, durationOf, forwardOnly, hourBuckets, lastHour, retrying, statusOf } from '../lib/view';
   import { pop } from '../lib/motion';
   import Icon from '../components/Icon.svelte';
   import MascotView from '../components/MascotView.svelte';
@@ -16,101 +20,184 @@
   import FlipNumber from '../components/FlipNumber.svelte';
   import JellyBar from '../components/JellyBar.svelte';
   import Sparkline from '../components/Sparkline.svelte';
-  import type { Reason } from '../lib/types';
 
-  const inst = $derived(store.instance(ui.instancePort));
-  const inflight = $derived(store.inflight.filter((e) => e.port === ui.instancePort));
-  const retryingHere = $derived(inflight.filter((e) => e.outcome === 'retrying').length);
+  const inst = $derived(store.card(ui.instancePort));
+  const status = $derived(inst ? statusOf(inst) : null);
+  const busy = $derived(status === 'starting' || status === 'restarting' || status === 'stopping');
 
-  /** 近一小时这个实例的失败尝试按原因分组：一眼看出上游到底怎么了 */
-  const reasons = $derived.by(() => {
-    const counts = new Map<Reason, number>();
-    for (const e of store.logs) {
-      if (e.port !== ui.instancePort || store.now - e.time > 3_600_000) continue;
-      for (const a of e.attempts) if (a.reason) counts.set(a.reason, (counts.get(a.reason) ?? 0) + 1);
+  // ---------------------------------------------------------------------------
+  // 这次运行的请求：在途的那几条从这里来。快照里的最近 50 条是整个 home 的，不能当成这次运行的列表，
+  // 所以单独按运行取第一页。运行换了（重启）、这次运行的请求变了（revision）、通道重新接上（epoch）就重取
+  // ---------------------------------------------------------------------------
+
+  /** 卡片每次重读都是新对象；只认运行的键，免得每次重读快照都重取一遍请求 */
+  const runId = $derived(inst?.run ? runKey(inst.run) : null);
+  const canRead = $derived(inst?.reads.historyFeed ?? false);
+  let rows = $state.raw<Row[]>([]);
+  let rowsFault = $state.raw<Failure | null>(null);
+
+  $effect(() => {
+    const id = runId;
+    const ok = canRead;
+    const rev = untrack(() => inst?.run ?? null);
+    void store.revision(rev);
+    void store.epoch;
+    if (!id || !ok || !rev) {
+      rows = [];
+      return;
     }
-    return [...counts.entries()].sort((a, b) => b[1] - a[1]);
+    let live = true;
+    load(rev).then(
+      (page) => {
+        if (!live) return;
+        rows = page;
+        rowsFault = null;
+      },
+      (raw) => {
+        if (live) rowsFault = toFailure(raw);
+      },
+    );
+    return () => (live = false);
   });
-  const rescuedHere = $derived(
-    store.logs.filter((e) => e.port === ui.instancePort && e.outcome === 'rescued' && store.now - e.time < 3_600_000).length,
+
+  async function load(run: Run): Promise<Row[]> {
+    return (await store.queryLogs(run, null, 50)).entries;
+  }
+
+  const inflight = $derived(rows.filter((r) => r.outcome === 'in-flight'));
+  const retryingHere = $derived(inst?.activity?.retrying ?? 0);
+
+  /** 这次运行以来失败的尝试按原因分组：一眼看出上游到底怎么了 */
+  const reasons = $derived(
+    (Object.entries(inst?.activity?.byCode ?? {}) as [HistoryCode, number][]).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]),
   );
+  const spark = $derived(hourBuckets(inst?.activity?.buckets));
+
   const displayName = $derived.by(() => {
     if (!inst) return '';
-    if (!inst.alias) return String(inst.port);
-    return ui.lang === 'en' ? `${inst.port} (${inst.alias})` : `${inst.port}（${inst.alias}）`;
+    const alias = aliasOf(inst);
+    if (!alias) return String(inst.port);
+    return ui.lang === 'en' ? `${inst.port} (${alias})` : `${inst.port}（${alias}）`;
   });
   // 「第 N 次尝试」里的 N 要换成翻牌数字：按占位符把译文切成前后两段
   const attemptParts = $derived(t('inst.attemptN', { n: '@@' }).split('@@'));
-  // 在途请求的进度、倒计时、已等时长都按这个时钟算。控制通道沉默时界面手里只有最后一份快照，
-  // 时钟就停在快照那一刻：否则倒计时会在过期数据上继续走，和「这是 N 秒前的数据」自相矛盾
-  const clock = $derived(inst?.status === 'unresponsive' && inst.silentSince !== null ? inst.silentSince : store.now);
-  const silentFor = $derived(inst?.silentSince != null ? store.now - inst.silentSince : 0);
 
-  function askRestart(i: Instance) {
+  function fail(raw: unknown) {
+    overlays.toast(faultText(toFailure(raw)), 'coral');
+  }
+
+  function askRestart(c: Card) {
+    const run = c.run;
+    if (!run) return;
     overlays.ask({
       title: t('confirm.restart.title', { name: displayName }),
-      body: () => t(inflight.length ? 'confirm.restart.body' : 'confirm.restart.bodyIdle', { n: inflight.length }),
+      body: () => t(inflight.length ? 'confirm.restart.body' : 'confirm.restart.bodyIdle', { n: inst?.activity?.inFlight ?? inflight.length }),
       okLabel: t('confirm.restart.ok'),
       danger: false,
       onOk: async () => {
-        await store.restart(i.port);
-        overlays.toast(t('toast.restarted', { name: displayName }));
+        try {
+          await store.restart(run);
+          overlays.toast(t('toast.restarted', { name: displayName }));
+        } catch (raw) {
+          fail(raw);
+        }
       },
     });
   }
 
-  function askStop(i: Instance) {
+  function askStop(c: Card) {
+    const run = c.run;
+    if (!run) return;
     overlays.ask({
       title: t('confirm.stop.title', { name: displayName }),
-      body: () => t(inflight.length ? 'confirm.stop.body' : 'confirm.stop.bodyIdle', { n: inflight.length }),
+      body: () => t(inflight.length ? 'confirm.stop.body' : 'confirm.stop.bodyIdle', { n: inst?.activity?.inFlight ?? inflight.length }),
       okLabel: t('confirm.stop.ok'),
       danger: true,
       onOk: async () => {
-        await store.stop(i.port);
-        overlays.toast(t('toast.stopped', { name: displayName }));
+        try {
+          await store.stop(run);
+          overlays.toast(t('toast.stopped', { name: displayName }));
+        } catch (raw) {
+          fail(raw);
+        }
       },
     });
   }
 
-  function askForce(i: Instance) {
+  function askForce(c: Card) {
+    const run = c.run;
+    if (!run) return;
     overlays.ask({
       title: t('confirm.force.title', { name: displayName }),
-      body: t('confirm.force.body', { pid: i.pid ?? '' }),
+      body: t('confirm.force.body', { pid: c.pid ?? '' }),
       okLabel: t('confirm.force.ok'),
       danger: true,
       onOk: async () => {
-        await store.forceStop(i.port);
-        overlays.toast(t('toast.stopped', { name: displayName }));
+        try {
+          await store.forceStop(run);
+          overlays.toast(t('toast.stopped', { name: displayName }));
+        } catch (raw) {
+          fail(raw);
+        }
       },
     });
   }
 
-  async function start(i: Instance) {
-    await store.start(i.port);
-    overlays.toast(t('toast.started', { name: displayName }));
+  async function restore(c: Card) {
+    if (!c.expectedRestore) return;
+    try {
+      await store.restore(c.port, c.expectedRestore);
+      overlays.toast(t('toast.started', { name: displayName }));
+    } catch (raw) {
+      fail(raw);
+    }
   }
 
-  function reconnect(i: Instance) {
-    overlays.toast(t('toast.reconnecting', { port: i.port }), 'lilac');
-    store.reconnect(i.port);
+  function forget(c: Card) {
+    const token = c.expectedRestore;
+    if (!token) return;
+    overlays.ask({
+      title: t('card.forgetTitle', { name: displayName }),
+      body: t('card.forgetBody'),
+      okLabel: t('card.forget'),
+      danger: false,
+      onOk: () => void store.forgetRestore(c.port, token).then(() => ui.go('overview'), fail),
+    });
   }
 
-  function progress(e: LogEntry): number {
-    if (e.phaseStartedAt === null || e.phaseEndsAt === null) return 0;
-    const span = e.phaseEndsAt - e.phaseStartedAt;
-    return span <= 0 ? 1 : (clock - e.phaseStartedAt) / span;
+  /** 让 Rust 马上重新找一遍实例：卡住的实例缓过来了，卡片会随之更新 */
+  async function reconnect(c: Card) {
+    overlays.toast(t('toast.reconnecting', { port: c.port }), 'lilac');
+    try {
+      await store.rescan();
+    } catch (raw) {
+      fail(raw);
+    }
   }
 
-  function remaining(e: LogEntry): number {
-    return Math.max(0, Math.ceil(((e.phaseEndsAt ?? clock) - clock) / 1000));
+  /**
+   * 退避等待的进度：只知道下一次在什么时候、这次等多久（最后一次尝试的决定里的延迟）。
+   * 不知道等多久时没有进度可言，条就是满的、只显示倒计时
+   */
+  function progress(r: Row): number {
+    if (r.nextAttemptAt === null) return 1;
+    const delay = r.tries.find((x) => x.attempt === r.attempts)?.decision?.delayMs ?? null;
+    if (!delay) return 1;
+    return 1 - (r.nextAttemptAt - store.now) / delay;
   }
 
-  function lastReason(e: LogEntry) {
-    return e.attempts[e.attempts.length - 1]?.reason ?? null;
+  function remaining(r: Row): number {
+    return Math.max(0, Math.ceil(((r.nextAttemptAt ?? store.now) - store.now) / 1000));
   }
 
-  function openLog(e: LogEntry) {
-    ui.selectedLog = e.key;
+  /** 最后一次尝试为什么失败 */
+  function lastReason(r: Row): string | null {
+    const last = r.tries.find((x) => x.attempt === r.attempts) ?? r.tries[r.tries.length - 1];
+    return last?.code ? codeText(last.code, last.upstreamStatus) : null;
+  }
+
+  function openLog(r: Row) {
+    ui.selectedRef = r.ref;
     ui.go('logs');
   }
 
@@ -123,115 +210,139 @@
 {#if !inst}
   <section class="missing">
     {#if mascots.current}<MascotView mood="sleeping" size="hero" px={110} />{/if}
-    <p>{t('inst.notFound', { port: ui.instancePort })}</p>
+    <p>{store.connected ? t('inst.notFound', { port: ui.instancePort }) : t('ov.connecting')}</p>
     <button class="btn" onclick={() => ui.go('overview')}>{t('nav.overview')}</button>
   </section>
 {:else}
   <header class="ihead">
     <div class="id">
       <span class="port">{inst.port}</span>
-      {#if inst.alias}<span class="alias">{inst.alias}</span>{/if}
-      {#if inst.status === 'stopped'}
-        <span class="chip"><span class="dot gray"></span>{t('status.stopped')}</span>
-      {:else if inst.status === 'unresponsive'}
+      {#if aliasOf(inst)}<span class="alias" title={inst.metadata?.aliases.join(', ')}>{aliasOf(inst)}</span>{/if}
+      {#if status === 'restore'}
+        <span class="chip butter"><Icon name="clock" size={13} stroke={2.4} />{t('status.restore')}</span>
+      {:else if status === 'unresponsive'}
         <span class="chip solid coral"><Icon name="alert" size={13} stroke={2.4} />{t('status.unresponsive')}</span>
-      {:else if inst.status === 'restarting'}
-        <span class="chip butter">{t('status.restarting')}</span>
+      {:else if busy}
+        <span class="chip butter">{t(`status.${status!}`)}</span>
+      {:else if status === 'down' || status === 'incompatible' || status === 'unknown'}
+        <span class="chip"><span class="dot gray"></span>{t(`status.${status}`)}</span>
       {:else}
-        <span class="chip mint"><span class="dot mint" class:breathe={inst.status === 'active'}></span>{t(`status.${inst.status}`)}</span>
+        <span class="chip mint"><span class="dot mint" class:breathe={status === 'active'}></span>{t(`status.${status!}`)}</span>
       {/if}
       {#if retryingHere > 0}
         <span class="chip solid sky"><Icon name="umbrella" size={13} stroke={2.4} />{t('card.retryingN', { n: retryingHere })}</span>
       {/if}
-      {#if inst.forwardOnly}
+      {#if forwardOnly(inst)}
         <span class="hazard"><span class="tape"></span>{t('mode.forwardOnly')}<span class="sep">/</span>{t('mode.noRetry')}</span>
       {/if}
     </div>
     <div class="meta">
-      <span class="url"><Icon name="upstream" size={14} stroke={2.2} /><code class="mono">{inst.baseUrl}</code></span>
+      {#if inst.metadata}<span class="url"><Icon name="upstream" size={14} stroke={2.2} /><code class="mono">{inst.metadata.baseUrl}</code></span>{/if}
       {#if inst.pid}<span class="chip">pid {inst.pid}</span>{/if}
-      <span class="chip">v{inst.version}</span>
-      {#if inst.status !== 'stopped'}<span class="chip">{t('card.uptime', { d: uptime(store.now - inst.startedAt) })}</span>{/if}
+      {#if inst.version}<span class="chip">v{inst.version}</span>{/if}
+      {#if inst.startedAt !== null && inst.run}<span class="chip">{t('card.uptime', { d: uptime(store.now - inst.startedAt) })}</span>{/if}
     </div>
     <div class="actions">
       <button class="btn sm" onclick={openLogs}><Icon name="list" size={14} />{t('inst.openLogs')}</button>
-      <button class="btn sm" onclick={() => ui.go('config', inst.port)}><Icon name="sliders" size={14} />{t('inst.editConfig')}</button>
-      <span class="divider" aria-hidden="true"></span>
-      {#if inst.status === 'stopped'}
-        <button class="btn sm mint" onclick={() => start(inst)}><Icon name="play" size={13} />{t('inst.start')}</button>
-      {:else if inst.status === 'unresponsive'}
+      <button class="btn sm" disabled={!inst.run} onclick={() => ui.go('config', inst.port)}><Icon name="sliders" size={14} />{t('inst.editConfig')}</button>
+      {#if status === 'restore'}
+        {#if inst.expectedRestore}
+          <span class="divider" aria-hidden="true"></span>
+          <button class="btn sm mint" onclick={() => restore(inst)}><Icon name="play" size={13} />{t('card.restore')}</button>
+        {/if}
+      {:else if status === 'unresponsive' && inst.run}
+        <span class="divider" aria-hidden="true"></span>
         <button class="btn sm danger" onclick={() => askForce(inst)}><Icon name="power" size={14} />{t('err.forceStop')}</button>
-      {:else}
-        <button class="btn sm" disabled={inst.status === 'restarting'} onclick={() => askRestart(inst)}><Icon name="restart" size={14} />{t('inst.restart')}</button>
-        <button class="btn sm danger-outline" disabled={inst.status === 'restarting'} onclick={() => askStop(inst)}><Icon name="stop" size={13} />{t('inst.stop')}</button>
+      {:else if controllable(inst)}
+        <span class="divider" aria-hidden="true"></span>
+        <button class="btn sm" disabled={busy} onclick={() => askRestart(inst)}><Icon name="restart" size={14} />{t('inst.restart')}</button>
+        <button class="btn sm danger-outline" disabled={busy} onclick={() => askStop(inst)}><Icon name="stop" size={13} />{t('inst.stop')}</button>
       {/if}
     </div>
   </header>
 
-  {#if inst.forwardOnly}
+  {#if forwardOnly(inst)}
     <div class="callout hazard-callout">
       <span class="tape-big" aria-hidden="true"></span>
       <p>{t('inst.fwdWarn')}</p>
     </div>
   {/if}
 
-  {#if inst.status === 'unresponsive'}
+  {#if status === 'unresponsive'}
     <!-- 错误状态：说清发生了什么、会自动怎样、用户现在能做什么 -->
     <section class="trouble" in:pop>
       <span class="t-badge" aria-hidden="true"><Icon name="alert" size={26} stroke={2.4} /></span>
       <div>
         <h2>{t('err.unresponsive.title', { port: inst.port })}</h2>
-        <p>{t('err.unresponsive.body', { pid: inst.pid ?? '', secs: Math.round(silentFor / 1000) })}</p>
+        <p>{t('err.unresponsive.body', { pid: inst.pid ?? '' })}</p>
         <div class="trouble-act">
           <button class="btn sm" onclick={() => reconnect(inst)}><Icon name="restart" size={14} />{t('err.reconnect')}</button>
-          <button class="btn sm danger" onclick={() => askForce(inst)}><Icon name="power" size={14} />{t('err.forceStop')}</button>
+          {#if inst.run}<button class="btn sm danger" onclick={() => askForce(inst)}><Icon name="power" size={14} />{t('err.forceStop')}</button>{/if}
         </div>
       </div>
     </section>
-  {:else if inst.status === 'stopped'}
+  {:else if status === 'restore'}
     <section class="trouble calm" in:pop>
       <span class="t-badge" aria-hidden="true"><Icon name="power" size={24} stroke={2.4} /></span>
       <div>
         <h2>{t('stopped.title', { name: displayName })}</h2>
-        <p>{t('stopped.body', { path: inst.configPath })}</p>
-        <div class="trouble-act">
-          <button class="btn sm mint" onclick={() => start(inst)}><Icon name="play" size={13} />{t('inst.start')}</button>
-        </div>
+        <p>{t(inst.restoreReason === 'config-missing' ? 'card.restoreMissing' : 'card.restoreHint')}</p>
+        {#if inst.expectedRestore}
+          <div class="trouble-act">
+            <button class="btn sm mint" onclick={() => restore(inst)}><Icon name="play" size={13} />{t('card.restore')}</button>
+            <button class="btn sm ghost" onclick={() => forget(inst)}>{t('card.forget')}</button>
+          </div>
+        {/if}
+      </div>
+    </section>
+  {:else if inst.historyUnavailable === 'source-redaction-missing'}
+    <section class="trouble calm" in:pop>
+      <span class="t-badge" aria-hidden="true"><Icon name="restart" size={24} stroke={2.4} /></span>
+      <div>
+        <h2>{t('card.oldVersion')}</h2>
+        <p>{t('card.oldVersionHint')}</p>
+        {#if controllable(inst)}
+          <div class="trouble-act">
+            <button class="btn sm" disabled={busy} onclick={() => askRestart(inst)}><Icon name="restart" size={14} />{t('inst.restart')}</button>
+          </div>
+        {/if}
       </div>
     </section>
   {/if}
 
   <div class="grid">
-    <section class="inflight" class:stale={inst.status === 'unresponsive'}>
-      <h2 class="section-title">{t('inst.inflight')}<span class="count">{inflight.length}</span></h2>
-      {#if inst.status === 'unresponsive'}
-        <!-- 控制通道沉默时拿不到新数据：照旧显示最后一次的快照，但明确标成过期的 -->
-        <p class="stale-note"><Icon name="clock" size={14} />{t('inst.stale', { ago: ago(silentFor) })}</p>
+    <section class="inflight" class:stale={status === 'unresponsive'}>
+      <h2 class="section-title">{t('inst.inflight')}<span class="count">{inst.activity?.inFlight ?? inflight.length}</span></h2>
+      {#if status === 'unresponsive'}
+        <!-- 控制通道沉默时拿不到新数据：照旧显示最后读到的，但明确标成可能过期的 -->
+        <p class="stale-note"><Icon name="clock" size={14} />{t('inst.stale')}</p>
+      {:else if rowsFault}
+        <p class="stale-note"><Icon name="alert" size={14} />{faultText(rowsFault)}</p>
       {/if}
-      {#each inflight as e (e.key)}
-        <article class="req" class:retrying={e.outcome === 'retrying'} in:pop={{ y: 8 }}>
-          <button class="req-hit" onclick={() => openLog(e)} aria-label="#{e.seq} {e.path}"></button>
+      {#each inflight as r (refKey(r.ref))}
+        {@const again = retrying(r)}
+        <article class="req" class:retrying={again} in:pop={{ y: 8 }}>
+          <button class="req-hit" onclick={() => openLog(r)} aria-label="#{r.seq} {r.path}"></button>
           <div class="r1">
-            <span class="method">{e.method}</span>
-            <code class="path mono">{e.path}</code>
-            {#if e.model}<span class="model">{e.model}</span>{/if}
-            <span class="seq mono">#{e.seq}</span>
+            <span class="method">{r.method}</span>
+            <code class="path mono">{r.path}</code>
+            {#if r.model}<span class="model">{r.model}</span>{/if}
+            <span class="seq mono">#{r.seq}</span>
           </div>
-          {#if e.outcome === 'retrying'}
+          {#if again}
             <div class="r2">
               <span class="attempt">
-                {attemptParts[0]}<span class="attempt-n"><FlipNumber value={e.attempts.length + (e.phase === 'attempting' ? 1 : 0)} /></span>{attemptParts[1]}
+                {attemptParts[0]}<span class="attempt-n"><FlipNumber value={r.phase === 'backoff' ? r.attempts + 1 : r.attempts} /></span>{attemptParts[1]}
               </span>
-              {#if lastReason(e)}
-                {@const reason = lastReason(e)!}
-                <span class="chip coral"><Icon name="cloudRain" size={13} />{t(`reason.${reason}`)}</span>
+              {#if lastReason(r)}
+                <span class="chip coral"><Icon name="cloudRain" size={13} />{lastReason(r)}</span>
               {/if}
             </div>
             <div class="r3">
-              <JellyBar value={e.phase === 'waiting' ? progress(e) : 1} label={t('inst.retryIn', { s: remaining(e) })} tone={e.phase === 'waiting' ? 'sky' : 'lilac'} />
+              <JellyBar value={r.phase === 'backoff' ? progress(r) : 1} label={t('inst.retryIn', { s: remaining(r) })} tone={r.phase === 'backoff' ? 'sky' : 'lilac'} />
               <span class="countdown">
-                {#if e.phase === 'waiting'}
-                  {remaining(e) > 0 ? t('inst.retryIn', { s: remaining(e) }) : t('inst.retryNow')}
+                {#if r.phase === 'backoff'}
+                  {remaining(r) > 0 ? t('inst.retryIn', { s: remaining(r) }) : t('inst.retryNow')}
                 {:else}
                   {t('inst.attempting')}
                 {/if}
@@ -239,44 +350,53 @@
             </div>
           {:else}
             <div class="r3">
-              <JellyBar value={progress(e)} label={t('inst.receiving')} tone="mint" />
-              <span class="countdown">{t('inst.receiving')}</span>
+              <JellyBar value={1} label={t('inst.receiving')} tone="mint" />
+              <span class="countdown">{t(r.phase === 'forwarding' || r.phase === 'replaying' ? 'inst.receiving' : 'inst.attempting')}</span>
             </div>
           {/if}
           <div class="r4">
-            {#if e.stream && !inst.forwardOnly && inst.keepalive.interval > 0 && e.outcome === 'retrying'}
+            {#if r.keepalive}
               <span class="beat">
-                {#key e.heartbeats}
+                {#key r.heartbeats}
                   <span class="heart" in:pop={{ y: 0, scale: 0.4, duration: 600 }}><Icon name="heart" size={14} stroke={2.2} /></span>
                 {/key}
-                {t('inst.heartbeat', { n: e.heartbeats })}
+                {t('inst.heartbeat', { n: r.heartbeats })}
               </span>
             {/if}
-            <span class="waited">{t('inst.waited', { d: durLong(clock - e.time) })}</span>
-            <span class="client">{e.client.split(' ')[0]}</span>
+            <span class="waited">{t('inst.waited', { d: durLong(durationOf(r, store.now)) })}</span>
+            {#if r.userAgent}<span class="client">{r.userAgent.split(' ')[0]}</span>{/if}
           </div>
         </article>
       {:else}
         <div class="quiet">
           <span class="q-icon" aria-hidden="true"><Icon name="check" size={18} stroke={2.6} /></span>
           <span>{t('inst.inflightEmpty')}</span>
-          {#if inst.lastRequestAt}<span class="quiet-sub">{ago(store.now - inst.lastRequestAt)}</span>{/if}
+          {#if inst.activity && inst.activity.requestsTotal > 0}<span class="quiet-sub">{ago(store.now - inst.activity.lastRequestAt)}</span>{/if}
         </div>
       {/each}
 
-      {#if inst.status !== 'stopped'}
+      {#if inst.activity}
+        {@const req = lastHour(inst.activity.buckets, 'requests')}
+        {@const retries = lastHour(inst.activity.buckets, 'retries')}
         <section class="panel hour">
           <div class="hour-head">
             <h2 class="section-title">{t('card.lastHour')}</h2>
-            <span class="legend"><i class="k k-req"></i>{t('card.requests')} <b class="num">{inst.req1h}</b></span>
-            <span class="legend"><i class="k k-retry"></i>{t('card.retries')} <b class="num">{inst.forwardOnly ? '—' : inst.retry1h}</b></span>
-            <span class="legend"><Icon name="umbrella" size={13} />{t('logs.filter.rescued')} <b class="num">{rescuedHere}</b></span>
+            <span class="legend"><i class="k k-req"></i>{t('card.requests')} <b class="num">{req === null ? '—' : fmtNum(req)}</b></span>
+            <span class="legend"><i class="k k-retry"></i>{t('card.retries')} <b class="num">{forwardOnly(inst) || retries === null ? '—' : fmtNum(retries)}</b></span>
           </div>
-          <Sparkline req={inst.spark.req} retry={inst.spark.retry} height={64} label={t('card.sparkLabel')} />
+          {#if spark}
+            <Sparkline req={spark.req} retry={spark.retry} height={64} label={t('card.sparkLabel', { m: Math.max(1, Math.round(inst.activity.buckets.widthSecs / 60)) })} />
+          {/if}
+          <div class="run-totals">
+            <span class="sub">{t('inst.sinceStart')}</span>
+            <span class="legend">{t('card.requests')} <b class="num">{fmtNum(inst.activity.requestsTotal)}</b></span>
+            <span class="legend">{t('card.retries')} <b class="num">{fmtNum(inst.activity.retriesTotal)}</b></span>
+            <span class="legend"><Icon name="umbrella" size={13} />{t('logs.filter.rescued')} <b class="num">{fmtNum(inst.activity.rescuedTotal)}</b></span>
+          </div>
           {#if reasons.length}
             <div class="reasons">
-              {#each reasons as [reason, n] (reason)}
-                <span class="chip coral"><Icon name="cloudRain" size={12} />{t(`reason.${reason}`)}<b class="num">×{n}</b></span>
+              {#each reasons as [code, n] (code)}
+                <span class="chip coral"><Icon name="cloudRain" size={12} />{codeText(code)}<b class="num">×{n}</b></span>
               {/each}
             </div>
           {/if}
@@ -284,46 +404,39 @@
       {/if}
     </section>
 
-    <section class="panel summary">
-      <h2 class="section-title">{t('inst.config')}</h2>
-      <dl>
-        <dt>{t('cfgsum.upstream')}</dt>
-        <dd><code class="mono">{inst.baseUrl}</code></dd>
-        <dt>{t('cfgsum.listen')}</dt>
-        <dd><code class="mono">{inst.listen}</code></dd>
-        <dt>{t('cfgsum.proxy')}</dt>
-        <dd>{#if inst.proxy}<code class="mono">{inst.proxy}</code>{:else}<span class="muted">{t('cfgsum.none')}</span>{/if}</dd>
-        <dt>{t('cfgsum.backoff')}</dt>
-        <dd>{#if inst.forwardOnly}<span class="muted">{t('mode.noRetry')}</span>{:else}{inst.backoffCap} {t('cfg.seconds')}{/if}</dd>
-        <dt>{t('cfgsum.keepalive')}</dt>
-        <dd>
-          {#if inst.forwardOnly || inst.keepalive.interval === 0}
-            <span class="muted">{t('cfgsum.keepaliveOff')}</span>
-          {:else}
-            {t('cfgsum.everyN', { n: inst.keepalive.interval })}<span class="chip">{t(`cfg.o.${inst.keepalive.trigger}`)}</span>
+    {#if inst.metadata}
+      {@const m = inst.metadata}
+      <section class="panel summary">
+        <h2 class="section-title">{t('inst.config')}</h2>
+        <dl>
+          <dt>{t('cfgsum.upstream')}</dt>
+          <dd><code class="mono">{m.baseUrl}</code></dd>
+          <dt>{t('cfgsum.listen')}</dt>
+          <dd><code class="mono">{m.listen}</code></dd>
+          <dt>{t('cfgsum.delivery')}</dt>
+          <dd>{#if m.delivery === 'forward'}<span class="muted">{t('mode.noRetry')}</span>{:else if m.delivery === 'retry'}{t('cfgsum.retryForever')}{:else}<span class="muted">{t('status.unknown')}</span>{/if}</dd>
+          <dt>{t('cfgsum.rules')}</dt>
+          <dd>{#if m.retryRuleCount > 0}{t('cfgsum.ruleCount', { n: m.retryRuleCount })}{:else}<span class="muted">{t('cfgsum.none')}</span>{/if}</dd>
+          <dt>{t('cfgsum.keepalive')}</dt>
+          <dd>
+            {#if m.delivery === 'forward' || m.keepaliveIntervalSecs === 0}
+              <span class="muted">{t('cfgsum.keepaliveOff')}</span>
+            {:else}
+              {t('cfgsum.everyN', { n: m.keepaliveIntervalSecs })}
+              {#if m.keepaliveTrigger !== 'unknown'}<span class="chip">{t(`cfg.o.${m.keepaliveTrigger === 'body-stream' ? 'body_stream' : m.keepaliveTrigger}`)}</span>{/if}
+            {/if}
+          </dd>
+          <dt>{t('cfgsum.diskCache')}</dt>
+          <dd>{m.diskCache ? t('cfgsum.on') : t('cfgsum.off')}</dd>
+          {#if m.aliases.length > 1}
+            <dt>{t('cfgsum.aliases')}</dt>
+            <dd>{m.aliases.join(', ')}</dd>
           {/if}
-        </dd>
-        <dt>{t('cfgsum.transform')}</dt>
-        <dd>
-          {#if inst.transform}
-            <code class="mono">{inst.transform.program}</code>
-            <span class="chip lilac">{t(`cfg.o.${inst.transform.mode}`)}</span>
-            <span class="chip lilac">{t('mode.keys', { n: inst.transform.keys })}</span>
-            <span class="chip lilac">{t('mode.channels', { n: inst.transform.channels.length })}</span>
-          {:else}
-            <span class="muted">{t('cfgsum.none')}</span>
-          {/if}
-        </dd>
-        <dt>{t('cfgsum.bounded')}</dt>
-        <dd>
-          {#each inst.boundedPaths as p (p)}<code class="mono pattern">{p}</code>{:else}<span class="muted">{t('cfgsum.none')}</span>{/each}
-        </dd>
-        <dt>{t('cfgsum.diskCache')}</dt>
-        <dd>{inst.diskCache ? t('cfgsum.on') : t('cfgsum.off')}</dd>
-        <dt>{t('cfgsum.file')}</dt>
-        <dd><code class="mono">{inst.configPath}</code></dd>
-      </dl>
-    </section>
+          <dt>{t('cfgsum.file')}</dt>
+          <dd>{#if m.configPath}<code class="mono">{m.configPath}</code>{:else}<span class="muted">{t('cfgsum.none')}</span>{/if}</dd>
+        </dl>
+      </section>
+    {/if}
   </div>
 {/if}
 
@@ -660,6 +773,20 @@
   .k-retry {
     background: var(--chart-retry);
   }
+  /* 这次启动以来的总数：实例重启后从头算，与上面「近一小时」的分桶分开写 */
+  .run-totals {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 14px;
+    margin: 6px 0 10px;
+  }
+  .run-totals .sub {
+    margin-right: auto;
+    color: var(--text-2);
+    font-size: var(--fs-sm);
+    font-weight: 600;
+  }
   .reasons {
     display: flex;
     flex-wrap: wrap;
@@ -698,10 +825,5 @@
   }
   .muted {
     color: var(--text-3);
-  }
-  .pattern {
-    padding: 1px 7px;
-    border-radius: var(--r-xs);
-    background: var(--card-2-bg);
   }
 </style>

@@ -162,7 +162,8 @@ const zh = {
   'inst.config': '配置摘要',
   'inst.fwdWarn': '仅转发模式：上游出错会直接交给客户端，这个实例不会重试。',
   'inst.notFound': '没有找到端口 {port} 的实例',
-  'inst.stale': '控制通道没有应答，下面是 {ago}的数据',
+  'inst.stale': '控制通道没有应答，下面是最后一次读到的数据，可能已经过期',
+  'inst.sinceStart': '这次启动以来',
 
   'cfgsum.upstream': '上游',
   'cfgsum.listen': '监听',
@@ -179,6 +180,11 @@ const zh = {
   'cfgsum.on': '开',
   'cfgsum.off': '关',
   'cfgsum.everyN': '每 {n} 秒',
+  'cfgsum.delivery': '出错时',
+  'cfgsum.retryForever': '一直重试到成功',
+  'cfgsum.rules': '重试规则',
+  'cfgsum.ruleCount': '{n} 条',
+  'cfgsum.aliases': '别名',
 
   'confirm.restart.title': '重启 {name}？',
   'confirm.restart.body': '新配置会先预检，通不过时旧实例保持运行。正在进行的 {n} 个请求会中断，客户端会看到连接断开。',
@@ -260,12 +266,11 @@ const zh = {
   'fault.install_precheck_failed': '{port} 的配置在新版本下检查不通过，没有安装。',
 
   'err.unresponsive.title': '{port} 的控制通道没有应答',
-  'err.unresponsive.body': '进程还在（pid {pid}），但 {secs} 秒内没有回应，多半是卡住了。看护者会在一分钟内结束并重启它，也可以现在强制停止。',
+  'err.unresponsive.body': '进程还在（pid {pid}），但控制通道不回应，多半是卡住了。看护者会结束并重启它；也可以现在强制停止。',
   'err.forceStop': '强制停止',
   'err.reconnect': '重新连接',
 
-  'stopped.title': '{name} 已停止',
-  'stopped.body': '配置还在 {path}。启动后，客户端就能重新经它转发。',
+  'stopped.title': '{name} 已经退出',
 
   'empty.instances.title': '还没有运行中的实例',
   'empty.instances.body': '实例在后台转发 agent 的请求，上游出错时替它无限重试。',
@@ -889,7 +894,8 @@ const en: Record<keyof typeof zh, string> = {
   'inst.config': 'Configuration',
   'inst.fwdWarn': 'Forward-only: upstream errors go straight to the client. This instance never retries.',
   'inst.notFound': 'No instance on port {port}',
-  'inst.stale': 'The control channel is silent; this is the data from {ago}',
+  'inst.stale': 'The control channel is not answering. Below is the last data read, which may be out of date.',
+  'inst.sinceStart': 'Since this start',
 
   'cfgsum.upstream': 'Upstream',
   'cfgsum.listen': 'Listen',
@@ -906,6 +912,11 @@ const en: Record<keyof typeof zh, string> = {
   'cfgsum.on': 'On',
   'cfgsum.off': 'Off',
   'cfgsum.everyN': 'every {n} s',
+  'cfgsum.delivery': 'On errors',
+  'cfgsum.retryForever': 'Retry until it succeeds',
+  'cfgsum.rules': 'Retry rules',
+  'cfgsum.ruleCount': '{n} {n:rule|rules}',
+  'cfgsum.aliases': 'Aliases',
 
   'confirm.restart.title': 'Restart {name}?',
   'confirm.restart.body': 'The new config is checked first; if it fails, the old instance keeps running. {n} {n:request|requests} in progress will be cut off and the clients will see the connection drop.',
@@ -987,12 +998,11 @@ const en: Record<keyof typeof zh, string> = {
   'fault.install_precheck_failed': 'The configuration of {port} fails the new version\'s check. Nothing was installed.',
 
   'err.unresponsive.title': '{port} is not answering its control channel',
-  'err.unresponsive.body': 'The process is alive (pid {pid}) but has not responded for {secs} s, so it is probably hung. The watchdog will terminate and restart it within a minute, or you can force stop it now.',
+  'err.unresponsive.body': 'The process is still there (pid {pid}), but its control channel does not answer, so it is probably stuck. The watchdog will end and restart it, or you can force stop it now.',
   'err.forceStop': 'Force stop',
   'err.reconnect': 'Reconnect',
 
-  'stopped.title': '{name} is stopped',
-  'stopped.body': 'Its config is still at {path}. Start it and clients can relay through it again.',
+  'stopped.title': '{name} has exited',
 
   'empty.instances.title': 'No instances running',
   'empty.instances.body': 'An instance relays your agent’s requests in the background and retries them whenever the upstream fails.',

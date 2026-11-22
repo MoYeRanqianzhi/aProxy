@@ -9,6 +9,7 @@
   import { onMount } from 'svelte';
   import { ui, parseHash, pageHash } from './lib/state.svelte';
   import { store } from './lib/store.svelte';
+  import { store as legacy } from './lib/legacy.svelte';
   import { overlays } from './lib/overlays.svelte';
   import { mascotPalette } from './lib/mascot/palette.svelte';
   import { mascots } from './lib/mascot/registry.svelte';
@@ -55,7 +56,7 @@
   // 已装的自定义吉祥物来自扩展列表（kind 为 mascot）。注册表只记名字和位置，代码由 MascotFrame 交给沙箱运行
   $effect(() => {
     mascots.setCustom(
-      store.extensions
+      legacy.extensions
         .filter((e) => e.kind === 'mascot' && e.enabled)
         .map((e) => ({ id: e.id, name: e.name, description: e.description, origin: e.origin })),
     );
@@ -97,6 +98,7 @@
     addEventListener('focus', focus);
 
     store.connect();
+    legacy.connect();
 
     return () => {
       removeEventListener('hashchange', fromHash);

@@ -7,7 +7,7 @@
 <script lang="ts">
   import { t, ago } from '../lib/i18n';
   import { ui } from '../lib/state.svelte';
-  import { store } from '../lib/store.svelte';
+  import { store } from '../lib/legacy.svelte';
   import { pop } from '../lib/motion';
   import type { Instance, UpdateInfo, UpdateStage } from '../lib/types';
   import Icon, { type IconName } from '../components/Icon.svelte';

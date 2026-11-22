@@ -5,7 +5,7 @@
 -->
 <script lang="ts">
   import { ui, type Page } from '../lib/state.svelte';
-  import { store } from '../lib/store.svelte';
+  import { store } from '../lib/legacy.svelte';
   import { overlays } from '../lib/overlays.svelte';
   import { mockControls } from '../lib/backend/mock';
   import { t } from '../lib/i18n';

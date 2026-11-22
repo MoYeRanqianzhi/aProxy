@@ -3,47 +3,60 @@
     一次成功   200（薄荷）
     救回       529 › 200 与重试次数（天蓝：下过雨，伞撑住了）
     重试中     伞 + 第 N 次（天蓝实心，次数翻牌）
-    接收中     三个跳动的小点（丁香）
-    失败       状态码或原因（珊瑚）
+    进行中     三个跳动的小点（丁香）；流式的写「接收中」
+    失败       交给客户端的状态码，或者原因（珊瑚）
   高度固定 24px，不会撑高日志行。
 -->
 <script lang="ts">
-  import type { LogEntry } from '../lib/types';
+  import type { Row } from '../lib/backend/contract';
   import { t } from '../lib/i18n';
+  import { codeText } from '../lib/faults';
+  import { retrying } from '../lib/view';
   import Icon from './Icon.svelte';
   import FlipNumber from './FlipNumber.svelte';
 
-  let { entry }: { entry: LogEntry } = $props();
+  let { row }: { row: Row } = $props();
 
-  const first = $derived(entry.attempts[0]);
-  const last = $derived(entry.attempts[entry.attempts.length - 1]);
-  const retries = $derived(Math.max(0, entry.attempts.length - 1));
-  const firstCode = $derived(first?.status ?? 'ERR');
+  // tries 可能不全（省略了中间的几次），按编号找，不按下标
+  const first = $derived(row.tries.find((x) => x.attempt === 1));
+  const last = $derived(row.tries.find((x) => x.attempt === row.attempts));
+  const retries = $derived(Math.max(0, row.attempts - 1));
+  /** 第一次尝试的结果：有状态码写状态码，没有（连不上、超时）写 ERR */
+  const firstCode = $derived(first?.upstreamStatus ?? 'ERR');
+  /** 正在进行的是第几次：退避等待时说的是下一次 */
+  const current = $derived(row.phase === 'backoff' ? row.attempts + 1 : row.attempts);
+  const why = $derived(row.code ? codeText(row.code, last?.upstreamStatus ?? null) : '');
 </script>
 
-{#if entry.outcome === 'ok'}
-  <span class="res ok"><span class="code">{last?.status ?? 200}</span></span>
-{:else if entry.outcome === 'rescued'}
+{#if row.outcome === 'ok' && row.attempts <= 1}
+  <span class="res ok"><span class="code">{row.clientStatus ?? last?.upstreamStatus ?? 200}</span></span>
+{:else if row.outcome === 'ok'}
   <span class="res rescued" title={t('logs.retriesTitle', { n: retries })}>
     <span class="code from">{firstCode}</span>
     <Icon name="chevronRight" size={11} stroke={3} />
-    <span class="code">{last?.status}</span>
+    <span class="code">{row.clientStatus ?? last?.upstreamStatus ?? 200}</span>
     <span class="times">{t('logs.retries', { n: retries })}</span>
   </span>
-{:else if entry.outcome === 'retrying'}
-  <span class="res retrying" title={t('logs.retriesTitle', { n: entry.attempts.length })}>
+{:else if retrying(row)}
+  <span class="res retrying" title={t('logs.retriesTitle', { n: retries })}>
     <span class="umb"><Icon name="umbrella" size={13} stroke={2.4} /></span>
     {t('logs.status.retrying')}
-    <span class="times">#<FlipNumber value={entry.attempts.length + 1} tiles={false} /></span>
+    <span class="times">#<FlipNumber value={current} tiles={false} /></span>
   </span>
-{:else if entry.outcome === 'streaming'}
+{:else if row.outcome === 'in-flight'}
   <span class="res streaming">
-    <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>{t('logs.status.streaming')}
+    <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>{t(row.stream ? 'logs.status.streaming' : 'logs.status.inflight')}
+  </span>
+{:else if row.outcome === 'client-gone'}
+  <span class="res failed" title={why}>
+    <Icon name="x" size={11} stroke={3} />
+    {t('logs.status.clientGone')}
   </span>
 {:else}
-  <span class="res failed" title={last?.reason ? t(`reason.${last.reason}`) : ''}>
+  <!-- upstream-error、aproxy-error、format-response、unknown：交给客户端的状态码最直接，没发出去就写原因 -->
+  <span class="res failed" title={why}>
     <Icon name="x" size={11} stroke={3} />
-    {last?.status ?? t('logs.status.failed')}
+    {row.clientStatus ?? last?.upstreamStatus ?? t('logs.status.failed')}
   </span>
 {/if}
 

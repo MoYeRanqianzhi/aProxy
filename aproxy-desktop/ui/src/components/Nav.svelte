@@ -7,7 +7,7 @@
   import { t } from '../lib/i18n';
   import { ui, type Page } from '../lib/state.svelte';
   import { store } from '../lib/store.svelte';
-  import type { Instance } from '../lib/types';
+  import { aliasOf, dotOf, forwardOnly } from '../lib/view';
   import Icon, { type IconName } from './Icon.svelte';
 
   const items = [
@@ -18,16 +18,10 @@
     ['settings', 'gear'],
   ] as const satisfies readonly (readonly [Page, IconName])[];
 
-  function dotOf(i: Instance): string {
-    if (i.status === 'stopped') return 'gray';
-    if (i.status === 'unresponsive') return 'coral';
-    if (i.status === 'restarting') return 'butter';
-    if (store.retrying.some((e) => e.port === i.port)) return 'sky breathe';
-    return i.status === 'active' ? 'mint breathe' : 'mint';
-  }
-
-  const retryingCount = $derived(store.retrying.length);
-  const watched = $derived(store.instances.filter((i) => i.status !== 'stopped').length);
+  /** 看护者管得着的：在运行、有可信运行记录的实例 */
+  const watched = $derived(store.cards.filter((c) => c.run !== null && c.liveness !== 'down').length);
+  /** 有安装正在进行、或检查到了新版本 */
+  const updateBadge = $derived((store.job !== null && store.job.end === null && store.job.fault === null) || store.offer?.updateAvailable === true);
 </script>
 
 <nav class="nav" aria-label={t('nav.main')}>
@@ -47,7 +41,7 @@
         <span class="label">{t('nav.instances')}</span>
       </div>
       <ul class="instances">
-        {#each store.instances as inst (inst.port)}
+        {#each store.cards as inst (inst.port)}
           <li>
             <button
               class="inst"
@@ -56,9 +50,9 @@
             >
               <span class="dot {dotOf(inst)}"></span>
               <span class="port mono">{inst.port}</span>
-              {#if inst.alias}<span class="alias">{inst.alias}</span>{/if}
+              {#if aliasOf(inst)}<span class="alias" title={inst.metadata?.aliases.join(', ')}>{aliasOf(inst)}</span>{/if}
               <!-- 仅转发（不重试）用和别处一样的警示胶带表示，窄栏里不占字 -->
-              {#if inst.forwardOnly}<span class="fo" title="{t('mode.forwardOnly')} / {t('mode.noRetry')}"><span class="sr-only">{t('mode.forwardOnly')}</span></span>{/if}
+              {#if forwardOnly(inst)}<span class="fo" title="{t('mode.forwardOnly')} / {t('mode.noRetry')}"><span class="sr-only">{t('mode.forwardOnly')}</span></span>{/if}
             </button>
           </li>
         {:else}
@@ -72,12 +66,12 @@
         <button class="item" aria-current={ui.page === page ? 'page' : undefined} onclick={() => ui.go(page)}>
           <Icon name={icon} size={18} />
           <span class="label">{t(`nav.${page}`)}</span>
-          {#if page === 'logs' && retryingCount > 0}
-            <span class="badge sky" title={t('card.retryingN', { n: retryingCount })}>
-              <Icon name="umbrella" size={12} stroke={2.4} />{retryingCount}
+          {#if page === 'logs' && store.retrying > 0}
+            <span class="badge sky" title={t('card.retryingN', { n: store.retrying })}>
+              <Icon name="umbrella" size={12} stroke={2.4} />{store.retrying}
             </span>
           {/if}
-          {#if page === 'update'}
+          {#if page === 'update' && updateBadge}
             <span class="badge butter">{t('nav.updateBadge')}</span>
           {/if}
         </button>
@@ -95,10 +89,12 @@
         </span>
       </span>
     </button>
-    <div class="version">
-      <span class="mono">v0.2.0</span>
-      <span class="chip lilac">desktop</span>
-    </div>
+    {#if store.about}
+      <div class="version">
+        <span class="mono">v{store.about.version}</span>
+        <span class="chip lilac">{store.about.variant}</span>
+      </div>
+    {/if}
   </div>
 </nav>
 

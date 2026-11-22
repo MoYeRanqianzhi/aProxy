@@ -15,7 +15,7 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
   import { ui } from '../lib/state.svelte';
-  import { store } from '../lib/store.svelte';
+  import { store } from '../lib/legacy.svelte';
   import { overlays, copyText } from '../lib/overlays.svelte';
   import { pop } from '../lib/motion';
   import { BUILTIN_THEME, SAMPLE_THEME, parseTheme, serializeTheme, type ThemeError } from '../lib/theme';

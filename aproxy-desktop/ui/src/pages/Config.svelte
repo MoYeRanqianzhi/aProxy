@@ -7,7 +7,7 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
   import { ui } from '../lib/state.svelte';
-  import { store } from '../lib/store.svelte';
+  import { store } from '../lib/legacy.svelte';
   import { overlays } from '../lib/overlays.svelte';
   import { backoffAfter } from '../lib/retry';
   import type { ConfigIssue, ConfigValues, InstanceConfig } from '../lib/types';

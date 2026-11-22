@@ -8,7 +8,7 @@
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { store } from '../lib/store.svelte';
+  import { store } from '../lib/legacy.svelte';
   import type { MascotRequest } from './MascotView.svelte';
 
   let {

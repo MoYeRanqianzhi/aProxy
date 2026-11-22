@@ -6,7 +6,7 @@
   允许意味着什么（以后这类操作不再问，可以撤销）。打开时焦点落在「拒绝」上：没看清就按回车，结果应该是不做。
 -->
 <script lang="ts">
-  import { store } from '../lib/store.svelte';
+  import { store } from '../lib/legacy.svelte';
   import { ui } from '../lib/state.svelte';
   import { overlays } from '../lib/overlays.svelte';
   import { t } from '../lib/i18n';

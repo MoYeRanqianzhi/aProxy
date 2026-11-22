@@ -7,6 +7,7 @@
  * 偏好以后持久化到 settings.json 的 ui 段，现在只在内存里。
  */
 
+import type { Ref } from './backend/contract';
 import type { ThemeSpec } from './types';
 
 /** mascots 是原型专用的吉祥物预览页，不在导航里，只在浏览器开发模式里从审核工具条或地址栏 #/mascots 进入（见 PAGES） */
@@ -39,6 +40,8 @@ class UiState {
   instancePort = $state(12346);
   /** 日志页打开详情的那一条（key = 端口:序号）；命令面板与总览也会设置它 */
   selectedLog = $state<string | null>(null);
+  /** 日志页打开详情的那一条；总览、实例页、命令面板也会设置它。raw：整个换掉，不深层代理 */
+  selectedRef = $state.raw<Ref | null>(null);
   /** 从别处跳到日志页时预设的实例筛选 */
   logInstanceFilter = $state<number | 'all'>('all');
 

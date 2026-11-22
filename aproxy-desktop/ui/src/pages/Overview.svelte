@@ -6,49 +6,65 @@
 <script lang="ts">
   import { t, fmtNum, ago, uptime } from '../lib/i18n';
   import { ui } from '../lib/state.svelte';
-  import { store } from '../lib/store.svelte';
+  import { refKey, sameRef, store } from '../lib/store.svelte';
   import { overlays } from '../lib/overlays.svelte';
-  import type { Instance, LogEntry } from '../lib/types';
+  import type { Card, Row, Watchdog } from '../lib/backend/contract';
+  import { toFailure } from '../lib/backend/link';
+  import { codeText, faultText } from '../lib/faults';
+  import { aliasOf, controllable, forwardOnly, hourBuckets, lastHour, rescued, statusOf } from '../lib/view';
   import MascotView from '../components/MascotView.svelte';
   import { mascots } from '../lib/mascot/registry.svelte';
   import FlipNumber from '../components/FlipNumber.svelte';
   import Sparkline from '../components/Sparkline.svelte';
   import Icon from '../components/Icon.svelte';
   import ResultChip from '../components/ResultChip.svelte';
+  import StartMenu from '../components/StartMenu.svelte';
 
   const mood = $derived(store.mood);
-  const running = $derived(store.instances.filter((i) => i.status !== 'stopped'));
-  const req1h = $derived(store.instances.reduce((s, i) => s + i.req1h, 0));
-  const retry1h = $derived(store.instances.reduce((s, i) => s + i.retry1h, 0));
-  const unresponsive = $derived(store.instances.find((i) => i.status === 'unresponsive'));
-  const rescuedEntry = $derived(store.rescuedKey ? store.logs.find((e) => e.key === store.rescuedKey) : undefined);
+  /** 在运行的：有可信的运行记录、进程还在 */
+  const running = $derived(store.cards.filter((c) => c.run !== null && c.liveness !== 'down'));
+
+  /** 近一小时的请求或重试：各实例分桶之和；没有一个实例提供分桶时为 null，显示「—」 */
+  function hourSum(key: 'requests' | 'retries'): number | null {
+    const parts = store.cards.map((c) => lastHour(c.activity?.buckets, key)).filter((v) => v !== null);
+    return parts.length ? parts.reduce((s, v) => s + v, 0) : null;
+  }
+  const req1h = $derived(hourSum('requests'));
+  const retry1h = $derived(hourSum('retries'));
+  /** 各实例这次运行以来救回的请求之和：实例重启后从头算，所以界面写明「自各实例这次启动以来」 */
+  const rescuedTotal = $derived(store.cards.reduce((s, c) => s + (c.activity?.rescuedTotal ?? 0), 0));
+  const unresponsive = $derived(store.cards.find((c) => c.liveness === 'unresponsive'));
+  /** 正在庆祝的那条；不在最近 50 条里就只说「救回了一个」 */
+  const rescuedRow = $derived(store.recent.find((r) => sameRef(r.ref, store.rescuedRef)));
   const quietMins = $derived.by(() => {
-    const last = Math.max(0, ...store.instances.map((i) => i.lastRequestAt ?? 0));
+    const last = Math.max(0, ...store.cards.map((c) => c.activity?.lastRequestAt ?? 0));
     return Math.max(1, Math.round((store.now - last) / 60_000));
   });
 
-  const retryWhere = $derived.by(() => {
-    const ports = [...new Set(store.retrying.map((e) => e.port))];
-    const en = ui.lang === 'en';
-    return ports
-      .map((p) => {
-        const alias = store.instance(p)?.alias;
-        if (!alias) return String(p);
-        return en ? `${alias} (${p})` : `${alias}（${p}）`;
-      })
-      .join(en ? ', ' : '、');
-  });
+  /** 某个实例的名字：有别名写「别名（端口）」，没有就是端口 */
+  function nameOf(c: Card): string {
+    const alias = aliasOf(c);
+    if (!alias) return String(c.port);
+    return ui.lang === 'en' ? `${alias} (${c.port})` : `${alias}（${c.port}）`;
+  }
+
+  const retryWhere = $derived(
+    store.cards
+      .filter((c) => (c.activity?.retrying ?? 0) > 0)
+      .map(nameOf)
+      .join(ui.lang === 'en' ? ', ' : '、'),
+  );
 
   const headline = $derived.by(() => {
     switch (mood) {
       case 'worried':
         return t('ov.hero.worried', { port: unresponsive?.port ?? '' });
       case 'retrying':
-        return t('ov.hero.retrying', { n: store.retrying.length });
+        return t('ov.hero.retrying', { n: store.retrying });
       case 'rescued':
         return t('ov.hero.rescued');
       case 'working':
-        return t('ov.hero.working', { n: store.inflight.length });
+        return t('ov.hero.working', { n: store.inflight });
       case 'sleeping':
         return t('ov.hero.sleeping');
       default:
@@ -59,13 +75,11 @@
   const sub = $derived.by(() => {
     switch (mood) {
       case 'worried':
-        return t('ov.hero.worriedSub', { secs: Math.round((store.now - (unresponsive?.silentSince ?? store.now)) / 1000) });
+        return t('ov.hero.worriedSub');
       case 'retrying':
         return t('ov.hero.retryingSub', { where: retryWhere });
       case 'rescued':
-        return rescuedEntry
-          ? t('ov.hero.rescuedSub', { path: rescuedEntry.path.split('?')[0], n: rescuedEntry.attempts.length })
-          : t('ov.hero.rescuedSubPlain');
+        return rescuedRow ? t('ov.hero.rescuedSub', { path: rescuedRow.path.split('?')[0], n: rescuedRow.attempts }) : t('ov.hero.rescuedSubPlain');
       case 'working':
         return t('ov.hero.workingSub');
       case 'sleeping':
@@ -75,47 +89,93 @@
     }
   });
 
-  const recent = $derived(
-    store.logs
-      .filter((e) => e.outcome === 'rescued')
-      .slice(-4)
-      .reverse(),
-  );
+  /** 最近救回的几条：最近 50 条里的，新的在前 */
+  const recentRescues = $derived(store.recent.filter(rescued).slice(0, 4));
 
-  function retryingOn(port: number) {
-    return store.retrying.filter((e) => e.port === port).length;
-  }
-  function inflightOn(port: number) {
-    return store.inflight.filter((e) => e.port === port).length;
-  }
-
-  function openLog(e: LogEntry) {
-    ui.selectedLog = e.key;
+  function openLog(r: Row) {
+    ui.selectedRef = r.ref;
     ui.go('logs');
   }
 
-  async function startInstance(inst: Instance) {
-    await store.start(inst.port);
-    overlays.toast(t('toast.started', { name: inst.alias ?? inst.port }));
+  function fail(raw: unknown) {
+    overlays.toast(faultText(toFailure(raw)), 'coral');
   }
 
-  // 不给端口：按默认配置启动第一个实例
+  /** 空状态里的「启动第一个实例」：用默认配置 */
+  let startingFirst = $state(false);
   async function startFirst() {
-    await store.start();
-    overlays.toast(t('toast.started', { name: 'default' }));
+    if (startingFirst) return;
+    startingFirst = true;
+    try {
+      const choices = await store.listConfigs();
+      const choice = choices.find((c) => c.isDefault) ?? choices[0];
+      if (!choice) {
+        overlays.toast(t('start.none'), 'coral');
+        return;
+      }
+      await store.start(choice.target);
+      overlays.toast(t('toast.started', { name: choice.label }));
+    } catch (raw) {
+      fail(raw);
+    } finally {
+      startingFirst = false;
+    }
+  }
+
+  /** 实例不在了、但留着「应当在运行」的记录：照记录重新启动 */
+  async function restore(c: Card) {
+    if (!c.expectedRestore) return;
+    try {
+      await store.restore(c.port, c.expectedRestore);
+      overlays.toast(t('toast.started', { name: nameOf(c) }));
+    } catch (raw) {
+      fail(raw);
+    }
+  }
+
+  /** 放弃恢复：删掉那条记录，卡片随之消失。配置文件不动 */
+  function forget(c: Card) {
+    const token = c.expectedRestore;
+    if (!token) return;
+    overlays.ask({
+      title: t('card.forgetTitle', { name: nameOf(c) }),
+      body: t('card.forgetBody'),
+      okLabel: t('card.forget'),
+      danger: false,
+      onOk: () => void store.forgetRestore(c.port, token).catch(fail),
+    });
+  }
+
+  async function enableWatchdog() {
+    try {
+      await store.setWatchdog(true);
+    } catch (raw) {
+      fail(raw);
+    }
+  }
+
+  function restartLine(r: Watchdog['restarts'][number]): string {
+    const vars = { port: r.port, ago: ago(store.now - r.at) };
+    if (!r.ok) return t('wd.restartFailed', vars);
+    if (r.kind === 'hang') return t('wd.respawned', vars);
+    return t(r.kind === 'crash' ? 'wd.restartedCrash' : 'wd.restarted', vars);
   }
 </script>
 
-{#if store.instances.length === 0}
+{#if !store.connected}
+  <!-- 第一次读完之前不下结论：「没有实例」要等真的读到了才能讲 -->
+  <section class="empty connecting">
+    <p>{store.readFault ? faultText(store.readFault) : t('ov.connecting')}</p>
+  </section>
+{:else if store.cards.length === 0}
   <!-- 空状态：没有任何实例。吉祥物在睡觉，给出唯一的下一步 -->
   <section class="empty">
     {#if mascots.current}<MascotView mood="sleeping" size="hero" px={150} />{/if}
     <h1>{t('empty.instances.title')}</h1>
     <p>{t('empty.instances.body')}</p>
-    <button class="btn primary big" onclick={startFirst}>
+    <button class="btn primary big" onclick={startFirst} disabled={startingFirst}>
       <Icon name="play" size={16} />{t('empty.instances.cta')}
     </button>
-    <span class="hint">{t('empty.instances.hint', { path: '' })}<code class="mono">~/.aproxy/config.toml</code></span>
   </section>
 {:else}
   <section class="hero mood-{mood}" class:bare={!mascots.current}>
@@ -129,85 +189,103 @@
       <h1>{headline}</h1>
       <p>{sub}</p>
       <div class="stats">
-        <span class="stat"><Icon name="hourglass" size={15} /><span class="lbl">{t('ov.inflight')}</span><b class="num">{store.inflight.length}</b></span>
-        <span class="stat"><Icon name="list" size={15} /><span class="lbl">{t('ov.req1h')}</span><b class="num">{fmtNum(req1h)}</b></span>
-        <span class="stat"><Icon name="umbrella" size={15} /><span class="lbl">{t('ov.retry1h')}</span><b class="num">{fmtNum(retry1h)}</b></span>
+        <span class="stat"><Icon name="hourglass" size={15} /><span class="lbl">{t('ov.inflight')}</span><b class="num">{store.inflight}</b></span>
+        <span class="stat"><Icon name="list" size={15} /><span class="lbl">{t('ov.req1h')}</span><b class="num">{req1h === null ? '—' : fmtNum(req1h)}</b></span>
+        <span class="stat"><Icon name="umbrella" size={15} /><span class="lbl">{t('ov.retry1h')}</span><b class="num">{retry1h === null ? '—' : fmtNum(retry1h)}</b></span>
       </div>
     </div>
     <div class="rescued">
       <span class="r-label">{t('ov.rescued')}</span>
-      <span class="r-count"><FlipNumber value={store.rescuedTotal} /></span>
+      <span class="r-count"><FlipNumber value={rescuedTotal} /></span>
       <span class="r-unit">{t('ov.rescuedUnit')}</span>
-      <span class="r-today chip mint"><Icon name="sparkles" size={13} />{t('ov.rescuedToday', { n: store.rescuedToday })}</span>
+      <span class="r-today chip mint"><Icon name="sparkles" size={13} />{t('ov.rescuedSince')}</span>
     </div>
   </section>
 
+  {#if store.readFault}
+    <div class="banner coral read-fault"><Icon name="alert" size={16} /><p>{faultText(store.readFault)}</p></div>
+  {/if}
+
   <div class="section-head">
-    <h2 class="section-title">{t('ov.instances')}<span class="count">{store.instances.length}</span></h2>
-    <button class="btn sm" onclick={() => overlays.toast(t('toast.protoOnly'), 'lilac')}>
-      <Icon name="plus" size={14} stroke={2.4} />{t('ov.startInstance')}
-    </button>
+    <h2 class="section-title">{t('ov.instances')}<span class="count">{store.cards.length}</span></h2>
+    <StartMenu />
   </div>
 
   <div class="cards">
-    {#each store.instances as inst (inst.port)}
-      {@const retrying = retryingOn(inst.port)}
-      <article class="icard st-{inst.status}" class:retrying={retrying > 0}>
-        <button class="hit" onclick={() => ui.go('instance', inst.port)} aria-label="{inst.port} {inst.alias ?? ''}"></button>
+    {#each store.cards as inst (inst.port)}
+      {@const status = statusOf(inst)}
+      {@const retrying = inst.activity?.retrying ?? 0}
+      {@const spark = hourBuckets(inst.activity?.buckets)}
+      {@const req = lastHour(inst.activity?.buckets, 'requests')}
+      {@const retries = lastHour(inst.activity?.buckets, 'retries')}
+      {@const lastError = inst.activity?.lastError ?? null}
+      <article class="icard st-{status}" class:retrying={retrying > 0}>
+        <button class="hit" onclick={() => ui.go('instance', inst.port)} aria-label="{inst.port} {aliasOf(inst) ?? ''}"></button>
         <header>
           <span class="port">{inst.port}</span>
-          {#if inst.alias}<span class="alias">{inst.alias}</span>{/if}
+          {#if aliasOf(inst)}<span class="alias" title={inst.metadata?.aliases.join(', ')}>{aliasOf(inst)}</span>{/if}
         </header>
         <div class="badges">
-          {#if inst.status === 'stopped'}
-            <span class="chip"><span class="dot gray"></span>{t('status.stopped')}</span>
-          {:else if inst.status === 'unresponsive'}
+          {#if status === 'restore'}
+            <span class="chip butter"><Icon name="clock" size={13} stroke={2.4} />{t('status.restore')}</span>
+          {:else if status === 'unresponsive'}
             <span class="chip solid coral"><Icon name="alert" size={13} stroke={2.4} />{t('status.unresponsive')}</span>
-          {:else if inst.status === 'restarting'}
-            <span class="chip butter"><span class="spin"></span>{t('status.restarting')}</span>
+          {:else if status === 'starting' || status === 'restarting' || status === 'stopping'}
+            <span class="chip butter"><span class="spin"></span>{t(`status.${status}`)}</span>
+          {:else if status === 'down' || status === 'incompatible' || status === 'unknown'}
+            <span class="chip"><span class="dot gray"></span>{t(`status.${status}`)}</span>
           {:else if retrying > 0}
             <span class="chip solid sky"><Icon name="umbrella" size={13} stroke={2.4} />{t('card.retryingN', { n: retrying })}</span>
           {:else}
-            <span class="chip mint"><span class="dot mint" class:breathe={inst.status === 'active'}></span>{t(`status.${inst.status}`)}</span>
+            <span class="chip mint"><span class="dot mint" class:breathe={status === 'active'}></span>{t(`status.${status}`)}</span>
           {/if}
-          {#if inst.status !== 'stopped'}
-            {#if inst.forwardOnly}
+          {#if inst.metadata}
+            {#if forwardOnly(inst)}
               <span class="hazard"><span class="tape"></span>{t('mode.forwardOnly')}<span class="sep">/</span>{t('mode.noRetry')}</span>
-            {:else if inst.transform}
-              <span class="chip lilac"><Icon name="shuffle" size={12} stroke={2.4} />{t('mode.keys', { n: inst.transform.keys })}</span>
             {:else}
-              <span class="chip"><Icon name="upstream" size={12} stroke={2.4} /><span class="host">{inst.baseUrl.replace(/^https?:\/\//, '')}</span></span>
+              <span class="chip"><Icon name="upstream" size={12} stroke={2.4} /><span class="host">{inst.metadata.baseUrl.replace(/^https?:\/\//, '')}</span></span>
             {/if}
           {/if}
         </div>
 
-        {#if inst.status === 'stopped'}
-          <p class="stopped-hint">{t('card.stoppedHint', { path: '' })}<code class="mono">{inst.configPath}</code></p>
-          <div class="stopped-act">
-            <button class="btn sm mint" onclick={() => startInstance(inst)}><Icon name="play" size={13} />{t('card.start')}</button>
-          </div>
+        {#if status === 'restore'}
+          <p class="stopped-hint">{t(inst.restoreReason === 'config-missing' ? 'card.restoreMissing' : 'card.restoreHint')}</p>
+          {#if inst.expectedRestore}
+            <div class="stopped-act">
+              <button class="btn sm mint" onclick={() => restore(inst)}><Icon name="play" size={13} />{t('card.restore')}</button>
+              <button class="btn sm ghost" onclick={() => forget(inst)}>{t('card.forget')}</button>
+            </div>
+          {/if}
+        {:else if !inst.activity}
+          <p class="stopped-hint">{t(controllable(inst) ? 'card.noActivity' : 'card.noRun')}</p>
         {:else}
-          <Sparkline req={inst.spark.req} retry={inst.spark.retry} label={t('card.sparkLabel')} />
+          {#if spark}
+            <Sparkline req={spark.req} retry={spark.retry} label={t('card.sparkLabel', { m: Math.max(1, Math.round(inst.activity.buckets.widthSecs / 60)) })} />
+          {/if}
           <dl class="metrics">
-            <div><dt><i class="k req"></i>{t('card.requests')}</dt><dd class="num">{fmtNum(inst.req1h)}</dd></div>
-            <div><dt><i class="k retry"></i>{t('card.retries')}</dt><dd class="num">{inst.forwardOnly ? '—' : fmtNum(inst.retry1h)}</dd></div>
-            <div><dt>{t('card.inflight')}</dt><dd class="num">{inflightOn(inst.port)}</dd></div>
+            <div><dt><i class="k req"></i>{t('card.requests')}</dt><dd class="num">{req === null ? '—' : fmtNum(req)}</dd></div>
+            <div><dt><i class="k retry"></i>{t('card.retries')}</dt><dd class="num">{forwardOnly(inst) || retries === null ? '—' : fmtNum(retries)}</dd></div>
+            <div><dt>{t('card.inflight')}</dt><dd class="num">{inst.activity.inFlight}</dd></div>
           </dl>
           <footer>
-            {#if inst.status === 'unresponsive'}
+            {#if status === 'unresponsive'}
               <span class="err"><Icon name="plug" size={13} /><span class="ell">{t('ov.hero.worried', { port: inst.port })}</span></span>
-            {:else if inst.lastError && store.now - inst.lastError.at < 3_600_000}
+            {:else if inst.historyUnavailable === 'source-redaction-missing'}
+              <span class="err" title={t('card.oldVersionHint')}><Icon name="restart" size={13} /><span class="ell">{t('card.oldVersion')}</span></span>
+            {:else if lastError && store.now - lastError.at < 3_600_000}
               <span class="err" title={t('card.lastError')}>
-                <Icon name="cloudRain" size={13} /><span class="ell">{t(`reason.${inst.lastError.reason}`)}</span><span class="when">{ago(store.now - inst.lastError.at)}</span>
+                <Icon name="cloudRain" size={13} /><span class="ell">{codeText(lastError.code, lastError.status)}</span><span class="when">{ago(store.now - lastError.at)}</span>
               </span>
             {:else}
               <span class="ok"><Icon name="check" size={13} stroke={2.4} />{t('card.noErrors')}</span>
             {/if}
-            <span class="up">
-              {inst.status === 'idle' && inst.lastRequestAt
-                ? t('card.idleFor', { d: uptime(store.now - inst.lastRequestAt) })
-                : t('card.uptime', { d: uptime(store.now - inst.startedAt) })}
-            </span>
+            {#if inst.startedAt !== null}
+              <span class="up">
+                {status === 'idle' && inst.activity.requestsTotal > 0
+                  ? t('card.idleFor', { d: uptime(store.now - inst.activity.lastRequestAt) })
+                  : t('card.uptime', { d: uptime(store.now - inst.startedAt) })}
+              </span>
+            {/if}
           </footer>
         {/if}
       </article>
@@ -219,17 +297,19 @@
       <div class="wd-badge"><Icon name={store.watchdogOn ? 'shield' : 'shieldOff'} size={22} /></div>
       <div class="wd-body">
         <h3>{t('wd.title')}</h3>
-        {#if store.watchdogOn}
-          <p class="wd-main">{running.length ? t('wd.watching', { n: running.length }) : t('wd.nothing')}</p>
-          {#if store.watchdog}
-            <p class="wd-meta">{t('wd.lastScan', { ago: ago(store.now - store.watchdog.lastScanAt) })}</p>
-            {#each store.watchdog.respawns as r (r.at)}
-              <p class="wd-event"><Icon name="restart" size={13} />{t('wd.respawned', { port: r.port, ago: ago(store.now - r.at) })}</p>
-            {/each}
-          {/if}
-        {:else}
+        {#if !store.watchdogOn}
           <p class="wd-main">{t('wd.disabled')}</p>
-          <button class="btn sm mint" onclick={() => store.updateSettings({ watchdog: true })}>{t('wd.enable')}</button>
+          <button class="btn sm mint" onclick={enableWatchdog}>{t('wd.enable')}</button>
+        {:else if store.watchdog === null}
+          <p class="wd-main">{t('wd.notRunning')}</p>
+        {:else}
+          <p class="wd-main">{running.length ? t('wd.watching', { n: running.length }) : t('wd.nothing')}</p>
+          <p class="wd-meta">
+            {t(store.watchdog.state === 'stale' ? 'wd.stale' : 'wd.lastScan', { ago: ago(store.now - store.watchdog.lastScanAt) })}
+          </p>
+          {#each store.watchdog.restarts as r (`${r.port}/${r.at}`)}
+            <p class="wd-event"><Icon name="restart" size={13} />{restartLine(r)}</p>
+          {/each}
         {/if}
       </div>
     </section>
@@ -240,16 +320,18 @@
         <button class="btn ghost sm" onclick={() => ui.go('logs')}>{t('ov.viewAll')}<Icon name="chevronRight" size={14} /></button>
       </div>
       <ul>
-        {#each recent as e (e.key)}
+        {#each recentRescues as r (refKey(r.ref))}
           <li>
-            <button onclick={() => openLog(e)}>
-              <ResultChip entry={e} />
-              <span class="rs-path mono">{e.path.split('?')[0]}</span>
-              <span class="rs-model">{e.model ?? ''}</span>
-              <span class="rs-line">{t('ov.rescueLine', { n: e.attempts.length })}</span>
-              <span class="rs-when">{ago(store.now - e.time)}</span>
+            <button onclick={() => openLog(r)}>
+              <ResultChip row={r} />
+              <span class="rs-path mono">{r.path.split('?')[0]}</span>
+              <span class="rs-model">{r.model ?? ''}</span>
+              <span class="rs-line">{t('ov.rescueLine', { n: r.attempts })}</span>
+              <span class="rs-when">{ago(store.now - (r.endedAt ?? r.startedAt))}</span>
             </button>
           </li>
+        {:else}
+          <li class="rs-none">{t('ov.noRescues')}</li>
         {/each}
       </ul>
     </section>
@@ -407,10 +489,23 @@
     padding: 0 22px;
     font-size: var(--fs-lg);
   }
-  .hint {
-    margin-top: 10px;
-    color: var(--text-3);
+  .empty.connecting {
+    padding-top: 120px;
+  }
+  /* 重读失败：上一次读到的内容还在下面显示着，这里说明它可能不是最新的 */
+  .read-fault {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: -10px 0 20px;
+    padding: 10px 14px;
+    border-radius: var(--r-md);
+    background: var(--coral-soft);
+    color: var(--coral-deep);
     font-size: var(--fs-sm);
+  }
+  .read-fault p {
+    margin: 0;
   }
 
   /* ---------- 实例卡片 ---------- */
@@ -598,11 +693,11 @@
     font-size: var(--fs-sm);
     line-height: 1.6;
   }
-  .stopped-hint code {
-    color: var(--text-2);
-  }
   .stopped-act {
+    position: relative;
     margin-top: auto;
+    display: flex;
+    gap: 8px;
   }
   .spin {
     width: 11px;
@@ -714,6 +809,11 @@
   .rs-when {
     color: var(--text-3);
     white-space: nowrap;
+  }
+  .rs-none {
+    padding: 10px 4px;
+    color: var(--text-3);
+    font-size: var(--fs-sm);
   }
   .rs-line {
     color: var(--sky-deep);

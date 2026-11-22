@@ -1,9 +1,19 @@
 /*
- * 界面使用的那一个 Backend。现在桌面窗口与浏览器里用的都是 mock（预览版的演示数据，界面据它的 demo 标明）；
- * 真实数据接进来时在这里按运行环境换成 Tauri IPC 实现，将来的 Web UI 换成 HTTP/WebSocket 实现——
- * 除了这一行，界面的其余代码都不用改。
+ * 界面用的那一条传输层：桌面窗口里经 Tauri 发给 Rust，浏览器里（开发、截图）用演示数据。
+ * 两者对 store 完全一样（见 link.ts），除了这里，界面的其余代码不知道自己接的是哪一个。
+ *
+ * 演示实现也打进了生产构建：选哪个要到运行时才知道（isTauri），打包时删不掉。它不碰任何系统资源，
+ * 只在页面不在 aProxy 窗口里时才会被用到，标题栏据 link.demo 常驻标明「演示数据」。
+ *
+ * backend 是迁移期间的旧接口，只给还没改到契约的页面（../legacy.svelte.ts）用。
  */
+import { isTauri } from '@tauri-apps/api/core';
+import type { Link } from './link';
+import { tauriLink } from './tauri';
+import { demoLink } from './demo';
 import type { Backend } from './types';
 import { mockBackend } from './mock';
+
+export const link: Link = isTauri() ? tauriLink : demoLink;
 
 export const backend: Backend = mockBackend;

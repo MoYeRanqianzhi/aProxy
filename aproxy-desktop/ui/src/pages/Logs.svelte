@@ -11,7 +11,7 @@
   import { onMount, tick } from 'svelte';
   import { t, clock, durShort, bytes, fmtNum } from '../lib/i18n';
   import { ui } from '../lib/state.svelte';
-  import { store } from '../lib/store.svelte';
+  import { store } from '../lib/legacy.svelte';
   import { overlays } from '../lib/overlays.svelte';
   import type { LogEntry } from '../lib/types';
   import { slideIn, pop, fadeOut } from '../lib/motion';
@@ -19,7 +19,7 @@
   import Segmented from '../components/Segmented.svelte';
   import Dropdown from '../components/Dropdown.svelte';
   import Switch from '../components/Switch.svelte';
-  import ResultChip from '../components/ResultChip.svelte';
+  import ResultChip from '../components/LegacyResultChip.svelte';
   import MascotView from '../components/MascotView.svelte';
   import { mascots } from '../lib/mascot/registry.svelte';
   import LogDetail from './LogDetail.svelte';

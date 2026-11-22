@@ -6,12 +6,12 @@
 <script lang="ts">
   import { t, stamp, durShort, durLong, bytes, ago } from '../lib/i18n';
   import { ui } from '../lib/state.svelte';
-  import { store } from '../lib/store.svelte';
+  import { store } from '../lib/legacy.svelte';
   import { overlays, copyText } from '../lib/overlays.svelte';
   import type { Attempt, LogEntry, RequestDetail } from '../lib/types';
   import { drawer, fadeOut, pop } from '../lib/motion';
   import Icon from '../components/Icon.svelte';
-  import ResultChip from '../components/ResultChip.svelte';
+  import ResultChip from '../components/LegacyResultChip.svelte';
   import JsonView from '../components/JsonView.svelte';
 
   let {

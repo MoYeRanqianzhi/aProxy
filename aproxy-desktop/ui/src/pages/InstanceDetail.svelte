@@ -6,7 +6,7 @@
 <script lang="ts">
   import { t, ago, durLong, uptime } from '../lib/i18n';
   import { ui } from '../lib/state.svelte';
-  import { store } from '../lib/store.svelte';
+  import { store } from '../lib/legacy.svelte';
   import { overlays } from '../lib/overlays.svelte';
   import type { Instance, LogEntry } from '../lib/types';
   import { pop } from '../lib/motion';

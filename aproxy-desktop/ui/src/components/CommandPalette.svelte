@@ -5,7 +5,7 @@
 <script lang="ts">
   import { overlays } from '../lib/overlays.svelte';
   import { ui, type Page } from '../lib/state.svelte';
-  import { store } from '../lib/store.svelte';
+  import { store } from '../lib/legacy.svelte';
   import { t } from '../lib/i18n';
   import { pop, fadeOut } from '../lib/motion';
   import Icon, { type IconName } from './Icon.svelte';

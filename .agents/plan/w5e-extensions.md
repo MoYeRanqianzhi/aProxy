@@ -38,25 +38,32 @@ Gate F 已过）加深的正是这些，不合入，留作参考。master 上已
 - 安装提醒里写明：这个扩展会执行代码、可能连接网络。
 
 **扩展与 format 互通（用户 2026-11-23 补充）。** format 的开发者可以同时发一个扩展，让人在界面里直接控制这个 format
-（看它的状态、切换它的开关、调它的参数），不用改 TOML、不用重启。做法是在 format 协议 1 里加一个可选的控制通道：
-- **协商。** 用协议 1 已有的 `features`：实例在 hello 里列出 `control`，程序在回复里也列出，才算打开。不打开的程序
-  什么都不变，所以不升协议版本。
-- **消息。** 实例发 `{"v":1,"seq":n,"stage":"control","method":"<名字>","params":{…}}`，程序回 `{"v":1,"seq":n,"result":{…}}`
-  或协议里已有的错误形状。行长按 hello 里 `limits.control` 一组。`method` 与 `params` 的含义由 format 自己定，aProxy 只转交、
-  不解释。spawn 模式为这一次调用起一个进程；persistent 模式交给池里一个空闲的 worker（多 worker 的程序要自己把状态放在
-  共享的地方，协议文档里写明）。
-- **路由。** 实例的 IPC 加一个操作：按 `[[format]]` 的 `name` 转交一次控制调用，带大小上限与超时，熔断打开时直接报错。
-  桌面加一个命令（以 Run 指定实例），给扩展的 `api` 加 `formats.list(run)`（这个实例配置了哪些 format、各自的名字、
-  程序名与版本、是否支持 control）与 `formats.call(run, name, method, params)`。
+（看它的状态、切换它的开关、调它的参数）。control 是一个**独立的进程**，和处理请求、返回的 worker 完全分开：
+- **怎么启动。** format 在 hello 回复里可以给一个可选字段 `"control": {"args": [...]}`（例如
+  `["keys", "control", "--config", "keys.toml"]`）。aProxy 需要时用同一个 `command`、同样的环境变量加这组参数起 control
+  进程。不给这个字段就没有 control。用户不用改 config.toml。
+- **怎么说话。** 沿用协议 1 的分帧：先 hello（`stages: ["control"]`），之后一问一答
+  `{"v":1,"seq":n,"stage":"control","method":"<名字>","params":{…}}` → `{"v":1,"seq":n,"result":{…}}` 或协议已有的错误形状。
+  `method` 与 `params` 的含义由 format 作者自定，aProxy 只转交、不解释。行长按 hello 里 `limits.control` 一组。
+- **为什么分开。** 请求 worker 同一时间只处理一条消息，池满时要排队；control 若借用它们，会在流量大时等上最多
+  `timeout_secs`，还会占走请求的名额。独立进程不占 `pool_max`、不排请求的队，挂了也不影响请求；期限另定（短，例如 5 秒），
+  超时只换掉 control 进程。control 进程可以常驻（空闲一段时间后退役）。
+- **生效时机由 format 作者决定。** control 进程与请求 worker 是不同的进程，互相看不到内存。改动要影响请求，format 自己
+  选办法：写回自己的配置文件、放进共享文件让 worker 读，或者干脆告诉用户「重启实例后生效」。aProxy 不规定，协议文档里
+  写明这一点。官方角色只在进程启动时读一次 TOML：persistent 模式下改了文件要等 worker 换新（干净的做法是重启实例），
+  spawn 模式下一条消息就会读到新文件。
+- **路由。** 实例的 IPC 加一个操作：按 `[[format]]` 的 `name` 转交一次 control 调用，带大小上限与超时。桌面加一个命令
+  （以 Run 指定实例），给扩展的 `api` 加 `formats.list(run)`（这个实例配置了哪些 format、各自的名字、程序名与版本、
+  有没有 control）与 `formats.call(run, name, method, params)`。
 - **配对。** 扩展的 manifest 可以写 `formats: ["<程序名>"]`（hello 回复里的 `name`），说明它是给哪个 format 做的界面；
-  实例页上列 format 时，对有配对扩展的显示它挂进来的控制面板（扩展通过挂载点放进去）。
-- **文档。** 协议的改动要写进 aproxy-format skill 的 `references/protocol.md`（英文，主代理写；Codex 不改 `.claude/`）。
-  官方 aproxy-format 的各角色暂不实现 control，以后按需加（例如 keys 显示密钥池状态、临时停用一个密钥）。
+  实例页列 format 时，对有配对扩展的显示它挂进来的控制面板（扩展通过挂载点放进去）。
+- **文档。** 协议的改动和「什么时候生效」写进 aproxy-format skill 的 `references/protocol.md` 与 `guide.md`（英文，主代理写；
+  Codex 不改 `.claude/`）。官方 aproxy-format 的各角色暂不实现 control，以后按需加。
 
 **接口暴露。** 扩展模块导出 `activate(api)`。`api` 是界面 store 的薄包装：读（实例卡片、最近请求、分页日志、请求详情）、
 订阅变化、写（启动、停止、重启实例，读写配置，检查与安装更新）、外观接口、format 控制。写操作不另加授权，安装时的提醒已经说清楚了。
 
-**分工。** Codex 做 Rust 侧：包的读取与安装、列出、启停、卸载，包文件的 sha256，GitHub 查询，format 的 control 通道（协议、实例 IPC、桌面命令），相应的桌面命令（安装分两步：
+**分工。** Codex 做 Rust 侧：包的读取与安装、列出、启停、卸载，包文件的 sha256，GitHub 查询，format 的 control 进程（hello 回复里的 control 参数、独立进程的启动与退役、实例 IPC、桌面命令），相应的桌面命令（安装分两步：
 先「检查」返回清单摘要与可信度事实，再带检查时的句柄「安装」），并删掉 master 上 t10 的沙箱、租约、授权与审计代码。
 主代理做前端：弹窗、设置页的列表、主题包的样式与图片加载、扩展加载与 `api`。
 

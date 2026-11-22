@@ -726,3 +726,34 @@ async fn metadata_hints_and_private_read_slots_do_not_issue_or_extend_authority(
     assert!(!a.host.inventory().packages[0].enabled);
     assert!(a.host.check_lease(&a.lease).is_err());
 }
+
+#[tokio::test]
+async fn refusal_activity_is_bounded_and_reprojected_without_a_pending_or_executing_grant() {
+    use aproxy_ipc::desktop::{ExtensionOps, Permission};
+    let a = AttachedTest::new().await;
+    let path = a.home.path().join("desktop/extension-state.json");
+    let snapshot = fs::read(&path).unwrap();
+    assert_eq!(
+        a.host.package_busy("obsolete", Permission::InstanceStart),
+        Err(Fault::DesktopExtensionDenied {})
+    );
+    assert_eq!(fs::read(&path).unwrap(), snapshot);
+    for _ in 0..129 {
+        assert_eq!(
+            a.host.package_busy(&a.lease, Permission::InstanceStart),
+            Err(Fault::DesktopBusy {})
+        );
+    }
+    let audit = a.host.extension_audit().unwrap();
+    assert_eq!(audit.len(), 128);
+    assert!(
+        audit
+            .iter()
+            .all(|r| r.outcome == ExtOutcome::Denied && r.target.is_none())
+    );
+    assert!(a.host.extension_inventory().packages[0].grants.is_empty());
+    a.home.settings(r#"{"watchdog":{"enabled":false},"defaults":{"base_url":"http://127.0.0.1:9","api_key":"violet-desk"}}"#);
+    assert!(a.host.extension_audit().unwrap().is_empty());
+    assert!(a.host.extension_inventory().packages.is_empty());
+    assert!(a.host.check_lease(&a.lease).is_err());
+}

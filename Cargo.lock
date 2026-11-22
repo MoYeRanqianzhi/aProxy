@@ -152,6 +152,7 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
+ "webview2-com",
  "window-vibrancy",
  "windows",
  "windows-version",

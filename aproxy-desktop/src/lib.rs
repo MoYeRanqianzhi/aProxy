@@ -55,6 +55,7 @@ use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 mod titlebar;
 
 mod bridge;
+mod extension_frame;
 include!("command_list.rs");
 macro_rules! handler {
     ([$($shell:ident),*],[$($bridge:ident),*],[$($native:ident),*]) => {
@@ -186,7 +187,10 @@ pub fn run(options: Options) -> Result<i32, Error> {
     let data_dir = options.data_dir;
 
     let close_ops = options.ops.clone();
-    let builder = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(windows)]
+    let builder = builder.invoke_system(include_str!("top-sender.js"));
+    let builder = builder
         .manage(Mutex::new(DesktopInfo::default()))
         .manage(bridge.clone())
         .manage(options.ops)
@@ -315,16 +319,24 @@ fn open_main_window(app: &tauri::App, data_dir: PathBuf) -> Result<(), Error> {
         // 界面只显示嵌入的页面：外部网址（扩展或页面里的链接试图把窗口带走）一律不导航
         .on_navigation(is_app_url)
         .on_web_resource_request(|request, response| {
-            if request.uri().path() == MASCOT_SANDBOX {
+            if request.uri().path() == aproxy_ipc::extension_shell::PATH {
+                extension_frame::respond(&request, response);
+            } else if request.uri().path() == MASCOT_SANDBOX {
                 allow_blob_scripts(response);
             }
         });
     // Mica 要窗口透明、页面在需要透出的地方不画底色（tauri-windows-mica skill）。Mica 只有
     // Windows 有，别的平台不开透明，免得某些 Linux 合成器把窗口画成透明或黑底。
     #[cfg(windows)]
-    let builder = builder.transparent(true);
+    let builder = builder
+        .transparent(true)
+        .on_navigation(extension_frame::trusted_top)
+        .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
+        .on_download(|_, _| false);
     let window = builder.build().map_err(|e| Error::Startup(e.to_string()))?;
 
+    #[cfg(windows)]
+    extension_frame::install(&window, app.state::<Arc<bridge::Bridge>>().inner().clone());
     fit_to_monitor(&window);
 
     #[cfg(windows)]

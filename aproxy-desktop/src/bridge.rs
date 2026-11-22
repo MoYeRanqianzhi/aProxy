@@ -43,7 +43,9 @@ struct Selection {
 #[derive(Default)]
 struct ReadArea {
     inflight: usize,
-    recent: Vec<Instant>,
+    writes: usize,
+    budget: Option<(Instant, f64)>,
+    violations: Vec<Instant>,
     id: String,
     generation: SafeUint,
     selection: Option<Selection>,
@@ -157,6 +159,13 @@ impl Bridge {
     fn clear_reads(&self) {
         *self.page_reads.lock().unwrap() = Default::default();
         *self.ext_reads.lock().unwrap() = Default::default();
+    }
+    /// 原生钩子的安装结果与附件绑定按同一顺序发布，失败不能被迟到的打开覆盖。
+    #[cfg(windows)]
+    pub(crate) fn qualify(&self, support: ScriptSupport) {
+        let mut old = self.script_support.lock().unwrap();
+        *old = support;
+        self.ops.extension_runtime(support);
     }
     fn retire_invalid(&self) {
         let id = self.ext_reads.lock().unwrap().id.clone();
@@ -1071,6 +1080,44 @@ pub(crate) async fn set_autostart(
     ops.set_autostart(a.enabled).await
 }
 
+// 请求体由框架先解码；深度、节点数和编码后的长度要在读选择器或启动异步任务前拒绝。
+fn package_args<T: DeserializeOwned>(req: &Request<'_>) -> R<T> {
+    fn shape(v: &serde_json::Value, depth: usize, n: &mut usize) -> bool {
+        *n += 1;
+        if *n > 256 || depth > 8 {
+            return false;
+        }
+        match v {
+            serde_json::Value::Object(m) => m
+                .iter()
+                .all(|(k, v)| k.len() <= 16384 && shape(v, depth + 1, n)),
+            serde_json::Value::Array(a) => a.iter().all(|v| shape(v, depth + 1, n)),
+            serde_json::Value::String(t) => t.len() <= 16384,
+            _ => true,
+        }
+    }
+    struct Size(usize);
+    impl std::io::Write for Size {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0 += b.len();
+            if self.0 > 16384 + 128 {
+                Err(std::io::ErrorKind::InvalidData.into())
+            } else {
+                Ok(b.len())
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    if let InvokeBody::Json(v) = req.body()
+        && shape(v, 0, &mut 0)
+        && serde_json::to_writer(Size(0), v).is_ok()
+    {
+        return args(req);
+    }
+    Err(Fault::DesktopBadInput {})
+}
 // 包的读取槽不会与普通页面共享游标、详细记录代数或配置选择令牌。所有选择器都是比较值，不是路径。
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1184,7 +1231,7 @@ pub(crate) async fn extension_list(
     request: Request<'_>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Inventory> {
-    let _: Empty = args(&request)?;
+    let _: Empty = package_args(&request)?;
     let v = file_op(&b, |h| Ok(h.inventory())).await?;
     b.retire_invalid();
     Ok(v)
@@ -1192,7 +1239,7 @@ pub(crate) async fn extension_list(
 /// 可信页面确认后比较并设置此摘要的启用位。
 #[tauri::command]
 pub(crate) async fn extension_enable(request: Request<'_>, b: State<'_, Arc<Bridge>>) -> R<()> {
-    let a: EnableArgs = args(&request)?;
+    let a: EnableArgs = package_args(&request)?;
     let v = file_op(&b, move |h| h.enable_package(&a.key, a.enabled)).await;
     b.retire_invalid();
     v
@@ -1200,7 +1247,7 @@ pub(crate) async fn extension_enable(request: Request<'_>, b: State<'_, Arc<Brid
 /// 只把本次扫描所核验的不可变内容交给当前附件，不按页面提供的路径读取。
 #[tauri::command]
 pub(crate) async fn extension_open(request: Request<'_>, b: State<'_, Arc<Bridge>>) -> R<Bundle> {
-    let a: OpenPackage = args(&request)?;
+    let a: OpenPackage = package_args(&request)?;
     let bundle = file_op(&b, move |h| h.open_package(&a.session, &a.key)).await?;
     if let Bundle::Page(s) | Bundle::Mascot(s) = &bundle {
         let mut reads = b.ext_reads.lock().unwrap();
@@ -1215,7 +1262,7 @@ pub(crate) async fn extension_open(request: Request<'_>, b: State<'_, Arc<Bridge
 /// 页面卸载只取消该租约的读取与尚未提交的动作。
 #[tauri::command]
 pub(crate) fn extension_close(request: Request<'_>, b: State<'_, Arc<Bridge>>) -> R<()> {
-    let a: LeaseArgs = args(&request)?;
+    let a: LeaseArgs = package_args(&request)?;
     b.ops.close_package(&a.lease);
     b.retire_invalid();
     Ok(())
@@ -1226,7 +1273,7 @@ pub(crate) async fn extension_query_logs(
     request: Request<'_>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<LogPage> {
-    let a: PackageQuery = args(&request)?;
+    let a: PackageQuery = package_args(&request)?;
     let _call = b.read_permit(&a.lease)?;
     let page = query(
         &b,
@@ -1247,7 +1294,7 @@ pub(crate) async fn extension_request_detail(
     request: Request<'_>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Detail> {
-    let a: PackageDetail = args(&request)?;
+    let a: PackageDetail = package_args(&request)?;
     let _call = b.read_permit(&a.lease)?;
     let v = detail(
         &b,
@@ -1267,7 +1314,7 @@ pub(crate) async fn extension_body_chunk(
     request: Request<'_>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Chunk> {
-    let a: PackageChunk = args(&request)?;
+    let a: PackageChunk = package_args(&request)?;
     let _call = b.read_permit(&a.lease)?;
     let v = chunk(
         &b,
@@ -1287,8 +1334,8 @@ pub(crate) async fn extension_body_chunk(
 /// 使租约的旧读取失效并实际取消等待中的 future。
 #[tauri::command]
 pub(crate) fn extension_cancel_detail(request: Request<'_>, b: State<'_, Arc<Bridge>>) -> R<()> {
-    let a: PackageCancel = args(&request)?;
-    b.ops.check_lease(&a.lease)?;
+    let a: PackageCancel = package_args(&request)?;
+    let _call = b.read_permit(&a.lease)?;
     retire(
         &b.ext_reads,
         Retire {
@@ -1303,7 +1350,7 @@ pub(crate) async fn extension_list_configs(
     request: Request<'_>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Vec<Choice>> {
-    let a: LeaseArgs = args(&request)?;
+    let a: LeaseArgs = package_args(&request)?;
     let _call = b.read_permit(&a.lease)?;
     bounded(&b, &a.lease, b.ops.package_choices(a.lease.clone()).await?)
 }
@@ -1313,7 +1360,7 @@ pub(crate) async fn extension_read_config(
     request: Request<'_>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<ConfigView> {
-    let a: PackageConfig = args(&request)?;
+    let a: PackageConfig = package_args(&request)?;
     let _call = b.read_permit(&a.lease)?;
     bounded(
         &b,
@@ -1327,7 +1374,7 @@ pub(crate) async fn extension_update_offer(
     request: Request<'_>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Option<UpdateInfo>> {
-    let a: LeaseArgs = args(&request)?;
+    let a: LeaseArgs = package_args(&request)?;
     let _call = b.read_permit(&a.lease)?;
     let id = a.lease.clone();
     bounded(
@@ -1342,13 +1389,13 @@ pub(crate) async fn extension_pending(
     request: Request<'_>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Vec<Consent>> {
-    let a: Session = args(&request)?;
+    let a: Session = package_args(&request)?;
     file_op(&b, move |h| h.pending_consents(&a.session)).await
 }
 /// 单次消费原请求的回答；不接受目标或权限覆盖。
 #[tauri::command]
 pub(crate) async fn extension_answer(request: Request<'_>, b: State<'_, Arc<Bridge>>) -> R<()> {
-    let a: Answer = args(&request)?;
+    let a: Answer = package_args(&request)?;
     file_op(&b, move |h| {
         h.answer_consent(&a.session, &a.token, a.decision)
     })
@@ -1357,7 +1404,7 @@ pub(crate) async fn extension_answer(request: Request<'_>, b: State<'_, Arc<Brid
 /// 只移除一个精确包上由用户选中的动词授权。
 #[tauri::command]
 pub(crate) async fn extension_revoke(request: Request<'_>, b: State<'_, Arc<Bridge>>) -> R<()> {
-    let a: Revoke = args(&request)?;
+    let a: Revoke = package_args(&request)?;
     file_op(&b, move |h| h.revoke_grant(&a.key, &a.grant_id)).await
 }
 /// 只返回当前安全投影后的有界活动记录。
@@ -1366,41 +1413,70 @@ pub(crate) async fn extension_audit(
     request: Request<'_>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Vec<Audit>> {
-    let _: Empty = args(&request)?;
+    let _: Empty = package_args(&request)?;
     file_op(&b, |h| h.package_activity()).await
 }
 
+// 限额与源窗口无关：替换租约时重置，旧请求完成也不会还到新租约的名额里。
 struct Call<'a> {
     b: &'a Bridge,
     id: String,
+    write: bool,
 }
 impl Drop for Call<'_> {
     fn drop(&mut self) {
         let mut s = self.b.ext_reads.lock().unwrap();
         if s.id == self.id {
-            s.inflight -= 1
+            s.inflight -= 1;
+            if self.write {
+                s.writes -= 1
+            }
         }
     }
 }
 impl Bridge {
-    fn read_permit(&self, id: &str) -> R<Call<'_>> {
+    fn permit(&self, id: &str, write: bool) -> R<Call<'_>> {
         self.ops.check_lease(id)?;
         let mut s = self.ext_reads.lock().unwrap();
         if s.id != id {
             return Err(Fault::DesktopCancelled {});
         }
         let now = Instant::now();
-        s.recent
-            .retain(|t| now.duration_since(*t) < Duration::from_secs(1));
-        if s.recent.len() >= 20 || s.inflight >= 4 {
+        let (last, left) = s.budget.unwrap_or((now, 20.));
+        let tokens = (left + now.duration_since(last).as_secs_f64() * 20.).min(20.);
+        if tokens < 1. || s.inflight >= 4 || write && s.writes >= 2 {
+            s.budget = Some((now, tokens));
+            s.violations
+                .retain(|t| now.duration_since(*t) < Duration::from_secs(10));
+            s.violations.push(now);
             return Err(Fault::DesktopBusy {});
         }
+        s.budget = Some((now, tokens - 1.));
         s.inflight += 1;
-        s.recent.push(now);
+        if write {
+            s.writes += 1
+        }
         Ok(Call {
             b: self,
             id: id.into(),
+            write,
         })
+    }
+    fn retire_throttled(&self, id: &str) {
+        let s = self.ext_reads.lock().unwrap();
+        let retire = s.id == id && s.violations.len() >= 3;
+        drop(s);
+        if retire {
+            self.ops.close_package(id);
+            self.retire_invalid()
+        }
+    }
+    fn read_permit(&self, id: &str) -> R<Call<'_>> {
+        let result = self.permit(id, false);
+        if result.is_err() {
+            self.retire_throttled(id)
+        }
+        result
     }
 }
 struct ActiveInstall {
@@ -1419,6 +1495,17 @@ async fn attributed(
     id: String,
     op: ExtensionWrite,
 ) -> R<ExtensionResult> {
+    let _call = match b.permit(&id, true) {
+        Ok(c) => c,
+        Err(Fault::DesktopBusy {}) => {
+            let k = id.clone();
+            let verb = op.permission();
+            let e = file_op(b, move |h| h.package_busy(&k, verb)).await;
+            b.retire_throttled(&id);
+            return Err(e.err().unwrap_or(Fault::DesktopBusy {}));
+        }
+        Err(e) => return Err(e),
+    };
     let bridge = b.clone();
     let slot: InstallSlot = Arc::new(move || {
         let mut u = bridge.update.lock().unwrap();
@@ -1447,7 +1534,7 @@ pub(crate) async fn extension_start(
     b: State<'_, Arc<Bridge>>,
     app: tauri::AppHandle,
 ) -> R<Run> {
-    let a: PackageStart = args(&request)?;
+    let a: PackageStart = package_args(&request)?;
     match attributed(&b, app, a.lease, ExtensionWrite::Start(a.target)).await? {
         ExtensionResult::Run(r) => Ok(r),
         _ => unreachable!(),
@@ -1460,7 +1547,7 @@ pub(crate) async fn extension_stop(
     b: State<'_, Arc<Bridge>>,
     app: tauri::AppHandle,
 ) -> R<()> {
-    let a: PackageRun = args(&request)?;
+    let a: PackageRun = package_args(&request)?;
     match attributed(&b, app, a.lease, ExtensionWrite::Stop(a.run)).await? {
         ExtensionResult::Stopped => Ok(()),
         _ => unreachable!(),
@@ -1473,7 +1560,7 @@ pub(crate) async fn extension_restart(
     b: State<'_, Arc<Bridge>>,
     app: tauri::AppHandle,
 ) -> R<Run> {
-    let a: PackageRun = args(&request)?;
+    let a: PackageRun = package_args(&request)?;
     match attributed(&b, app, a.lease, ExtensionWrite::Restart(a.run)).await? {
         ExtensionResult::Run(r) => Ok(r),
         _ => unreachable!(),
@@ -1486,7 +1573,7 @@ pub(crate) async fn extension_install(
     b: State<'_, Arc<Bridge>>,
     app: tauri::AppHandle,
 ) -> R<InstallEnd> {
-    let a: PackageInstall = args(&request)?;
+    let a: PackageInstall = package_args(&request)?;
     match attributed(&b, app, a.lease, ExtensionWrite::Install(a.check)).await? {
         ExtensionResult::Installed(end) => Ok(end),
         _ => unreachable!(),

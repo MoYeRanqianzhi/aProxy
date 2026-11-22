@@ -263,7 +263,11 @@ impl Store {
                 {
                     return Err(state(ExtStateReason::TooNew));
                 }
-                let d: Disk = serde_json::from_slice(&b).map_err(|_| corrupt())?;
+                // serde 的普通 map 接受重复键；同一个 id 的两份授权不能按读取次序选一份。
+                let object = format::object(std::str::from_utf8(&b).map_err(|_| corrupt())?)
+                    .ok_or_else(corrupt)?;
+                let d: Disk = serde_json::from_value(serde_json::Value::Object(object))
+                    .map_err(|_| corrupt())?;
                 if !d.validate() {
                     return Err(corrupt());
                 }
@@ -306,6 +310,7 @@ struct Waiting {
 #[derive(Default)]
 pub(in crate::desktop) struct Runtime {
     recovered: bool,
+    failed_save: Option<Fault>,
     notify: Option<ExtensionNotify>,
     inventory: Option<Inventory>,
     session: Option<String>,
@@ -382,6 +387,9 @@ impl DesktopHome {
         r: &mut Runtime,
         f: impl FnOnce(&mut Runtime, &mut Disk) -> R<T>,
     ) -> R<T> {
+        if let Some(e) = &r.failed_save {
+            return Err(e.clone());
+        }
         let active_before = r.executing.clone();
         let work = || {
             let (store, mut disk) = Store::open(&self.home)?;
@@ -390,7 +398,10 @@ impl DesktopHome {
             let result = f(r, &mut disk);
             r.cleanup(&mut disk);
             if before != disk {
-                store.save(&mut disk)?;
+                if let Err(e) = store.save(&mut disk) {
+                    r.failed_save = Some(e.clone());
+                    return Err(e);
+                }
                 if before.audit != disk.audit {
                     r.notify(DesktopEvent::ExtensionAuditChanged);
                     r.notify(DesktopEvent::ExtensionConsentsChanged)
@@ -1195,6 +1206,14 @@ impl ExtensionOps for DesktopHome {
     fn bind_extensions(&self, session: String, support: ScriptSupport, notify: ExtensionNotify) {
         self.extension_attach(session, support, notify)
     }
+    fn extension_runtime(&self, support: ScriptSupport) {
+        let mut r = self.extensions.lock().unwrap();
+        r.qualified = support == ScriptSupport::Available;
+        if !r.qualified {
+            r.retire()
+        }
+        r.notify(DesktopEvent::ExtensionsChanged);
+    }
     fn detach_extensions(&self, session: Option<&str>) {
         self.extension_detach(session)
     }
@@ -1232,6 +1251,25 @@ impl ExtensionOps for DesktopHome {
     }
     fn package_offer(&self, lease: &str) -> R<Option<UpdateInfo>> {
         self.extension_update_offer(lease)
+    }
+    fn package_busy(&self, lease: &str, verb: Permission) -> R<()> {
+        let mut r = self.extensions.lock().unwrap();
+        let principal = r
+            .lease
+            .as_ref()
+            .filter(|l| l.id == lease)
+            .ok_or_else(denied)?
+            .principal
+            .clone();
+        let a = Admission {
+            id: token()?,
+            principal,
+            requested: now(),
+            verb,
+        };
+        self.transaction(&mut r, |_, d| {
+            Err(refusal(d, &a, None, Fault::DesktopBusy {}))
+        })
     }
     fn attributed_write(
         &self,

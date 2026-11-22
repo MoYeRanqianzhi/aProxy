@@ -64,7 +64,7 @@ impl<'de> Visitor<'de> for Bounded {
         Ok(v.into())
     }
 }
-fn object(s: &str) -> Option<Map<String, Value>> {
+pub(super) fn object(s: &str) -> Option<Map<String, Value>> {
     let mut d = serde_json::Deserializer::from_str(s);
     let Value::Object(m) = Bounded(0).deserialize(&mut d).ok()? else {
         return None;

@@ -400,6 +400,8 @@ pub trait ExtensionOps: Send + Sync + 'static {
     fn bind_extensions(&self, session: String, support: ScriptSupport, notify: ExtensionNotify);
     /// Fence pending work synchronously, including hide-on-close.
     fn detach_extensions(&self, session: Option<&str>);
+    /// Retire a live script immediately if any engine hook later becomes unavailable.
+    fn extension_runtime(&self, support: ScriptSupport);
     /// Refresh the complete on-disk inventory without executing anything.
     fn inventory(&self) -> Inventory;
     /// Read bounded metadata only. The value is a refresh hint, never authorization.
@@ -422,6 +424,8 @@ pub trait ExtensionOps: Send + Sync + 'static {
     ) -> super::Task<'_, super::ConfigView>;
     /// Return the last page-initiated check without starting an external process.
     fn package_offer(&self, lease: &str) -> super::R<Option<super::UpdateInfo>>;
+    /// Attribute a native admission-limit refusal without creating a prompt or calling an executor.
+    fn package_busy(&self, lease: &str, verb: Permission) -> super::R<()>;
     /// Remain pending through the decision and execution, without returning an execution ticket.
     fn attributed_write(
         &self,

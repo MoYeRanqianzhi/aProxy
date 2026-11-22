@@ -97,6 +97,23 @@ fn main() {
         return;
     }
 
+    // 固定来自构建产物的字节，不能让打包器的 HTML 重写、缺文件时的 index 回退成为沙箱文档。
+    let frame = format!("dist{}", aproxy_ipc::extension_shell::PATH);
+    println!("cargo::rerun-if-changed={frame}");
+    let bytes = std::fs::read(&frame).unwrap_or_default();
+    let hashes = aproxy_ipc::extension_shell::fingerprints(&bytes);
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
+    std::fs::write(
+        out.join("extension-frame.html"),
+        if hashes.is_some() {
+            bytes.as_slice()
+        } else {
+            &[]
+        },
+    )
+    .expect("write fixed shell");
+    std::fs::write(out.join("frame-hashes.rs"), format!("{hashes:?}"))
+        .expect("write fixed fingerprints");
     for path in ["src/command_list.rs", "permissions", "capabilities"] {
         println!("cargo::rerun-if-changed={path}");
     }

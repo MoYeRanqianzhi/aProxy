@@ -1060,3 +1060,58 @@ pub(crate) async fn package_verify(
 ) -> R<GithubFacts> {
     ops.package_verify(args::<TokenArgs>(&request)?.token).await
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallPackage {
+    token: String,
+    enable: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnablePackage {
+    id: String,
+    enabled: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UninstallPackage {
+    id: String,
+    remove_data: bool,
+}
+/// 读取包清单与安装记录，手工复制的包不伪造来源。
+#[tauri::command]
+pub(crate) async fn package_list(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<Vec<PackageEntry>> {
+    let _: Empty = args(&request)?;
+    ops.package_list().await
+}
+/// 各条提醒确认完毕后只消费该令牌，不再读取可变的源文件。
+#[tauri::command]
+pub(crate) async fn package_install(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<PackageEntry> {
+    let a: InstallPackage = args(&request)?;
+    ops.package_install(a.token, a.enable).await
+}
+/// 仅扩展进入加载顺序，主题由普通窗口偏好选择。
+#[tauri::command]
+pub(crate) async fn package_set_enabled(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<PackageEntry> {
+    let a: EnablePackage = args(&request)?;
+    ops.package_set_enabled(a.id, a.enabled).await
+}
+/// 包和扩展私有数据是两个独立的卸载选择。
+#[tauri::command]
+pub(crate) async fn package_uninstall(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<()> {
+    let a: UninstallPackage = args(&request)?;
+    ops.package_uninstall(a.id, a.remove_data).await
+}

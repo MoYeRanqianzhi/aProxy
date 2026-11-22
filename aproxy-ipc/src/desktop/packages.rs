@@ -116,6 +116,14 @@ pub struct PackageIssue {
 }
 /// Package operations are home-bound. File and archive work runs off the event loop.
 pub trait PackageOps: Send + Sync + 'static {
+    /// Enumerate installed and hand-copied packages, including broken entries.
+    fn package_list(&self) -> Task<'_, Vec<PackageEntry>>;
+    /// Commit a single-use staging token without reopening the source.
+    fn package_install(&self, token: String, enable: bool) -> Task<'_, PackageEntry>;
+    /// Append/remove an extension in the persisted load order.
+    fn package_set_enabled(&self, id: String, enabled: bool) -> Task<'_, PackageEntry>;
+    /// Remove package code independently of retaining its settings and data.
+    fn package_uninstall(&self, id: String, remove_data: bool) -> Task<'_, ()>;
     /// Fetch neutral publisher facts for exactly one unexpired check.
     fn package_verify(&self, token: String) -> Task<'_, GithubFacts>;
     /// Stage picked bytes without trusting the filename as a path.
@@ -209,4 +217,29 @@ pub enum GithubFacts {
         repo: RepoFacts,
         release: ReleaseFacts,
     },
+}
+/// One visible installation. Broken and hand-copied packages remain visible for inspection/removal.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageEntry {
+    /// Directory name validated as a portable package identifier.
+    pub id: String,
+    /// Treat unreadable unknown packages as code-capable rather than promising theme safety.
+    pub kind: PackageKind,
+    /// Absent when the on-disk package no longer validates.
+    pub manifest: Option<PackageManifest>,
+    /// Only extensions may appear in the ordered load list.
+    pub enabled: bool,
+    /// Unix milliseconds at installation, absent for hand copies.
+    pub installed_at: Option<u64>,
+    /// Original file or directory; hand copies have no provenance record.
+    pub source: Option<PackageSource>,
+    /// Last verification performed before this installation.
+    pub github: Option<GithubFacts>,
+    /// Local inspection failure, if any.
+    pub issue: Option<PackageIssue>,
+    /// Regular file bytes in the extension's retained data directory.
+    pub data_bytes: u64,
+    /// Parsed theme object only for valid theme installations.
+    pub theme: Option<Map<String, Value>>,
 }

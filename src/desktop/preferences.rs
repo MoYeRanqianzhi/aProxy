@@ -206,6 +206,58 @@ impl DesktopToml {
         }
         (p, enabled, issues)
     }
+    /// 修改同一数组而非重建所有值；保留未动条目的注释，插入顺序就是加载顺序。
+    pub(super) fn enable(&mut self, id: &str, enable: bool) -> R<bool> {
+        let (_, ids, issues) = self.preferences();
+        let invalid = issues
+            .iter()
+            .any(|i| i.key.as_deref() == Some("extensions.enabled"));
+        if !invalid && ids.iter().any(|s| s == id) == enable {
+            return Ok(false);
+        }
+        let item = self
+            .doc
+            .entry("extensions")
+            .or_insert_with(|| Item::Table(toml_edit::Table::new()));
+        let table = item.as_table_like_mut().ok_or_else(|| {
+            Fault::DesktopToml(TomlIssue {
+                key: Some("extensions".into()),
+                ..issue(TomlIssueKind::Value)
+            })
+        })?;
+        if invalid || !table.contains_key("enabled") {
+            table.insert("enabled", Item::Value(toml_edit::Array::new().into()));
+        }
+        let a = table
+            .get_mut("enabled")
+            .and_then(Item::as_array_mut)
+            .unwrap();
+        if enable {
+            a.push(id)
+        } else if let Some(i) = ids.iter().position(|s| s == id) {
+            a.remove(i);
+        }
+        Ok(true)
+    }
+    /// 卸载主题恢复内置外观；按用户选择清理这个扩展的设置，不影响邻居。
+    pub(super) fn uninstall(&mut self, id: &str, remove_data: bool) -> R<bool> {
+        let mut changed = self.enable(id, false)?;
+        if self.doc.get("theme").and_then(Item::as_str) == Some(id) {
+            self.set("theme", "builtin".into());
+            changed = true;
+        }
+        if remove_data
+            && let Some(table) = self
+                .doc
+                .get_mut("extensions")
+                .and_then(Item::as_table_like_mut)
+                .and_then(|t| t.get_mut("settings"))
+                .and_then(Item::as_table_like_mut)
+        {
+            changed |= table.remove(id).is_some();
+        }
+        Ok(changed)
+    }
     /// 只核验提交的键；用户可以逐项修复文档，不被别处的坏值挡住。
     fn set(&mut self, key: &str, mut value: Value) {
         if let Some(old) = self.doc.get(key).and_then(Item::as_value) {

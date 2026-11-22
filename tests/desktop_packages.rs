@@ -537,3 +537,131 @@ async fn github_repo_and_release_facts_use_only_bounded_anonymous_api_requests()
         }
     ));
 }
+
+#[tokio::test(start_paused = true)]
+async fn expired_check_does_not_install_or_verify_and_releases_its_stage() {
+    let h = TestHome::new();
+    let host = host(&h);
+    let c = host
+        .package_check_file("e.zip".into(), archive(&members("theme"), ""))
+        .await
+        .unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(1800)).await;
+    assert_eq!(
+        check_error(
+            host.package_install(c.token.clone(), true)
+                .await
+                .unwrap_err()
+        )
+        .reason,
+        "token"
+    );
+    assert_eq!(
+        check_error(host.package_verify(c.token).await.unwrap_err()).reason,
+        "token"
+    );
+    assert!(host.package_list().await.unwrap().is_empty());
+    assert_eq!(
+        fs::read_dir(h.path().join("desktop/extensions"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+#[tokio::test]
+async fn lifecycle_preserves_data_order_and_provenance_but_not_removed_code() {
+    let h = TestHome::new();
+    let host = host(&h);
+    let desktop = h.path().join("desktop");
+    let base = desktop.join("extensions");
+    fs::create_dir_all(base.join(".staging-stale")).unwrap();
+    fs::create_dir_all(base.join(".old-stale")).unwrap();
+    let check = |kind: &str, id: &str, version: &str| {
+        let mut m = members(kind);
+        let mut v = manifest(kind);
+        v["id"] = json!(id);
+        v["version"] = json!(version);
+        v.as_object_mut().unwrap().remove("repository");
+        m[0].1 = v.to_string().into_bytes();
+        host.package_check_file("pick.zip".into(), archive(&m, ""))
+    };
+    let c = check("extension", "sample.one", "2.0.0").await.unwrap();
+    assert!(host.package_list().await.unwrap().is_empty());
+    assert!(!base.join(".staging-stale").exists() && !base.join(".old-stale").exists());
+    assert!(matches!(
+        host.package_verify(c.token.clone()).await.unwrap(),
+        GithubFacts::NoRepository
+    ));
+    let e = host.package_install(c.token.clone(), true).await.unwrap();
+    assert!(e.enabled && matches!(e.github, Some(GithubFacts::NoRepository)));
+    assert!(host.package_install(c.token, false).await.is_err());
+    let d = desktop.join("extension-data/sample.one");
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("storage.json"), b"{\"x\":1}").unwrap();
+    let prefs = desktop.join("desktop.toml");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&prefs)
+        .unwrap()
+        .write_all(b"\n[extensions.settings.\"sample.one\"]\nkept = 123\n")
+        .unwrap();
+    let c = check("extension", "sample.one", "1.0.0").await.unwrap();
+    assert_eq!(c.installed.unwrap().version, "2.0.0");
+    assert!(host.package_install(c.token, false).await.unwrap().enabled);
+    assert_eq!(host.package_list().await.unwrap()[0].data_bytes, 7);
+    assert!(fs::read_to_string(&prefs).unwrap().contains("kept = 123"));
+    assert_eq!(
+        check_error(check("theme", "sample.one", "3.0.0").await.unwrap_err()).reason,
+        "kind-change"
+    );
+    let c = check("theme", "theme.two", "1.0.0").await.unwrap();
+    let e = host.package_install(c.token, true).await.unwrap();
+    assert!(!e.enabled && e.theme.unwrap()["x"] == 42);
+    assert!(
+        host.package_set_enabled("theme.two".into(), true)
+            .await
+            .is_err()
+    );
+    let p = serde_json::from_value(json!({"theme":"theme.two"})).unwrap();
+    host.set_preferences(p).await.unwrap();
+    host.package_uninstall("theme.two".into(), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        host.read_desktop_state()
+            .await
+            .unwrap()
+            .preferences
+            .unwrap()
+            .theme,
+        "builtin"
+    );
+    assert!(
+        !host
+            .package_set_enabled("sample.one".into(), false)
+            .await
+            .unwrap()
+            .enabled
+    );
+    host.package_uninstall("sample.one".into(), false)
+        .await
+        .unwrap();
+    assert!(d.is_dir() && !base.join("sample.one").exists());
+    assert!(fs::read_to_string(&prefs).unwrap().contains("kept = 123"));
+    directory(&base.join("sample.one"), &members("extension"));
+    let list = host.package_list().await.unwrap();
+    assert_eq!(list.len(), 1);
+    assert!(list[0].issue.is_none() && list[0].source.is_none());
+    fs::write(base.join("sample.one/manifest.json"), b"{").unwrap();
+    let list = host.package_list().await.unwrap();
+    assert!(list[0].issue.is_some() && list[0].manifest.is_none());
+    assert!(
+        host.package_set_enabled("sample.one".into(), true)
+            .await
+            .is_err()
+    );
+    host.package_uninstall("sample.one".into(), true)
+        .await
+        .unwrap();
+    assert!(!d.exists() && !fs::read_to_string(prefs).unwrap().contains("kept = 123"));
+}

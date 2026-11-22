@@ -44,6 +44,10 @@
     "allow-package-check-file",
     "allow-package-check-path",
     "allow-package-discard",
-    "allow-package-verify"
+    "allow-package-verify",
+    "allow-package-list",
+    "allow-package-install",
+    "allow-package-set-enabled",
+    "allow-package-uninstall"
   ]
 }

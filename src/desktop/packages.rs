@@ -1,6 +1,8 @@
 //! 安装页展示的是暂存副本的事实；确认之后只交换目录，绝不回到用户选择的源路径再读一次。
 pub mod github;
+mod lifecycle;
 mod manifest;
+use tokio::time::Instant;
 mod tree;
 mod unpack;
 use super::{
@@ -14,7 +16,7 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tree::{Dir, Node, Why};
 const FILE: u64 = 64 << 20;
@@ -245,6 +247,26 @@ impl DesktopHome {
     }
 }
 impl PackageOps for DesktopHome {
+    fn package_list(&self) -> Task<'_, Vec<PackageEntry>> {
+        Box::pin(self.state_work(StateFile::Packages, move |host, s| {
+            lifecycle::list(&host, &s)
+        }))
+    }
+    fn package_install(&self, token: String, enable: bool) -> Task<'_, PackageEntry> {
+        Box::pin(self.state_work(StateFile::Packages, move |host, s| {
+            lifecycle::install(&host, &s, &token, enable)
+        }))
+    }
+    fn package_set_enabled(&self, id: String, enabled: bool) -> Task<'_, PackageEntry> {
+        Box::pin(self.state_work(StateFile::Packages, move |_, s| {
+            lifecycle::set_enabled(&s, &id, enabled)
+        }))
+    }
+    fn package_uninstall(&self, id: String, remove_data: bool) -> Task<'_, ()> {
+        Box::pin(self.state_work(StateFile::Packages, move |_, s| {
+            lifecycle::uninstall(&s, &id, remove_data)
+        }))
+    }
     fn package_verify(&self, token: String) -> Task<'_, GithubFacts> {
         Box::pin(async move {
             let t = token.clone();

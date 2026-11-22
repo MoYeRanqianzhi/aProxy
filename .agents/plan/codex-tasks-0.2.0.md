@@ -85,10 +85,11 @@
      只在安装前逐条弹窗（见 [w5e-extensions](w5e-extensions.md) 顶部）。这 12 个修复**不合入**，分支留作参考；v24 的结论随之作废。
 9b. **t10b：扩展改成「安装入口 + 接口暴露 + 安装前的可信度检查」**（下一份任务书，Rust 侧）
    - 范围：按 [w5e-extensions](w5e-extensions.md) 顶部一节：主题包与扩展包的读取、安装、列出、启停、卸载；包文件 sha256；
-     GitHub 仓库信息与 release asset 摘要的查询（走更新下载的代理设置）；两步安装的桌面命令；删掉 master 上 t10 的沙箱、
+     GitHub 仓库信息与 release asset 摘要的查询（走更新下载的代理设置）；两步安装的桌面命令；format 协议 1 的可选
+     `control` 特性、实例 IPC 的转交操作与桌面命令；删掉 master 上 t10 的沙箱、
      租约、授权与审计代码。顺带下面 9a 的 `url` 升级。
    - 验收：临时 home 里装、启停、卸载主题包与扩展包；GitHub 查询用本机假服务器测四种情况（通过、哈希不符、低 star、连不上），
-     不碰真实 GitHub；两个变体全量过。
+     不碰真实 GitHub；control 用测试 format 测 spawn 与 persistent、未协商、超时、超长、熔断打开；两个变体全量过。
 9a. **随 t10b 顺带**：`cargo update -p url`（到 ≥2.5.9）。RUSTSEC-2026-0592（`Url::origin()` 对嵌套
    `blob:` 递归、栈溢出），2026-11-22 起 main 的 Review 工作流（cargo-deny）因此失败；aproxy-format 的 convert/keys/route
    对配置与上游地址调用 `origin()`，都不是客户端给的输入，风险低。只动 Cargo.lock，验收是 cargo-deny 过、两个变体全量过。

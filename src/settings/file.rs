@@ -174,14 +174,12 @@ pub fn parse(text: &str, file: &Path) -> (Settings, Vec<Diagnostic>) {
     if let Some(update) = root.object(&mut ctx, "update") {
         if let Some(chain) = update.get("download_chain").filter(|v| !v.is_null()) {
             // 元素是渠道名或 `{"url": …}`，它的读法在下载模块里
-            match serde_json::from_value(chain.clone()) {
+            match crate::install::download::settings_chain(chain) {
                 Ok(chain) => settings.download_chain = Some(chain),
                 Err(e) => ctx.push(
                     "config_invalid_value",
                     &update.key_path("download_chain"),
-                    Reason::DownloadChain {
-                        error: e.to_string(),
-                    },
+                    Reason::DownloadChain { error: Box::new(e) },
                     json!({ "reason": "not_one_of" }),
                 ),
             }
@@ -706,6 +704,20 @@ mod tests {
         assert_eq!(diagnostics[0].line, Some(3));
         let (_, diagnostics) = parse_text("[]");
         assert_eq!(brief(&diagnostics), ["config_type -"]);
+    }
+
+    #[test]
+    fn unknown_source_keeps_its_bilingual_reason() {
+        use aproxy_ipc::i18n::Lang;
+        let (_, ds) = parse_text(r#"{"update":{"download_chain":["npm","other"]}}"#);
+        assert_eq!(ds.len(), 1);
+        let reason = &ds[0].message;
+        assert!(
+            reason
+                .render(Lang::En)
+                .contains("unknown download source \"other\"")
+        );
+        assert!(reason.render(Lang::Zh).contains(r#"未知下载渠道 "other"（取值：github | npm | cargo-binstall | cargo，或 {"url": "模板"}）"#));
     }
 
     #[test]

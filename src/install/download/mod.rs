@@ -105,28 +105,58 @@ pub enum ChainStep {
     Url { url: String },
 }
 
-// serde：受控词表映射（未知名报错并列出全部取值——settings 校验提示）
-impl<'de> Deserialize<'de> for ChainStep {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            Name(String),
-            Url { url: String },
-        }
-        match Raw::deserialize(d).map_err(serde::de::Error::custom)? {
-            Raw::Name(s) => match s.as_str() {
+#[derive(Deserialize)]
+#[serde(untagged)]
+#[serde(rename = "Raw")]
+enum RawStep {
+    Name(String),
+    Url { url: String },
+}
+
+impl RawStep {
+    fn resolve(self) -> Result<ChainStep, aproxy_ipc::i18n::diagnostic::Reason> {
+        match self {
+            Self::Url { url } => Ok(ChainStep::Url { url }),
+            Self::Name(name) => match name.as_str() {
                 "github" => Ok(ChainStep::Github),
                 "npm" => Ok(ChainStep::Npm),
                 "cargo-binstall" => Ok(ChainStep::Binstall),
                 "cargo" => Ok(ChainStep::Cargo),
-                other => Err(serde::de::Error::custom(format!(
-                    "unknown download source \"{other}\" (expected github, npm, cargo-binstall, cargo or {{\"url\": \"template\"}})"
-                ))),
+                _ => {
+                    Err(aproxy_ipc::i18n::diagnostic::Reason::UnknownDownloadSource { other: name })
+                }
             },
-            Raw::Url { url } => Ok(ChainStep::Url { url }),
         }
     }
+}
+
+// serde 的错误对程序固定为英文；设置检查保留同一个有类型的原因，在终端选择语言。
+impl<'de> Deserialize<'de> for ChainStep {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        RawStep::deserialize(d)?
+            .resolve()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// 按输入顺序解析设置里的渠道；第一个错误就是公开诊断，后续步骤不掩盖它。
+pub(crate) fn settings_chain(
+    value: &serde_json::Value,
+) -> Result<Vec<ChainStep>, aproxy_ipc::i18n::diagnostic::Reason> {
+    let opaque = |e: serde_json::Error| aproxy_ipc::i18n::diagnostic::Reason::Verbatim {
+        text: e.to_string(),
+    };
+    let Some(steps) = value.as_array() else {
+        return serde_json::from_value(value.clone()).map_err(opaque);
+    };
+    steps
+        .iter()
+        .map(|v| {
+            serde_json::from_value::<RawStep>(v.clone())
+                .map_err(opaque)?
+                .resolve()
+        })
+        .collect()
 }
 
 impl Serialize for ChainStep {

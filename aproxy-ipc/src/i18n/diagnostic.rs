@@ -207,7 +207,10 @@ reasons! {
     Language { language: String },
         en: "language must be \"system\", \"en\" or \"zh-CN\", not {language:?}",
         zh: "language 必须为 \"system\"、\"en\" 或 \"zh-CN\"，不能为 {language:?}";
-    DownloadChain { error: String },
+    UnknownDownloadSource { other: String },
+        en: "unknown download source \"{other}\" (expected github, npm, cargo-binstall, cargo or {{\"url\": \"template\"}})",
+        zh: "未知下载渠道 \"{other}\"（取值：github | npm | cargo-binstall | cargo，或 {{\"url\": \"模板\"}}）";
+    DownloadChain { error: Nested },
         en: "update.download_chain must be an array of \"github\", \"npm\", \"cargo-binstall\", \"cargo\" or {{\"url\": …}}: {error}",
         zh: "update.download_chain 必须为数组，元素为 \"github\"、\"npm\"、\"cargo-binstall\"、\"cargo\" 或 {{\"url\": …}}：{error}";
     BadAlias { name: String, reason: Nested },

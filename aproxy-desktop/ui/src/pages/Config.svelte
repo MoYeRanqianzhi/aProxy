@@ -1,271 +1,419 @@
 <!--
-  配置：按分组的表单（上游、重试、保活、转换、安全），也可以切到原始 TOML。
-  每个字段标出「实时生效」或「需重启」，输入时就地校验；有修改时底部浮出保存条，
-  保存前先给出差异预览（像 TOML 的逐行增删），需重启的项单独提醒。
-  哪些字段能实时生效是原型阶段的提案，接入时以实现为准。
+  配置：一份配置文件的表单。
+
+  读到的是 Rust 给的投影（read_config）：每个键一项，带着值从哪来（文件、settings.json 的全局默认、
+  环境变量、启动参数、内置默认）。密钥只说「设没设」，原值永远不会到界面里来。
+  表单能改的只有几类键：上游地址、监听地址、代理与它的账号、API key、三个超时、保活、两张请求头表。
+  其余的只读列出，要改得去编辑文件。Rust 只接受这几类改动（Edit），文件里的注释和排版原样保留。
+
+  保存分两步：先把改动交给 Rust 试算（validate_config），把改动、问题和需要用户确认的事摆进一个对话框；
+  用户确认后才写（write_config）。写回只改文件、不替用户重启：正在用这个文件的实例要重启才会用上新配置，
+  保存后页面列出它们，并给每个一个重启按钮。
+
+  目标有两种：
+    正在运行的实例：按它这次运行实际用的那个文件。写的时候带上读时拿到的文件句柄，
+                    文件在这期间被别处改过，Rust 会拒绝（desktop_changed），页面重读一遍。
+    list_configs 给出的一项配置：还没在运行的别名、配置目录里的文件或默认配置。
 -->
 <script lang="ts">
-  import { t } from '../lib/i18n';
+  import { t, hasMessage } from '../lib/i18n';
   import { ui } from '../lib/state.svelte';
-  import { store } from '../lib/legacy.svelte';
+  import { store } from '../lib/store.svelte';
   import { overlays } from '../lib/overlays.svelte';
-  import { backoffAfter } from '../lib/retry';
-  import type { ConfigIssue, ConfigValues, InstanceConfig } from '../lib/types';
   import { pop, fadeOut } from '../lib/motion';
+  import type { Cell, Choice, ConfigField, ConfigTarget, ConfigView, Edit, HeaderTable, SecondsKey, Source, TextKey, Trigger, Validation } from '../lib/backend/contract';
+  import { toFailure, type Failure } from '../lib/backend/link';
+  import { faultText, issueText } from '../lib/faults';
+  import { aliasOf } from '../lib/view';
   import Icon, { type IconName } from '../components/Icon.svelte';
-  import Segmented from '../components/Segmented.svelte';
   import Dropdown from '../components/Dropdown.svelte';
-  import Switch from '../components/Switch.svelte';
+  import Segmented from '../components/Segmented.svelte';
 
-  interface Cfg {
-    base_url: string;
-    listen_addr: string;
-    proxy: string;
-    connect_timeout_secs: string;
-    read_timeout_secs: string;
-    max_retry_backoff_secs: string;
-    bounded_retry_paths: string[];
-    forward_only: boolean;
-    spool_limit_mb: string;
-    max_body_mb: string;
-    disk_cache: boolean;
-    keepalive_interval_secs: string;
-    keepalive_trigger: 'any' | 'accept' | 'body_stream';
-    keepalive_heartbeat: string;
-    rt_command: string;
-    rt_args: string;
-    rt_mode: 'persistent' | 'spawn';
-    rt_extra: string;
-    every_attempt: boolean;
-    allowed_hosts: string[];
-    allowed_origins: string[];
+  // ---------------------------------------------------------------------------
+  // 键的分类：决定一个字段用哪种输入框、改动编成哪种 Edit
+  // ---------------------------------------------------------------------------
+
+  /** 明文的文本键：输入框里显示当前值，可以直接改 */
+  const PLAIN_KEYS: TextKey[] = ['base_url', 'listen_addr', 'proxy', 'keepalive.heartbeat'];
+  /** 密钥：只知道设没设。只能换成新值或者删掉，看不到原值 */
+  const SECRET_KEYS: TextKey[] = ['api_key', 'proxy_username', 'proxy_password'];
+  const SECONDS_KEYS: SecondsKey[] = ['timeouts.connect_secs', 'timeouts.first_byte_secs', 'timeouts.read_idle_secs', 'keepalive.interval_secs'];
+  const TABLES: HeaderTable[] = ['extra_headers', 'override_headers'];
+  type Mode = Exclude<Trigger, 'unknown'>;
+
+  const isPlain = (k: string): k is TextKey => (PLAIN_KEYS as string[]).includes(k);
+  const isSecret = (k: string): k is TextKey => (SECRET_KEYS as string[]).includes(k);
+  const isSeconds = (k: string): k is SecondsKey => (SECONDS_KEYS as string[]).includes(k);
+
+  /** 表单的分组；最后一组「其他」收下所有前面没点名的键（只读） */
+  const GROUPS: { id: 'upstream' | 'network' | 'timeouts' | 'keepalive' | 'other'; icon: IconName; keys: string[] | null }[] = [
+    { id: 'upstream', icon: 'globe', keys: ['base_url', 'api_key', 'extra_headers', 'override_headers'] },
+    { id: 'network', icon: 'server', keys: ['listen_addr', 'proxy', 'proxy_username', 'proxy_password'] },
+    { id: 'timeouts', icon: 'clock', keys: ['timeouts.connect_secs', 'timeouts.first_byte_secs', 'timeouts.read_idle_secs'] },
+    { id: 'keepalive', icon: 'heart', keys: ['keepalive.interval_secs', 'keepalive.trigger', 'keepalive.heartbeat'] },
+    { id: 'other', icon: 'file', keys: null },
+  ];
+  const NAMED = new Set(GROUPS.flatMap((g) => g.keys ?? []));
+
+  /** 显示值里的打码标记（与 Rust 认的一致）：带着它写回去会被拒绝，原来的密钥也会丢 */
+  const marked = (s: string) => s.includes('***') || s.includes('<secret>') || s.includes('<secret ');
+  /** 一个值在输入框里的样子：文本、整数原样，其他（没设、密钥、表）是空串 */
+  function plain(c: Cell | undefined): string {
+    if (!c) return '';
+    if (c.kind === 'text') return c.text;
+    if (c.kind === 'integer') return c.decimal;
+    return '';
   }
-  type Field = keyof Cfg;
-  type NumField = 'connect_timeout_secs' | 'read_timeout_secs' | 'max_retry_backoff_secs' | 'spool_limit_mb' | 'max_body_mb' | 'keepalive_interval_secs';
-  const NUM_FIELDS: Field[] = ['connect_timeout_secs', 'read_timeout_secs', 'max_retry_backoff_secs', 'spool_limit_mb', 'max_body_mb', 'keepalive_interval_secs'];
-  /** 表单里摊平的请求转换字段，在配置文件里是同一张内联表 request_transform */
-  const isTransformField = (f: Field) => f.startsWith('rt_') || f === 'every_attempt';
+  const HEARTBEAT = 'keepalive.heartbeat';
+  // 心跳内容里常有换行，单行输入框装不下（浏览器会把换行吞掉）：输入框里换行写成 \n、反斜杠写成 \\，写回时还原
+  const escapeText = (s: string) => s.replace(/\\/g, '\\\\').replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+  const unescapeText = (s: string) => s.replace(/\\([\\nr])/g, (_, c: string) => (c === 'n' ? '\n' : c === 'r' ? '\r' : '\\'));
+  /** 一个值在输入框里的样子 */
+  const shown = (k: string, c: Cell | undefined) => (k === HEARTBEAT ? escapeText(plain(c)) : plain(c));
+  /** 草稿规整成要写进文件的值：心跳内容原样（空格也是内容），其余去掉首尾空白 */
+  const valueOf = (k: string, draft: string | undefined) => (k === HEARTBEAT ? unescapeText(draft ?? '') : (draft ?? '').trim());
 
-  /** 后端给的配置 → 表单：数字变成字符串（输入框里边打字边校验），请求转换摊平成几个字段 */
-  function toForm(v: ConfigValues): Cfg {
-    const rt = v.request_transform;
-    return {
-      base_url: v.base_url,
-      listen_addr: v.listen_addr,
-      proxy: v.proxy,
-      connect_timeout_secs: String(v.connect_timeout_secs),
-      read_timeout_secs: String(v.read_timeout_secs),
-      max_retry_backoff_secs: String(v.max_retry_backoff_secs),
-      bounded_retry_paths: [...v.bounded_retry_paths],
-      forward_only: v.forward_only,
-      spool_limit_mb: String(v.spool_limit_mb),
-      max_body_mb: String(v.max_body_mb),
-      disk_cache: v.disk_cache,
-      keepalive_interval_secs: String(v.keepalive_interval_secs),
-      keepalive_trigger: v.keepalive_trigger,
-      keepalive_heartbeat: v.keepalive_heartbeat,
-      rt_command: rt?.command ?? '',
-      rt_args: rt?.args ?? '',
-      rt_mode: rt?.mode ?? 'persistent',
-      rt_extra: rt?.extra ?? '',
-      every_attempt: rt?.every_attempt ?? false,
-      allowed_hosts: [...v.allowed_hosts],
-      allowed_origins: [...v.allowed_origins],
-    };
-  }
+  /** 文件里写的是 body_stream，契约里是 body-stream */
+  const modeOf = (c: Cell | undefined): Mode => {
+    const m = plain(c).replace('_', '-');
+    return m === 'accept' || m === 'body-stream' ? m : 'any';
+  };
 
-  /** 表单 → 只含改动的配置键，交给后端写回文件 */
-  function changesOf(c: Cfg, fields: Field[]): Partial<ConfigValues> {
-    const out: Record<string, unknown> = {};
-    for (const f of fields) {
-      if (isTransformField(f)) {
-        out.request_transform = c.rt_command
-          ? { command: c.rt_command, args: c.rt_args, mode: c.rt_mode, extra: c.rt_extra, every_attempt: c.every_attempt }
-          : null;
-      } else {
-        out[f] = NUM_FIELDS.includes(f) ? Number(c[f]) : $state.snapshot(c[f]);
-      }
-    }
-    return out as Partial<ConfigValues>;
-  }
+  // ---------------------------------------------------------------------------
+  // 目标：哪份配置
+  // ---------------------------------------------------------------------------
 
-  const instances = $derived(store.instances);
-  const inst = $derived(store.instance(ui.instancePort) ?? instances[0]);
+  let choices = $state.raw<Choice[]>([]);
+  /** 当前读的目标；跟随运行的实例时不带文件句柄，写的时候再加上 */
+  let target = $state.raw<ConfigTarget | null>(null);
+  let config = $state.raw<ConfigView | null>(null);
+  let loadFault = $state.raw<Failure | null>(null);
+  /** 下拉框里的选择：run:<端口> 或 cfg:<序号> */
+  let pick = $state('');
+  let picked = '';
 
-  // 页面按实例端口挂载（App 里的 {#key}），换实例会重建本页，所以配置只读一次。
-  // 直接从地址栏打开本页时，界面可能还没拿到实例列表，等连上之后再读
-  let config = $state<InstanceConfig | null>(null);
-  let original = $state<Cfg | null>(null);
-  let cfg = $state<Cfg | null>(null);
-  let requested = false;
+  const runningCards = $derived(store.cards.filter((c) => c.run));
+  /** 没在运行的配置：正在运行的实例已经各占一项，同一个文件不重复列 */
+  const idleChoices = $derived(choices.filter((c) => !runningCards.some((card) => card.metadata?.configPath === c.path)));
+  const options = $derived([
+    ...runningCards.map((c) => {
+      const alias = aliasOf(c);
+      return { value: `run:${c.port}`, label: alias ? `${c.port} ${alias}` : String(c.port), hint: t('cfg.running'), dot: 'mint' };
+    }),
+    ...idleChoices.map((c) => ({ value: `cfg:${choices.indexOf(c)}`, label: c.label, hint: c.path })),
+  ]);
+  const currentChoice = $derived(pick.startsWith('cfg:') ? choices[Number(pick.slice(4))] : undefined);
+
+  // 页面按端口挂载（App 里的 {#key}）：换到另一个运行中的实例会重建本页，所以初始目标只定一次。
+  // 等第一份快照到了才知道这个端口上有没有运行中的实例
+  // 只在模板里读（「还没有配置」与「正在读取」的区分），所以要是响应式的
+  let started = $state(false);
   $effect(() => {
-    if (requested || !store.connected) return;
-    const i = store.instance(ui.instancePort) ?? store.instances[0];
-    if (!i) return;
-    requested = true;
-    store.readConfig(i.port).then((c) => {
-      config = c;
-      original = toForm(c.values);
-      cfg = toForm(c.values);
-    });
+    if (started || !store.connected) return;
+    started = true;
+    void begin();
   });
-  /** 哪些键改了立即生效由实例说了算（后端随配置一起给出） */
-  const live = $derived(new Set<string>(config?.live ?? []));
-  const isLive = (f: Field) => live.has(isTransformField(f) ? 'request_transform' : f);
-  let view = $state<'form' | 'toml'>('form');
-  let reviewing = $state(false);
-  /** 实例对这批改动的意见：格式之外界面判断不了的问题（端口被占、上游指回自己），有问题就不让保存 */
-  let issues = $state<ConfigIssue[]>([]);
-  let checking = $state(false);
 
-  // 「检查并保存」先请实例检查一遍，再打开对比框：问题和改动摆在一起看
-  async function review() {
-    if (!cfg || !config) return;
-    checking = true;
+  async function begin() {
     try {
-      issues = await store.validateConfig(config.port, changesOf(cfg, changed));
-    } finally {
-      checking = false;
+      choices = await store.listConfigs();
+    } catch (raw) {
+      loadFault = toFailure(raw);
     }
-    reviewing = true;
+    const card = store.card(ui.instancePort);
+    if (card?.run) choose(`run:${card.port}`);
+    else {
+      const i = choices.findIndex((c) => c.isDefault);
+      if (choices.length) choose(`cfg:${i >= 0 ? i : 0}`);
+    }
   }
-  let port = $state(ui.instancePort);
-  let newPath = $state('');
-  let newHost = $state('');
-  let newOrigin = $state('');
+
+  function choose(value: string) {
+    pick = value;
+    picked = value;
+    if (value.startsWith('run:')) {
+      const card = store.card(Number(value.slice(4)));
+      if (!card?.run) return;
+      // 换到另一个实例走路由：地址栏跟着变，返回键也认得
+      if (card.port !== ui.instancePort) return ui.go('config', card.port);
+      void load({ kind: 'run', run: card.run });
+    } else {
+      const c = choices[Number(value.slice(4))];
+      if (c) void load(c.target);
+    }
+  }
 
   $effect(() => {
-    if (port !== ui.instancePort && store.instance(port)) ui.go('config', port);
+    if (pick && pick !== picked) choose(pick);
   });
 
-  const intField = (v: string) => /^\d+$/.test(v.trim());
+  async function load(next: ConfigTarget) {
+    target = next;
+    try {
+      const v = await store.readConfig(next);
+      if (target !== next) return;
+      config = v;
+      loadFault = null;
+      fill(v);
+    } catch (raw) {
+      if (target === next) loadFault = toFailure(raw);
+    }
+  }
+
+  /** 写回用的目标：跟随运行时带上读到的文件句柄，读完之后文件被别处改过就不写 */
+  function writeTarget(): ConfigTarget | null {
+    if (!target) return null;
+    return target.kind === 'run' && config?.fileToken ? { kind: 'run', run: target.run, expectedFile: config.fileToken } : target;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 草稿
+  // ---------------------------------------------------------------------------
+
+  /** 明文与秒数的草稿，键是配置键 */
+  let texts = $state<Record<string, string>>({});
+  /** 密钥的新值；空串是「不改」 */
+  let secrets = $state<Record<string, string>>({});
+  /** 要从文件里删掉的密钥 */
+  let cleared = $state<Record<string, boolean>>({});
+  let mode = $state<Mode>('any');
+
+  interface HeaderRow {
+    id: number;
+    table: HeaderTable;
+    /** 文件里已有的头：名字定死，值看不到，只能换值或删掉 */
+    existing: boolean;
+    name: string;
+    /** 新值；已有的头留空是「不改」 */
+    value: string;
+    removed: boolean;
+  }
+  let headers = $state<HeaderRow[]>([]);
+  let rowId = 0;
+
+  const field = (key: string): ConfigField | undefined => config?.fields.find((f) => f.key === key && !f.header);
+
+  function fill(v: ConfigView) {
+    const next: Record<string, string> = {};
+    for (const f of v.fields) if (!f.header && (isPlain(f.key) || isSeconds(f.key))) next[f.key] = shown(f.key, f.value);
+    texts = next;
+    secrets = {};
+    cleared = {};
+    mode = modeOf(v.fields.find((f) => f.key === 'keepalive.trigger')?.value);
+    headers = v.fields
+      .filter((f) => f.header)
+      .map((f) => ({ id: ++rowId, table: f.header!.table, existing: true, name: f.header!.name, value: '', removed: false }));
+  }
+
+  function discard() {
+    if (config) fill(config);
+  }
+
+  function addHeader(table: HeaderTable) {
+    headers.push({ id: ++rowId, table, existing: false, name: '', value: '', removed: false });
+  }
+
+  /** 表头里名字带着密钥的项（Rust 不给名字、也不让改）：只读列出，让用户知道它在 */
+  const lockedHeaders = (table: HeaderTable) => config?.fields.filter((f) => f.key.startsWith(`${table}.`) && !f.header) ?? [];
+
+  // ---------------------------------------------------------------------------
+  // 校验与改动
+  // ---------------------------------------------------------------------------
+
+  const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 
   const errors = $derived.by(() => {
-    const e: Partial<Record<Field, string>> = {};
-    if (!cfg) return e;
-    if (!/^https?:\/\/\S+$/.test(cfg.base_url.trim())) e.base_url = t('cfg.err.url');
-    if (cfg.proxy && !/^(https?|socks5h?):\/\/\S+$/.test(cfg.proxy.trim())) e.proxy = t('cfg.err.url');
-    for (const f of ['connect_timeout_secs', 'read_timeout_secs', 'max_retry_backoff_secs', 'spool_limit_mb', 'max_body_mb', 'keepalive_interval_secs'] as const) {
-      if (!intField(cfg[f])) e[f] = t('cfg.err.int');
+    const e: Record<string, string> = {};
+    for (const [k, v] of Object.entries(texts)) {
+      const s = valueOf(k, v);
+      if (isSeconds(k) && s !== '' && (!/^\d+$/.test(s) || Number(s) > Number.MAX_SAFE_INTEGER)) e[k] = t('cfg.err.int');
+      else if (isPlain(k) && s !== plain(field(k)?.value) && marked(s)) e[k] = t('cfg.err.marked');
     }
-    for (const p of cfg.bounded_retry_paths) {
-      try {
-        new RegExp(p);
-      } catch {
-        e.bounded_retry_paths = t('cfg.err.regex');
+    for (const [k, v] of Object.entries(secrets)) if (marked(v)) e[k] = t('cfg.err.marked');
+    for (const r of headers) {
+      if (r.removed) continue;
+      const id = `h${r.id}`;
+      if (!r.existing) {
+        if (!r.name && !r.value) continue;
+        if (!HEADER_NAME.test(r.name)) e[id] = t('cfg.err.headerName');
+        else if (headers.some((o) => o !== r && !o.removed && o.table === r.table && o.name.toLowerCase() === r.name.toLowerCase())) e[id] = t('cfg.err.headerDup');
+        else if (!r.value) e[id] = t('cfg.err.headerValue');
       }
+      if (!e[id] && (/[\r\n]/.test(r.value) || marked(r.value))) e[id] = t(marked(r.value) ? 'cfg.err.marked' : 'cfg.err.headerValue');
     }
     return e;
   });
-
-  const changed = $derived.by((): Field[] => {
-    if (!cfg || !original) return [];
-    return (Object.keys(cfg) as Field[]).filter((k) => JSON.stringify(cfg![k]) !== JSON.stringify(original![k]));
-  });
-  const needRestart = $derived(changed.filter((f) => !isLive(f)));
   const hasErrors = $derived(Object.keys(errors).length > 0);
 
-  /** 退避阶梯：第 n 次失败后等多久。一眼看懂「前三次立即、之后翻倍、到封顶为止」 */
-  const ladder = $derived.by(() => {
-    const cap = Number(cfg?.max_retry_backoff_secs);
-    if (!Number.isFinite(cap)) return [];
-    return Array.from({ length: 10 }, (_, i) => backoffAfter(i + 1, cap) / 1000);
-  });
-
-  function tomlValue(v: unknown): string {
-    if (typeof v === 'boolean') return String(v);
-    if (Array.isArray(v)) return `[${v.map((x) => `'${x}'`).join(', ')}]`;
-    if (typeof v === 'string' && /^\d+$/.test(v)) return v;
-    return `"${v}"`;
+  /**
+   * 草稿和读到的值算不算不同。值不是文件里写的（默认、全局默认）而草稿清空了：
+   * 文件里本来就没有这一项，没有可删的，不算改动
+   */
+  function differs(f: ConfigField | undefined, draft: string): boolean {
+    if (!f) return false;
+    if (draft === '' && f.source !== 'toml') return false;
+    return draft !== plain(f.value);
   }
 
-  /** 把表单映射回 TOML 的键（请求转换收拢成一张内联表） */
-  function tomlLines(c: Cfg): { key: string; text: string }[] {
-    const lines: { key: string; text: string }[] = [];
-    const simple: Field[] = [
-      'base_url',
-      'listen_addr',
-      'proxy',
-      'connect_timeout_secs',
-      'read_timeout_secs',
-      'max_retry_backoff_secs',
-      'bounded_retry_paths',
-      'forward_only',
-      'spool_limit_mb',
-      'max_body_mb',
-      'disk_cache',
-      'keepalive_interval_secs',
-      'keepalive_trigger',
-      'keepalive_heartbeat',
-      'allowed_hosts',
-      'allowed_origins',
-    ];
-    for (const k of simple) {
-      const v = c[k];
-      if (v === '' || (Array.isArray(v) && v.length === 0)) continue;
-      lines.push({ key: k, text: `${k} = ${tomlValue(v)}` });
+  /** 草稿和读到的值之间的差，编成 Rust 认的改动；没改的（尤其是密钥）不传 */
+  const edits = $derived.by((): Edit[] => {
+    if (!config) return [];
+    const out: Edit[] = [];
+    for (const f of config.fields) {
+      if (!f.editable || f.header) continue;
+      const k = f.key;
+      if (isSecret(k)) {
+        if (cleared[k]) out.push({ op: 'unset', key: k });
+        else if (secrets[k]) out.push({ op: 'set', key: k, value: secrets[k] });
+      } else if (isSeconds(k)) {
+        const s = valueOf(k, texts[k]);
+        if (!differs(f, s) || errors[k]) continue;
+        out.push(s === '' ? { op: 'unset', key: k } : { op: 'set', key: k, value: Number(s) });
+      } else if (isPlain(k)) {
+        const s = valueOf(k, texts[k]);
+        if (!differs(f, s) || errors[k]) continue;
+        out.push(s === '' ? { op: 'unset', key: k } : { op: 'set', key: k, value: s });
+      } else if (k === 'keepalive.trigger' && mode !== modeOf(f.value)) {
+        out.push({ op: 'set', key: 'keepalive.trigger', value: mode });
+      }
     }
-    if (c.rt_command) {
-      lines.push({
-        key: 'request_transform',
-        text: `request_transform = { command = "${c.rt_command}", args = ["${c.rt_args}"], mode = "${c.rt_mode}", extra = "${c.rt_extra}"${c.every_attempt ? ', every_attempt = true' : ''} }`,
-      });
-    }
-    return lines;
-  }
-
-  const diff = $derived.by(() => {
-    if (!cfg || !original) return [];
-    const before = tomlLines(original);
-    const after = tomlLines(cfg);
-    const out: { kind: '-' | '+' | ' '; text: string }[] = [];
-    const keys = [...new Set([...before.map((l) => l.key), ...after.map((l) => l.key)])];
-    for (const k of keys) {
-      const b = before.find((l) => l.key === k);
-      const a = after.find((l) => l.key === k);
-      if (b && a && b.text === a.text) continue;
-      if (b) out.push({ kind: '-', text: b.text });
-      if (a) out.push({ kind: '+', text: a.text });
+    for (const r of headers) {
+      if (r.existing && r.removed) out.push({ op: 'unset-header', key: r.table, name: r.name });
+      else if (!r.removed && r.value && r.name && !errors[`h${r.id}`]) out.push({ op: 'set-header', key: r.table, name: r.name, value: r.value });
     }
     return out;
   });
+  /** 草稿里动过的地方（含还有错、编不成改动的），保存条按它出现 */
+  const touched = $derived.by(() => {
+    if (!config) return 0;
+    let n = 0;
+    for (const [k, v] of Object.entries(texts)) if (differs(field(k), valueOf(k, v))) n++;
+    n += Object.values(secrets).filter(Boolean).length + Object.values(cleared).filter(Boolean).length;
+    if (mode !== modeOf(field('keepalive.trigger')?.value)) n++;
+    n += headers.filter((r) => (r.existing ? r.removed || r.value : r.name || r.value)).length;
+    return n;
+  });
 
-  function discard() {
-    if (original) cfg = $state.snapshot(original);
-  }
+  /** 文件读不懂（语法错）：Rust 给的字段全是空的，表单无从改起 */
+  const unreadable = $derived(config?.diagnostics.some((d) => d.code === 'config_syntax') ?? false);
 
-  function setNum(f: NumField, v: string) {
-    if (cfg) cfg[f] = v;
-  }
+  // ---------------------------------------------------------------------------
+  // 保存
+  // ---------------------------------------------------------------------------
 
-  async function save(restart: boolean) {
-    if (!cfg || !config) return;
-    const { port: target, path } = config;
-    const name = store.instance(target)?.alias ?? target;
-    await store.writeConfig(target, changesOf(cfg, changed));
-    original = $state.snapshot(cfg);
-    reviewing = false;
-    overlays.toast(t('toast.saved', { path }));
-    if (restart) {
-      await store.restart(target);
-      overlays.toast(t('toast.restarted', { name }));
+  let reviewing = $state(false);
+  let checking = $state(false);
+  let saving = $state(false);
+  let check = $state.raw<Validation | null>(null);
+  let saveFault = $state.raw<Failure | null>(null);
+  /** 文件在主目录之外时，用户确认过「我知道，照样保存」 */
+  let ack = $state(false);
+  /** 刚保存过、要重启才用上新配置的实例 */
+  let restartPorts = $state.raw<number[]>([]);
+
+  async function review() {
+    const to = writeTarget();
+    if (!to) return;
+    checking = true;
+    try {
+      check = await store.validateConfig(to, edits);
+      ack = false;
+      saveFault = null;
+      reviewing = true;
+    } catch (raw) {
+      await failed(toFailure(raw));
+    } finally {
+      checking = false;
     }
   }
 
-  function addTo(list: string[], value: string): boolean {
-    const v = value.trim();
-    if (!v || list.includes(v)) return false;
-    list.push(v);
-    return true;
+  async function save() {
+    const to = writeTarget();
+    if (!to || !target) return;
+    saving = true;
+    try {
+      const r = await store.writeConfig(to, edits, ack);
+      reviewing = false;
+      overlays.toast(r.changed ? t('toast.saved', { path: config?.file ?? '' }) : t('cfg.unchanged'));
+      restartPorts = r.instancesToRestart;
+      await load(target);
+    } catch (raw) {
+      const f = toFailure(raw);
+      // 写的时候 Rust 又查了一遍：没过就把它说的问题摆进对话框，不关
+      if (f.code === 'desktop_config' && check) check = { ...check, canSave: false, diagnostics: f.details.diagnostics };
+      else await failed(f);
+    } finally {
+      saving = false;
+    }
   }
 
-  const groups: { id: string; icon: IconName; label: () => string }[] = [
-    { id: 'upstream', icon: 'globe', label: () => t('cfg.group.upstream') },
-    { id: 'retry', icon: 'repeat', label: () => t('cfg.group.retry') },
-    { id: 'keepalive', icon: 'heart', label: () => t('cfg.group.keepalive') },
-    { id: 'transform', icon: 'shuffle', label: () => t('cfg.group.transform') },
-    { id: 'security', icon: 'lock', label: () => t('cfg.group.security') },
-  ];
+  async function failed(f: Failure) {
+    if (f.code === 'desktop_changed' && target) {
+      // 文件在读了之后被别处改过：草稿是按旧内容算的，不能硬写，重读一遍让用户再改
+      reviewing = false;
+      overlays.toast(t('cfg.changedElsewhere'), 'coral');
+      await load(target);
+    } else if (reviewing) saveFault = f;
+    else overlays.toast(faultText(f), 'coral');
+  }
+
+  /** 正在重启的端口：重启要等新进程就绪，期间按钮不能再点 */
+  let restarting = $state.raw<number[]>([]);
+
+  async function restart(port: number) {
+    const card = store.card(port);
+    if (!card?.run) return;
+    restarting = [...restarting, port];
+    try {
+      await store.restart(card.run);
+      restartPorts = restartPorts.filter((p) => p !== port);
+      overlays.toast(t('toast.restarted', { name: aliasOf(card) ?? port }));
+    } catch (raw) {
+      overlays.toast(faultText(toFailure(raw)), 'coral');
+    } finally {
+      restarting = restarting.filter((p) => p !== port);
+    }
+  }
+
+  /** 对话框里一处改动的说法；密钥只说「换成新值」，值不出现在屏幕上 */
+  function changeText(e: Edit): { key: string; text: string } {
+    switch (e.op) {
+      case 'set':
+        return { key: e.key, text: isSecret(e.key) ? t('cfg.ch.secret') : t('cfg.ch.set', { value: (e.key as string) === HEARTBEAT ? escapeText(String(e.value)) : String(e.value) }) };
+      case 'unset':
+        return { key: e.key, text: t('cfg.ch.unset') };
+      case 'set-header':
+        return { key: `${e.key}.${e.name}`, text: t('cfg.ch.secret') };
+      case 'unset-header':
+        return { key: `${e.key}.${e.name}`, text: t('cfg.ch.unset') };
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 显示
+  // ---------------------------------------------------------------------------
+
+  /** 字段名：认得的键用字典里的叫法，认不得的（比界面新的 Rust 多出来的键）直接显示键本身 */
+  function label(key: string): string {
+    const k = `cfg.k.${key}`;
+    return hasMessage(k) ? t(k) : key;
+  }
+  function help(key: string): string {
+    const k = `cfg.kh.${key}`;
+    return hasMessage(k) ? t(k) : '';
+  }
+  /**
+   * 值不是从文件里来的：说一声从哪来。启动覆盖压过文件（改文件要等下次不带覆盖启动）；
+   * 环境变量只有代理一项，而且只在文件没写代理时才用，所以在这里填了就以文件为准
+   */
+  const sourceTone: Record<Source, string> = { toml: '', settings: 'sky', default: '', env: 'butter', override: 'butter' };
+
+  /** 「其他」组：前面几组没点名的键；请求头表的每一项归请求头表管 */
+  const others = $derived(config?.fields.filter((f) => !f.header && !NAMED.has(f.key) && !TABLES.some((tb) => f.key.startsWith(`${tb}.`))) ?? []);
+
+  /** 字段对应的读时问题（Rust 给了键的） */
+  const issuesOf = (key: string) => config?.diagnostics.filter((d) => d.key === key) ?? [];
+
   let activeGroup = $state('upstream');
   let formEl: HTMLDivElement | undefined = $state();
 
@@ -286,354 +434,319 @@
     activeGroup = id;
     formEl?.querySelector(`#g-${id}`)?.scrollIntoView({ behavior: ui.reducedMotion ? 'auto' : 'smooth', block: 'start' });
   }
-
-  const instanceOptions = $derived(instances.map((i) => ({ value: i.port, label: i.alias ? `${i.port} ${i.alias}` : `${i.port}` })));
-
-  /** TOML 语法着色：逐行切成键、等号、值（字符串 / 数字 / 布尔 / 数组） */
-  function tokens(line: string): { cls: string; text: string }[] {
-    const m = line.match(/^(\w+)(\s*=\s*)(.*)$/);
-    if (!m) return [{ cls: 'plain', text: line }];
-    const v = m[3];
-    const cls = /^"/.test(v) ? 'str' : /^\d/.test(v) ? 'num' : /^(true|false)/.test(v) ? 'bool' : /^[[{]/.test(v) ? 'arr' : 'plain';
-    return [
-      { cls: 'key', text: m[1] },
-      { cls: 'eq', text: m[2] },
-      { cls, text: v },
-    ];
-  }
 </script>
 
-{#snippet badge(f: Field)}
-  {#if isLive(f)}
-    <span class="tag live"><Icon name="bolt" size={11} stroke={2.4} />{t('cfg.live')}</span>
+<!-- 只读的值：文本与数字原样，表按「名字 = 值」逐行，列表逐项 -->
+{#snippet cellView(c: Cell)}
+  {#if c.kind === 'none'}
+    <span class="muted">{t('cfg.empty')}</span>
+  {:else if c.kind === 'secret'}
+    <span class="chip" class:mint={c.set}><Icon name="key" size={11} stroke={2.4} />{c.set ? t('cfg.secretSet') : t('cfg.secretUnset')}</span>
+  {:else if c.kind === 'text'}
+    <code class="mono val">{c.text}</code>
+  {:else if c.kind === 'integer'}
+    <code class="mono val">{c.decimal}</code>
+  {:else if c.kind === 'bool'}
+    <span class="chip" class:mint={c.value}>{c.value ? t('cfg.yes') : t('cfg.no')}</span>
+  {:else if c.kind === 'list'}
+    {#if c.items.length === 0}
+      <span class="muted">{t('cfg.emptyList')}</span>
+    {:else}
+      <ol class="cells">
+        {#each c.items as item, i (i)}<li>{@render cellView(item)}</li>{/each}
+      </ol>
+    {/if}
+  {:else if c.entries.length === 0}
+    <span class="muted">{t('cfg.emptyList')}</span>
   {:else}
-    <span class="tag restart"><Icon name="restart" size={11} stroke={2.4} />{t('cfg.restart')}</span>
+    <dl class="cells map">
+      {#each c.entries as e, i (i)}
+        <dt class="mono">{e.name}</dt>
+        <dd>{@render cellView(e.value)}</dd>
+      {/each}
+    </dl>
   {/if}
 {/snippet}
 
-{#snippet label(f: Field, key: Parameters<typeof t>[0], help?: Parameters<typeof t>[0])}
+{#snippet lbl(f: ConfigField)}
+  {@const changedHere = edits.some((e) => ('key' in e ? e.key : '') === f.key && (e.op === 'set' || e.op === 'unset'))}
   <div class="lbl">
     <div class="lbl-top">
       <!-- 输入框靠 aria-labelledby 指回这里取得可读的名字（字段名在左栏，不和输入框嵌套） -->
-      <span class="name" id="lbl-{f}">{t(key)}</span>
-      {@render badge(f)}
-      {#if changed.includes(f)}<span class="dirty-dot" title={t('cfg.dirty', { n: 1 })}></span>{/if}
+      <span class="name" id="lbl-{f.key}">{label(f.key)}</span>
+      {#if f.source && f.source !== 'toml'}
+        <span class="tag {sourceTone[f.source]}">{t(`cfg.src.${f.source}`)}</span>
+      {/if}
+      {#if changedHere}<span class="dirty-dot" title={t('cfg.dirty', { n: 1 })}></span>{/if}
     </div>
-    <code class="mono tkey">{f.startsWith('rt_') ? 'request_transform' : f}</code>
-    {#if help}<p class="help">{t(help)}</p>{/if}
+    <code class="mono tkey">{f.key}</code>
+    {#if help(f.key)}<p class="help">{help(f.key)}</p>{/if}
   </div>
 {/snippet}
 
-{#snippet err(f: Field)}
-  {#if errors[f]}
-    <span class="msg error" in:pop={{ y: -4, scale: 1, duration: 300 }}><Icon name="alert" size={13} stroke={2.4} />{errors[f]}</span>
+{#snippet notes(f: ConfigField)}
+  {#if errors[f.key]}
+    <span class="msg error" in:pop={{ y: -4, scale: 1, duration: 300 }}><Icon name="alert" size={13} stroke={2.4} />{errors[f.key]}</span>
+  {/if}
+  {#if f.source === 'env' || f.source === 'override'}
+    <span class="msg warn"><Icon name="info" size={13} stroke={2.4} />{t(`cfg.src.${f.source}.warn`)}</span>
+  {/if}
+  {#each issuesOf(f.key) as d, i (i)}
+    <span class="msg {d.severity === 'error' ? 'error' : 'warn'}"><Icon name="alert" size={13} stroke={2.4} />{issueText(d)}</span>
+  {/each}
+{/snippet}
+
+{#snippet editor(f: ConfigField)}
+  {#if !f.editable}
+    <div class="ctl">{@render cellView(f.value)}</div>
+  {:else if isSecret(f.key)}
+    {@const set = f.value.kind === 'secret' && f.value.set}
+    <div class="ctl">
+      <div class="secret-row">
+        {#if cleared[f.key]}
+          <span class="chip coral"><Icon name="minus" size={11} stroke={2.4} />{t('cfg.secretWillClear')}</span>
+          <button class="btn sm ghost" onclick={() => (cleared[f.key] = false)}><Icon name="undo" size={13} />{t('cfg.secretKeep')}</button>
+        {:else}
+          <span class="chip" class:mint={set}><Icon name="key" size={11} stroke={2.4} />{set ? t('cfg.secretSet') : t('cfg.secretUnset')}</span>
+          <input
+            class="input mono"
+            class:invalid={!!errors[f.key]}
+            type="password"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder={set ? t('cfg.secretReplace') : t('cfg.secretNew')}
+            aria-labelledby="lbl-{f.key}"
+            bind:value={secrets[f.key]}
+          />
+          {#if set && f.source === 'toml'}
+            <button class="btn sm ghost" onclick={() => ((cleared[f.key] = true), (secrets[f.key] = ''))}>{t('cfg.secretClear')}</button>
+          {/if}
+        {/if}
+      </div>
+      {@render notes(f)}
+    </div>
+  {:else if isSeconds(f.key)}
+    <div class="ctl">
+      <div class="num-wrap">
+        <input class="input mono" class:invalid={!!errors[f.key]} inputmode="numeric" aria-labelledby="lbl-{f.key}" bind:value={texts[f.key]} aria-invalid={!!errors[f.key]} />
+        <span class="unit">{t('cfg.seconds')}</span>
+      </div>
+      {#if (texts[f.key] ?? '').trim() === '' && f.source === 'toml'}<span class="msg warn">{t('cfg.unsetHint')}</span>{/if}
+      {@render notes(f)}
+    </div>
+  {:else if f.key === 'keepalive.trigger'}
+    <div class="ctl">
+      <Segmented
+        options={[
+          { value: 'any', label: t('cfg.o.any') },
+          { value: 'accept', label: t('cfg.o.accept') },
+          { value: 'body-stream', label: t('cfg.o.body_stream') },
+        ]}
+        bind:value={mode}
+        label={label(f.key)}
+        size="sm"
+      />
+      {@render notes(f)}
+    </div>
+  {:else}
+    <div class="ctl">
+      <input
+        class="input mono"
+        class:invalid={!!errors[f.key]}
+        spellcheck="false"
+        autocomplete="off"
+        placeholder={t('cfg.empty')}
+        aria-labelledby="lbl-{f.key}"
+        aria-invalid={!!errors[f.key]}
+        bind:value={texts[f.key]}
+      />
+      {#if (texts[f.key] ?? '').trim() === '' && f.source === 'toml'}<span class="msg warn">{t('cfg.unsetHint')}</span>{/if}
+      {@render notes(f)}
+    </div>
   {/if}
 {/snippet}
 
-{#snippet num(f: NumField, unit: string)}
-  <div class="num-wrap">
-    <input
-      class="input mono"
-      class:invalid={!!errors[f]}
-      inputmode="numeric"
-      aria-labelledby="lbl-{f}"
-      value={cfg?.[f] ?? ''}
-      oninput={(e) => setNum(f, e.currentTarget.value)}
-      aria-invalid={!!errors[f]}
-    />
-    <span class="unit">{unit}</span>
-  </div>
-{/snippet}
-
-{#snippet chips(list: string[], draft: string, setDraft: (v: string) => void, placeholder: string)}
-  <div class="chips">
-    {#each list as item, i (item)}
-      <span class="item-chip mono" in:pop={{ y: 0, scale: 0.8, duration: 420 }}>
-        {item}
-        <button onclick={() => list.splice(i, 1)} aria-label={t('cfg.remove')}><Icon name="x" size={11} stroke={2.8} /></button>
-      </span>
-    {/each}
-    <span class="adder">
-      <input
-        class="mono"
-        value={draft}
-        {placeholder}
-        oninput={(e) => setDraft(e.currentTarget.value)}
-        onkeydown={(e) => {
-          if (e.key === 'Enter' && addTo(list, draft)) setDraft('');
-        }}
-        aria-label={t('cfg.add')}
-      />
-      <button onclick={() => addTo(list, draft) && setDraft('')}><Icon name="plus" size={13} stroke={2.6} />{t('cfg.add')}</button>
-    </span>
-  </div>
-{/snippet}
-
-{#if !inst || !cfg || !config}
-  <p class="none">{t('logs.noTraffic')}</p>
-{:else}
-  <header class="head">
-    <div class="title-row">
-      <h1>{t('nav.config')}</h1>
-      <Dropdown options={instanceOptions} bind:value={port} label={t('logs.col.instance')} icon="server" />
-      <span class="file"><Icon name="file" size={14} /><code class="mono">{config.path}</code></span>
-      <button class="btn ghost sm" onclick={() => overlays.toast(t('toast.protoOnly'), 'lilac')}><Icon name="external" size={14} />{t('cfg.openInEditor')}</button>
-      <span class="grow"></span>
-      <Segmented
-        options={[
-          { value: 'form', label: t('cfg.form'), icon: 'sliders' },
-          { value: 'toml', label: t('cfg.toml'), icon: 'braces' },
-        ]}
-        bind:value={view}
-        label={t('cfg.view')}
-        size="sm"
-      />
+{#snippet headerTable(table: HeaderTable)}
+  {@const f = field(table)}
+  {@const rows = headers.filter((r) => r.table === table)}
+  {@const locked = lockedHeaders(table)}
+  <div class="field">
+    <div class="lbl">
+      <div class="lbl-top"><span class="name">{label(table)}</span></div>
+      <code class="mono tkey">{table}</code>
+      {#if help(table)}<p class="help">{help(table)}</p>{/if}
     </div>
-  </header>
-
-  {#if view === 'toml'}
-    <div class="toml" in:pop={{ y: 6, scale: 1 }}>
-      <div class="toml-file"><Icon name="file" size={13} />{config.path}</div>
-      <ol>
-        {#each tomlLines(cfg) as line, i (line.key)}
-          <li><span class="ln">{i + 1}</span><code class="mono">{#each tokens(line.text) as tk, j (j)}<span class="tk {tk.cls}">{tk.text}</span>{/each}</code></li>
+    <div class="ctl">
+      {#if !rows.length && !locked.length}<span class="muted">{t('cfg.headers.none')}</span>{/if}
+      <ul class="headers">
+        {#each rows as r (r.id)}
+          <li class:removed={r.removed}>
+            {#if r.existing}
+              <code class="mono h-name">{r.name}</code>
+              {#if r.removed}
+                <span class="chip coral"><Icon name="minus" size={11} stroke={2.4} />{t('cfg.secretWillClear')}</span>
+                <span class="grow"></span>
+                <button class="btn sm ghost" onclick={() => (r.removed = false)}><Icon name="undo" size={13} />{t('cfg.secretKeep')}</button>
+              {:else}
+                <input class="input mono" type="password" autocomplete="off" placeholder={t('cfg.headers.replace')} aria-label={t('cfg.headers.valueOf', { name: r.name })} bind:value={r.value} />
+                <button class="btn sm icon ghost" onclick={() => ((r.removed = true), (r.value = ''))} aria-label={t('cfg.remove')}><Icon name="x" size={13} stroke={2.6} /></button>
+              {/if}
+            {:else}
+              <input class="input mono h-name" spellcheck="false" autocomplete="off" placeholder={t('cfg.headers.name')} aria-label={t('cfg.headers.name')} bind:value={r.name} />
+              <input class="input mono" type="password" autocomplete="off" placeholder={t('cfg.headers.value')} aria-label={t('cfg.headers.value')} bind:value={r.value} />
+              <button class="btn sm icon ghost" onclick={() => headers.splice(headers.indexOf(r), 1)} aria-label={t('cfg.remove')}><Icon name="x" size={13} stroke={2.6} /></button>
+            {/if}
+          </li>
+          {#if errors[`h${r.id}`]}<li class="h-err"><span class="msg error"><Icon name="alert" size={13} stroke={2.4} />{errors[`h${r.id}`]}</span></li>{/if}
         {/each}
-      </ol>
+        {#each locked as l (l.key)}
+          <li class="locked"><code class="mono h-name">{l.key.slice(table.length + 1)}</code><span class="muted">{t('cfg.headers.locked')}</span></li>
+        {/each}
+      </ul>
+      {#if f?.source && f.source !== 'toml'}<span class="msg warn"><Icon name="info" size={13} stroke={2.4} />{t('cfg.headers.inherited', { from: t(`cfg.src.${f.source}`) })}</span>{/if}
+      <button class="btn sm add" onclick={() => addHeader(table)}><Icon name="plus" size={13} stroke={2.6} />{t('cfg.headers.add')}</button>
     </div>
-  {:else}
+  </div>
+{/snippet}
+
+<header class="head">
+  <div class="title-row">
+    <h1>{t('nav.config')}</h1>
+    {#if options.length}
+      <Dropdown {options} bind:value={pick} label={t('cfg.target')} icon="file" />
+    {/if}
+    {#if config}
+      <span class="file"><Icon name="file" size={14} /><code class="mono">{config.file}</code></span>
+    {/if}
+  </div>
+  {#if currentChoice && !currentChoice.exists}
+    <p class="hint"><Icon name="info" size={14} />{t('cfg.fileMissing')}</p>
+  {/if}
+</header>
+
+{#if restartPorts.length}
+  <div class="restart-banner" role="status" in:pop={{ y: -6, scale: 1 }}>
+    <Icon name="restart" size={16} />
+    <p>{t('cfg.restartNeeded')}</p>
+    {#each restartPorts as port (port)}
+      {@const card = store.card(port)}
+      <button class="btn sm" disabled={!card?.run || restarting.includes(port)} onclick={() => restart(port)}><Icon name="restart" size={13} />{t('cfg.restartOne', { port })}</button>
+    {/each}
+    <button class="btn sm icon ghost" onclick={() => (restartPorts = [])} aria-label={t('confirm.cancel')}><Icon name="x" size={13} stroke={2.6} /></button>
+  </div>
+{/if}
+
+{#if loadFault && !config}
+  <div class="banner coral"><Icon name="alert" size={16} /><p>{faultText(loadFault)}</p></div>
+{:else if !config}
+  <p class="none">{store.connected && !options.length && started ? t('cfg.noTarget') : t('cfg.loading')}</p>
+{:else}
+  {#if config.diagnostics.length || config.withheld.length}
+    <section class="problems" aria-label={t('cfg.problems')}>
+      {#each config.diagnostics as d, i (i)}
+        <p class="sev-{d.severity}">
+          <Icon name={d.severity === 'info' ? 'info' : 'alert'} size={14} stroke={2.4} />
+          <span>{issueText(d)}</span>
+          {#if d.key}<code class="mono">{d.key}</code>{/if}
+          {#if d.line !== null}<span class="muted num">{t('cfg.line', { n: d.line })}</span>{/if}
+        </p>
+      {/each}
+      {#each config.withheld as w (w.key)}
+        <p class="sev-warning">
+          <Icon name="key" size={14} stroke={2.4} />
+          <span>{t(`cfg.withheld.${w.reason}`, { key: w.key, from: w.defaultTarget, to: w.target })}</span>
+        </p>
+      {/each}
+    </section>
+  {/if}
+
+  {#if !unreadable}
     <div class="layout">
       <nav class="groups" aria-label={t('nav.config')}>
-        {#each groups as g (g.id)}
+        {#each GROUPS as g (g.id)}
           <button class:on={activeGroup === g.id} onclick={() => jump(g.id)}>
-            <Icon name={g.icon} size={16} />{g.label()}
+            <Icon name={g.icon} size={16} />{t(`cfg.group.${g.id}`)}
           </button>
         {/each}
       </nav>
 
       <div class="form" bind:this={formEl}>
-        <section class="group" id="g-upstream">
-          <h2><Icon name="globe" size={17} />{t('cfg.group.upstream')}</h2>
-          <div class="field">
-            {@render label('base_url', 'cfg.f.base_url', 'cfg.h.base_url')}
-            <div class="ctl">
-              <input class="input mono" class:invalid={!!errors.base_url} bind:value={cfg.base_url} aria-invalid={!!errors.base_url} aria-labelledby="lbl-base_url" />
-              {@render err('base_url')}
-            </div>
-          </div>
-          <div class="field">
-            {@render label('listen_addr', 'cfg.f.listen_addr', 'cfg.h.listen_addr')}
-            <div class="ctl"><input class="input mono" bind:value={cfg.listen_addr} aria-labelledby="lbl-listen_addr" /></div>
-          </div>
-          <div class="field">
-            {@render label('proxy', 'cfg.f.proxy', 'cfg.h.proxy')}
-            <div class="ctl">
-              <input class="input mono" class:invalid={!!errors.proxy} bind:value={cfg.proxy} placeholder="http://127.0.0.1:7890" aria-labelledby="lbl-proxy" />
-              {@render err('proxy')}
-            </div>
-          </div>
-          <div class="field">
-            <div class="lbl">
-              <div class="lbl-top"><span class="name">{t('cfg.f.api_key')}</span><span class="tag live"><Icon name="bolt" size={11} stroke={2.4} />{t('cfg.live')}</span></div>
-              <code class="mono tkey">api_key</code>
-              <p class="help">{t('cfg.h.api_key')}</p>
-            </div>
-            <div class="ctl row">
-              <!-- 密钥只写不读：后端只给打码后的样子 -->
-              {#if config.apiKeyMasked}
-                <span class="chip pink"><Icon name="lock" size={12} stroke={2.4} />{t('cfg.secretSet')}<code class="mono">{config.apiKeyMasked}</code></span>
-              {:else}
-                <span class="chip">{t('cfg.secretUnset')}</span>
+        {#each GROUPS as g (g.id)}
+          <!-- 点名的键按顺序排；Rust 没给的跳过。请求头表总是画出来：表是空的、文件里没写它时也要能添加 -->
+          {@const fields = g.keys ? g.keys.map((k) => field(k) ?? k) : others}
+          <section class="group" id="g-{g.id}">
+            <h2><Icon name={g.icon} size={17} />{t(`cfg.group.${g.id}`)}</h2>
+            {#if g.id === 'other'}<p class="group-desc">{t('cfg.other.desc')}</p>{/if}
+            {#each fields as f (typeof f === 'string' ? f : f.key)}
+              {#if typeof f === 'string' ? TABLES.includes(f as HeaderTable) : TABLES.includes(f.key as HeaderTable)}
+                {@render headerTable((typeof f === 'string' ? f : f.key) as HeaderTable)}
+              {:else if typeof f !== 'string'}
+                <div class="field">
+                  {@render lbl(f)}
+                  {@render editor(f)}
+                </div>
               {/if}
-              <button class="btn sm" onclick={() => overlays.toast(t('toast.protoOnly'), 'lilac')}><Icon name="key" size={13} />{t('cfg.replace')}</button>
-            </div>
-          </div>
-          <div class="field two">
-            <div>
-              {@render label('connect_timeout_secs', 'cfg.f.connect_timeout_secs')}
-              {@render num('connect_timeout_secs', t('cfg.seconds'))}
-              {@render err('connect_timeout_secs')}
-            </div>
-            <div>
-              {@render label('read_timeout_secs', 'cfg.f.read_timeout_secs')}
-              {@render num('read_timeout_secs', t('cfg.seconds'))}
-              {@render err('read_timeout_secs')}
-              <p class="help">{t('cfg.h.read_timeout_secs')}</p>
-            </div>
-          </div>
-        </section>
-
-        <section class="group" id="g-retry">
-          <h2><Icon name="repeat" size={17} />{t('cfg.group.retry')}</h2>
-          <div class="field">
-            {@render label('max_retry_backoff_secs', 'cfg.f.max_retry_backoff_secs', 'cfg.h.max_retry_backoff_secs')}
-            <div class="ctl">
-              {@render num('max_retry_backoff_secs', t('cfg.seconds'))}
-              {@render err('max_retry_backoff_secs')}
-              {#if cfg.max_retry_backoff_secs.trim() === '0'}
-                <span class="msg warn" in:pop={{ y: -4, scale: 1, duration: 300 }}><Icon name="alert" size={13} stroke={2.4} />{t('cfg.warn.backoff0')}</span>
-              {/if}
-              {#if ladder.length && !errors.max_retry_backoff_secs}
-                <ol class="ladder" aria-hidden="true">
-                  {#each ladder as s, i (i)}
-                    <li class:zero={s === 0} class:cap={s > 0 && s === Number(cfg.max_retry_backoff_secs)}>{s}s</li>
-                  {/each}
-                  <li class="more">…</li>
-                </ol>
-              {/if}
-            </div>
-          </div>
-          <div class="field">
-            {@render label('bounded_retry_paths', 'cfg.f.bounded_retry_paths', 'cfg.h.bounded_retry_paths')}
-            <div class="ctl">
-              {@render chips(cfg.bounded_retry_paths, newPath, (v) => (newPath = v), '/v1/files.*')}
-              {@render err('bounded_retry_paths')}
-            </div>
-          </div>
-          <div class="field" class:hazard-field={cfg.forward_only}>
-            {@render label('forward_only', 'cfg.f.forward_only', 'cfg.h.forward_only')}
-            <div class="ctl">
-              <Switch bind:checked={cfg.forward_only} label={t('cfg.f.forward_only')} />
-              {#if cfg.forward_only}
-                <span class="msg warn strong" in:pop={{ y: -4, scale: 1, duration: 300 }}><span class="tape"></span>{t('cfg.warn.forwardOnly')}</span>
-              {/if}
-            </div>
-          </div>
-          <div class="field two">
-            <div>
-              {@render label('spool_limit_mb', 'cfg.f.spool_limit_mb')}
-              {@render num('spool_limit_mb', 'MB')}
-              {@render err('spool_limit_mb')}
-            </div>
-            <div>
-              {@render label('max_body_mb', 'cfg.f.max_body_mb')}
-              {@render num('max_body_mb', 'MB')}
-              {@render err('max_body_mb')}
-            </div>
-          </div>
-          <div class="field">
-            {@render label('disk_cache', 'cfg.f.disk_cache', 'cfg.h.disk_cache')}
-            <div class="ctl"><Switch bind:checked={cfg.disk_cache} label={t('cfg.f.disk_cache')} /></div>
-          </div>
-        </section>
-
-        <section class="group" id="g-keepalive">
-          <h2><Icon name="heart" size={17} />{t('cfg.group.keepalive')}</h2>
-          <div class="field">
-            {@render label('keepalive_interval_secs', 'cfg.f.keepalive_interval_secs', 'cfg.h.keepalive_interval_secs')}
-            <div class="ctl">
-              {@render num('keepalive_interval_secs', t('cfg.seconds'))}
-              {@render err('keepalive_interval_secs')}
-            </div>
-          </div>
-          <div class="field">
-            {@render label('keepalive_trigger', 'cfg.f.keepalive_trigger')}
-            <div class="ctl">
-              <Segmented
-                options={[
-                  { value: 'any', label: t('cfg.o.any') },
-                  { value: 'accept', label: t('cfg.o.accept') },
-                  { value: 'body_stream', label: t('cfg.o.body_stream') },
-                ]}
-                bind:value={cfg.keepalive_trigger}
-                label={t('cfg.f.keepalive_trigger')}
-                size="sm"
-              />
-            </div>
-          </div>
-          <div class="field">
-            {@render label('keepalive_heartbeat', 'cfg.f.keepalive_heartbeat', 'cfg.h.keepalive_heartbeat')}
-            <div class="ctl"><input class="input mono" bind:value={cfg.keepalive_heartbeat} aria-labelledby="lbl-keepalive_heartbeat" /></div>
-          </div>
-        </section>
-
-        <section class="group" id="g-transform">
-          <h2><Icon name="shuffle" size={17} />{t('cfg.group.transform')}</h2>
-          <div class="field">
-            {@render label('rt_command', 'cfg.f.request_transform', 'cfg.h.request_transform')}
-            <div class="ctl stack">
-              <input class="input mono" bind:value={cfg.rt_command} placeholder="~/.aproxy/bin/aproxy-format" aria-label="command" />
-              <div class="pair">
-                <input class="input mono" bind:value={cfg.rt_args} placeholder="run" aria-label="args" />
-                <Segmented
-                  options={[
-                    { value: 'persistent', label: t('cfg.o.persistent') },
-                    { value: 'spawn', label: t('cfg.o.spawn') },
-                  ]}
-                  bind:value={cfg.rt_mode}
-                  label={t('cfg.f.mode')}
-                  size="sm"
-                />
-              </div>
-              <input class="input mono" bind:value={cfg.rt_extra} placeholder={t('cfg.f.extra')} aria-label={t('cfg.f.extra')} />
-            </div>
-          </div>
-          <div class="field">
-            {@render label('every_attempt', 'cfg.f.every_attempt', 'cfg.h.every_attempt')}
-            <div class="ctl"><Switch bind:checked={cfg.every_attempt} label={t('cfg.f.every_attempt')} /></div>
-          </div>
-        </section>
-
-        <section class="group" id="g-security">
-          <h2><Icon name="lock" size={17} />{t('cfg.group.security')}</h2>
-          <div class="field">
-            {@render label('allowed_hosts', 'cfg.f.allowed_hosts', 'cfg.h.allowed_hosts')}
-            <div class="ctl">{@render chips(cfg.allowed_hosts, newHost, (v) => (newHost = v), 'myproxy.local')}</div>
-          </div>
-          <div class="field">
-            {@render label('allowed_origins', 'cfg.f.allowed_origins', 'cfg.h.allowed_origins')}
-            <div class="ctl">{@render chips(cfg.allowed_origins, newOrigin, (v) => (newOrigin = v), 'http://localhost:5173')}</div>
-          </div>
-        </section>
+            {/each}
+          </section>
+        {/each}
       </div>
     </div>
   {/if}
 
-  {#if changed.length > 0}
+  {#if touched > 0}
     <div class="savebar" in:pop={{ y: 30, scale: 0.96, duration: 560 }} out:fadeOut>
       <span class="dirty-dot big"></span>
-      <span class="sb-text">{t('cfg.dirty', { n: changed.length })}</span>
+      <span class="sb-text">{t('cfg.dirty', { n: touched })}</span>
       {#if hasErrors}<span class="msg error inline"><Icon name="alert" size={13} stroke={2.4} />{t('cfg.err.fix')}</span>{/if}
       <span class="grow"></span>
       <button class="btn sm ghost" onclick={discard}><Icon name="undo" size={14} />{t('cfg.discard')}</button>
-      <button class="btn sm primary" disabled={hasErrors || checking} onclick={review}>
+      <button class="btn sm primary" disabled={hasErrors || checking || edits.length === 0} onclick={review}>
         <Icon name="eye" size={14} />{checking ? t('cfg.checking') : t('cfg.review')}
       </button>
     </div>
   {/if}
 
-  {#if reviewing}
+  {#if reviewing && check}
     <div class="scrim" in:fadeOut={{ duration: 160 }} out:fadeOut={{ duration: 120 }} onclick={() => (reviewing = false)} aria-hidden="true"></div>
     <div class="layer">
       <div class="review" role="dialog" aria-modal="true" aria-labelledby="review-title" in:pop={{ y: 18, scale: 0.94, duration: 560 }} out:fadeOut={{ duration: 120 }}>
         <h2 id="review-title">{t('cfg.diff.title')}</h2>
-        <div class="file small"><Icon name="file" size={13} /><code class="mono">{config.path}</code></div>
-        <ol class="diff">
-          {#each diff as d, i (i)}
-            <li class="d-{d.kind === '-' ? 'del' : 'add'}"><span class="sign">{d.kind}</span><code class="mono">{d.text}</code></li>
+        <div class="file small"><Icon name="file" size={13} /><code class="mono">{config.file}</code></div>
+        <ul class="changes">
+          {#each edits as e, i (i)}
+            {@const c = changeText(e)}
+            <li class:del={e.op === 'unset' || e.op === 'unset-header'}><code class="mono">{c.key}</code><span>{c.text}</span></li>
           {/each}
-        </ol>
-        {#if issues.length}
-          <div class="issues" role="alert">
-            <p><Icon name="alert" size={14} stroke={2.4} />{t('cfg.diff.issues')}</p>
+        </ul>
+
+        {#if check.diagnostics.length || check.occupiedPort !== null}
+          <div class="issues" class:blocking={!check.canSave} role={check.canSave ? undefined : 'alert'}>
+            {#if !check.canSave}<p><Icon name="alert" size={14} stroke={2.4} />{t('cfg.diff.issues')}</p>{/if}
             <ul>
-              {#each issues as issue (issue.key)}
-                <li><code class="mono">{issue.key}</code>{issue.message[ui.lang] ?? issue.message.en}</li>
+              {#if check.occupiedPort !== null}<li>{t('cfg.occupied', { port: check.occupiedPort })}</li>{/if}
+              {#each check.diagnostics as d, i (i)}
+                <li class="sev-{d.severity}">{#if d.key}<code class="mono">{d.key}</code>{/if}{issueText(d)}</li>
               {/each}
             </ul>
           </div>
-        {:else}
-          <p class="restart-note" class:warn={needRestart.length > 0}>
-            <Icon name={needRestart.length > 0 ? 'restart' : 'bolt'} size={14} stroke={2.4} />
-            {needRestart.length > 0 ? t('cfg.diff.restartNote', { n: needRestart.length }) : t('cfg.diff.allLive')}
-          </p>
         {/if}
+
+        {#if check.externalAcl && check.canSave}
+          <label class="acl">
+            <input type="checkbox" bind:checked={ack} />
+            <span><strong>{t('cfg.acl')}</strong>{t('cfg.aclAck')}</span>
+          </label>
+        {/if}
+
+        {#if check.canSave}
+          <p class="restart-note warn"><Icon name="restart" size={14} stroke={2.4} />{t('cfg.diff.restartNote')}</p>
+        {/if}
+        {#if saveFault}<p class="msg error"><Icon name="alert" size={13} stroke={2.4} />{faultText(saveFault)}</p>{/if}
+
         <div class="actions">
           <button class="btn" onclick={() => (reviewing = false)}>{t('confirm.cancel')}</button>
-          {#if !issues.length}
-            <button class="btn {needRestart.length > 0 ? '' : 'primary'}" onclick={() => save(false)}>{t('cfg.save')}</button>
-            {#if needRestart.length > 0}
-              <button class="btn primary" onclick={() => save(true)}><Icon name="restart" size={14} />{t('cfg.saveRestart')}</button>
-            {/if}
+          {#if check.canSave}
+            <button class="btn primary" disabled={saving || (check.externalAcl && !ack)} onclick={save}>{t('cfg.save')}</button>
           {/if}
         </div>
       </div>
@@ -740,20 +853,6 @@
   .group h2 + .field {
     border-top: 0;
   }
-  .field.two {
-    grid-template-columns: 1fr 1fr;
-  }
-  .field.two > div {
-    display: grid;
-    gap: 8px;
-    align-content: start;
-  }
-  .field.hazard-field {
-    margin: 0 -12px;
-    padding: 14px 12px;
-    border-radius: var(--r-md);
-    background: var(--butter-soft);
-  }
   .lbl-top {
     display: flex;
     align-items: center;
@@ -785,15 +884,6 @@
     font-size: 11px;
     font-weight: 600;
   }
-  .tag.live {
-    background: var(--mint-soft);
-    color: var(--mint-deep);
-  }
-  .tag.restart {
-    background: var(--butter-soft);
-    color: var(--butter-deep);
-    border: 1px solid color-mix(in oklab, var(--butter-deep) 30%, transparent);
-  }
   .dirty-dot {
     width: 8px;
     height: 8px;
@@ -814,22 +904,6 @@
   }
   .ctl > .input {
     width: 100%;
-  }
-  .ctl.row {
-    flex-direction: row;
-    align-items: center;
-    flex-wrap: wrap;
-  }
-  .ctl.stack {
-    align-items: stretch;
-  }
-  .pair {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-  }
-  .pair .input {
-    flex: 1;
   }
   .num-wrap {
     position: relative;
@@ -860,165 +934,7 @@
   .msg.warn {
     color: var(--butter-deep);
   }
-  .msg.warn.strong {
-    color: var(--text);
-  }
-  .msg .tape {
-    flex: none;
-    width: 26px;
-    height: 16px;
-    border-radius: var(--r-pill);
-    border: var(--line-w) solid var(--butter-deep);
-    background: repeating-linear-gradient(-45deg, var(--on-fill) 0 4px, var(--butter) 4px 8px);
-  }
-  .ladder {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    margin: 2px 0 0;
-    padding: 0;
-    list-style: none;
-  }
-  .ladder li {
-    padding: 2px 7px;
-    border-radius: var(--r-pill);
-    background: var(--sky-soft);
-    color: var(--sky-deep);
-    font-size: 11px;
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-  }
-  .ladder li.zero {
-    background: var(--card-2-bg);
-    color: var(--text-3);
-  }
-  .ladder li.cap {
-    background: var(--sky);
-    color: var(--on-fill);
-  }
-  .ladder li.more {
-    background: transparent;
-  }
-  .chips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    align-items: center;
-  }
-  .item-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    height: 28px;
-    padding: 0 4px 0 11px;
-    border-radius: var(--r-pill);
-    border: var(--line-w-thin) solid color-mix(in oklab, var(--lilac-soft) 60%, var(--lilac));
-    background: var(--lilac-soft);
-    font-size: 12px;
-  }
-  .item-chip button {
-    display: grid;
-    place-items: center;
-    width: 20px;
-    height: 20px;
-    border-radius: 50%;
-    border: 0;
-    background: transparent;
-    color: var(--text-2);
-  }
-  .item-chip button:hover {
-    background: var(--coral-soft);
-    color: var(--coral-deep);
-  }
-  .adder {
-    display: inline-flex;
-    align-items: center;
-    height: 30px;
-    padding: 0 3px 0 12px;
-    border-radius: var(--r-pill);
-    /* 「添加一项」的输入位：虚线表示还空着，但它能输入，所以虚线用强边色 */
-    border: var(--line-w-thin) dashed var(--line-strong);
-    background: var(--card-bg);
-  }
-  .adder input {
-    width: 190px;
-    border: 0;
-    outline: none;
-    background: transparent;
-    color: var(--text);
-    font-size: 12px;
-  }
-  .adder input::placeholder {
-    color: var(--text-3);
-  }
-  .adder button {
-    display: inline-flex;
-    align-items: center;
-    gap: 3px;
-    height: 22px;
-    padding: 0 9px;
-    border-radius: var(--r-pill);
-    border: 0;
-    background: var(--lilac);
-    color: var(--on-fill);
-    font-size: 11.5px;
-    font-weight: 600;
-  }
 
-  .toml {
-    border-radius: var(--r-lg);
-    border: var(--line-w) solid var(--line);
-    background: var(--card-bg);
-    overflow: hidden;
-  }
-  .toml-file {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 9px 16px;
-    border-bottom: var(--line-w-thin) solid var(--line-soft);
-    background: var(--card-2-bg);
-    color: var(--text-2);
-    font-size: var(--fs-sm);
-  }
-  .toml ol {
-    margin: 0;
-    padding: 10px 0 14px;
-    list-style: none;
-  }
-  .toml li {
-    display: flex;
-    gap: 14px;
-    padding: 1px 16px;
-    font-size: 13px;
-    line-height: 1.7;
-  }
-  .ln {
-    width: 22px;
-    flex: none;
-    text-align: right;
-    color: var(--text-3);
-    font-family: var(--font-mono);
-    font-size: 12px;
-  }
-  .tk.key {
-    color: var(--lilac-deep);
-  }
-  .tk.eq {
-    color: var(--text-3);
-  }
-  .tk.str {
-    color: var(--mint-deep);
-  }
-  .tk.num {
-    color: var(--sky-deep);
-  }
-  .tk.bool {
-    color: var(--coral-deep);
-  }
-  .tk.arr {
-    color: var(--text);
-  }
 
   .savebar {
     position: absolute;
@@ -1072,41 +988,6 @@
     font-size: var(--fs-xl);
     font-weight: 620;
   }
-  .diff {
-    margin: 0 0 14px;
-    padding: 8px 0;
-    list-style: none;
-    border-radius: var(--r-md);
-    border: var(--line-w-thin) solid var(--line-soft);
-    background: var(--card-2-bg);
-    max-height: 300px;
-    overflow: auto;
-  }
-  .diff li {
-    display: flex;
-    gap: 10px;
-    padding: 2px 14px;
-    font-size: 12.5px;
-    line-height: 1.6;
-  }
-  .diff code {
-    white-space: pre-wrap;
-    word-break: break-all;
-  }
-  .d-del {
-    background: var(--coral-soft);
-    color: var(--coral-deep);
-  }
-  .d-add {
-    background: var(--mint-soft);
-    color: var(--mint-deep);
-  }
-  .sign {
-    width: 10px;
-    flex: none;
-    font-family: var(--font-mono);
-    font-weight: 700;
-  }
   .restart-note {
     display: flex;
     align-items: center;
@@ -1147,5 +1028,217 @@
     display: flex;
     justify-content: flex-end;
     gap: 10px;
+  }
+
+  /* 值的来源：全局默认是天蓝（别处来的、但照样生效），启动覆盖与环境变量是黄油色（要留意），内置默认是灰 */
+  .tag {
+    background: var(--card-2-bg);
+    color: var(--text-2);
+  }
+  .tag.sky {
+    background: var(--sky-soft);
+    color: var(--sky-deep);
+  }
+  .tag.butter {
+    background: var(--butter-soft);
+    color: var(--butter-deep);
+  }
+  .muted {
+    color: var(--text-3);
+  }
+  .hint {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin: 8px 0 0;
+    color: var(--text-2);
+    font-size: var(--fs-sm);
+  }
+  .group-desc {
+    margin: 0 0 6px;
+    color: var(--text-2);
+    font-size: var(--fs-sm);
+  }
+
+  /* 只读的值 */
+  .val {
+    word-break: break-all;
+    font-size: var(--fs-sm);
+  }
+  .cells {
+    display: grid;
+    gap: 6px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  /* 列表里的表（retry.rules、format 的每一项）各自成块，一眼分得清哪几行属于同一项 */
+  ol.cells > li:has(> .map) {
+    padding: 8px 10px;
+    border-radius: var(--r-md);
+    background: var(--card-2-bg);
+  }
+  .cells.map {
+    grid-template-columns: max-content 1fr;
+    column-gap: 12px;
+    row-gap: 4px;
+    align-items: baseline;
+  }
+  .cells.map dt {
+    color: var(--text-2);
+    font-size: var(--fs-sm);
+  }
+  .cells.map dd {
+    margin: 0;
+    min-width: 0;
+  }
+
+  /* 密钥：状态片 + 换新值的输入框 + 删掉 */
+  .secret-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .secret-row .input {
+    flex: 1;
+    min-width: 0;
+  }
+
+  /* 请求头表：已有的名字定死、值隐藏；新加的两格都能填 */
+  .headers {
+    display: grid;
+    gap: 6px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .headers li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .headers li .input {
+    flex: 1;
+    min-width: 0;
+  }
+  .headers .h-name {
+    flex: 0 0 34%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: var(--fs-sm);
+  }
+  .headers li.removed .h-name {
+    color: var(--text-3);
+    text-decoration: line-through;
+  }
+  .headers li.locked {
+    font-size: var(--fs-sm);
+  }
+  .btn.add {
+    justify-self: start;
+  }
+  .grow {
+    flex: 1;
+  }
+
+  /* 读到的问题、被扣下的凭据：放在表单上方，按严重程度着色 */
+  .banner,
+  .restart-banner {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 16px;
+    padding: 10px 14px;
+    border-radius: var(--r-md);
+  }
+  .banner {
+    background: var(--coral-soft);
+    color: var(--coral-deep);
+  }
+  .restart-banner {
+    background: var(--mint-soft);
+    color: var(--text);
+  }
+  .banner p,
+  .restart-banner p {
+    flex: 1;
+    min-width: 220px;
+    margin: 0;
+  }
+  .problems {
+    display: grid;
+    gap: 6px;
+    margin-bottom: 18px;
+    padding: 10px 14px;
+    border-radius: var(--r-md);
+    background: var(--card-2-bg);
+  }
+  .problems p {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 0;
+    font-size: var(--fs-sm);
+  }
+  .problems p :global(svg) {
+    flex: none;
+    align-self: center;
+  }
+  .problems code {
+    color: var(--text-2);
+  }
+  .sev-error {
+    color: var(--coral-deep);
+  }
+  .sev-warning {
+    color: var(--butter-deep);
+  }
+  .sev-info {
+    color: var(--sky-deep);
+  }
+
+  /* 对话框：改动清单、不挡保存的提醒（黄油色）、主目录之外的确认 */
+  .changes {
+    display: grid;
+    gap: 6px;
+    margin: 0 0 16px;
+    padding: 10px 14px;
+    border-radius: var(--r-md);
+    background: var(--card-2-bg);
+    list-style: none;
+  }
+  .changes li {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    font-size: var(--fs-sm);
+  }
+  .changes code {
+    color: var(--mint-deep);
+    font-weight: 600;
+  }
+  .changes li.del code {
+    color: var(--coral-deep);
+  }
+  .issues:not(.blocking) {
+    background: var(--butter-soft);
+    color: var(--text);
+  }
+  .acl {
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    margin: 0 0 16px;
+    padding: 10px 14px;
+    border-radius: var(--r-md);
+    background: var(--butter-soft);
+    font-size: var(--fs-sm);
+    line-height: 1.5;
+    cursor: pointer;
+  }
+  .acl input {
+    margin-top: 3px;
   }
 </style>

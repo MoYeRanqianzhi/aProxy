@@ -37,7 +37,7 @@ const SECONDS_KEYS: SecondsKey[] = ['timeouts.connect_secs', 'timeouts.first_byt
 
 const TEXT_DEFAULT: Partial<Record<TextKey, string>> = {
   listen_addr: '127.0.0.1:12345',
-  'keepalive.heartbeat': ': keepalive\\n\\n',
+  'keepalive.heartbeat': ': keepalive\n\n',
 };
 
 const SECONDS_DEFAULT: Record<SecondsKey, number> = {
@@ -93,18 +93,22 @@ function fieldsOf(doc: Doc, inst: Instance): ConfigField[] {
   }
   add('keepalive.trigger', text(doc.trigger ?? 'any'), doc.trigger ? 'toml' : 'default');
 
+  // 和 Rust 一样：先给整张表一项（只读，值都打成「设没设」），再给表里每个头一项
   for (const table of ['extra_headers', 'override_headers'] as const) {
+    const rows = doc.headers[table];
+    add(table, rows.length ? { kind: 'map', entries: rows.map(([name, v]) => ({ name, value: { kind: 'secret', set: !!v } })) } : { kind: 'none' }, rows.length ? 'toml' : null, false);
     for (const [name, value] of doc.headers[table]) {
-      out.push({ key: `${table}.${name}`, value: text(value), source: 'toml', header: { table, name }, editable: true });
+      // 头的值可能是凭据：和 Rust 一样只说设没设
+      out.push({ key: `${table}.${name}`, value: { kind: 'secret', set: !!value }, source: 'toml', header: { table, name }, editable: true });
     }
   }
 
   // 表单改不了的部分只读地列出来：要改它们得去编辑文件
   add('delivery', text(inst.forwardOnly ? 'forward' : 'retry'), 'toml', false);
-  add('cache.disk', { kind: 'bool', value: inst.diskCache }, 'toml', false);
+  add('disk_cache', { kind: 'bool', value: inst.diskCache }, 'toml', false);
   if (inst.boundedPaths.length) {
     add(
-      'retry',
+      'retry.rules',
       {
         kind: 'list',
         items: inst.boundedPaths.map((p) => ({

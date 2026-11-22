@@ -1,10 +1,10 @@
 /*
- * 码 → 给人看的一句话：命令失败（Failure）、请求失败或重试的原因（HistoryCode）。
+ * 码 → 给人看的一句话：命令失败（Failure）、请求失败或重试的原因（HistoryCode）、配置诊断（Issue）。
  *
  * Rust 只给稳定的码和几个固定的细节，从不给句子；句子都在界面的字典里（i18n.ts 的 fault.*、code.*），
  * 跟着界面语言走。认不出的码（比新版本的 Rust 少一个枚举值）落到通用的说法上，不显示码本身以外的原文。
  */
-import type { HistoryCode } from './backend/contract';
+import type { HistoryCode, Issue } from './backend/contract';
 import type { Failure } from './backend/link';
 import { hasMessage, t } from './i18n';
 
@@ -46,4 +46,10 @@ export function codeText(code: HistoryCode, status: number | null = null): strin
   if (code === 'upstream_status' && status !== null) return t('code.upstream_status_n', { status });
   const key = `code.${code}`;
   return hasMessage(key) ? t(key) : t('code.unknown');
+}
+
+/** 配置诊断的说明；认不出的码落到「运行 aproxy doctor 查看」上 */
+export function issueText(i: Issue): string {
+  const key = `diag.${i.code}`;
+  return hasMessage(key) ? t(key) : t('diag.unknown');
 }

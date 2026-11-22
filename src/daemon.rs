@@ -1991,6 +1991,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn retire_moved_port_records_only_touches_dead_owner() {
         let dir = tempfile::tempdir().unwrap();

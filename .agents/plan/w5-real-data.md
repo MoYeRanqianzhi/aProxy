@@ -97,6 +97,12 @@ W5 的总体要求（窗口外观、主题、吉祥物、安全边界、构建�
   文档，主代理审过再实现。形状文档是 [w5b-desktop-api](w5b-desktop-api.md)（2026-11-22 裁定，W5c 的前端照它写）。
   2026-11-22 已实现并合入（32 个命令）；Windows 的登记用 `conhost.exe --headless` 包裹（实测不出窗口，见记忆 desktop-login-carrier），macOS 只交叉编译过。
 - **W5c（主代理）**：前端的 Tauri Backend 实现，界面类型的调整（状态与阶段的词表、救回统计、置顶），去掉原型工具。
+  2026-11-23 进度：总览、导航与标题栏、实例页、请求日志与详情、更新页与命令面板、设置页、配置页都已改到契约
+  （`lib/store.svelte.ts` + `lib/backend/link.ts`），每页在浏览器里用演示后端（`lib/backend/demo/`）实际走过。
+  还剩：扩展相关的部分（设置页的扩展列表、`ConsentDialog`、`MascotFrame`、App 里的自定义吉祥物、审核工具条的
+  「模拟扩展写操作」）仍读旧数据源 `lib/legacy.svelte.ts` + `lib/backend/mock/index.ts`，等 W5e 的扩展契约（t10）合入后
+  一并改；之后删掉 `legacy.svelte.ts`、`backend/types.ts`、`mock/index.ts`、`lib/types.ts` 里没人用的类型和 App 里的
+  `legacy.connect()`。演示后端仍复用 `mock/engine.ts` 与 `mock/fake.ts` 造流量，这两个留着（可以挪进 `demo/`）。
 - **W5d（主代理）**：在真实应用里逐页过外观与交互，改文字与 i18n。
 - **W5e（Codex 做 Rust 与宿主侧的协议，主代理做确认框与设置页）**：扩展包的清单与发现、沙箱 iframe 的宿主、扩展 API、
   Rust 侧的授权检查与记录。

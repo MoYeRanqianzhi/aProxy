@@ -68,6 +68,9 @@
   } as const;
 
   export type IconName = keyof typeof paths;
+
+  /** 全部图标名：扩展按名字指定图标（api.ui.addPage 的 icon），认不认识要在运行时查 */
+  export const ICON_NAMES: ReadonlySet<string> = new Set(Object.keys(paths));
 </script>
 
 <script lang="ts">

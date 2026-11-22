@@ -35,6 +35,12 @@ export interface Link {
    * 还没接上时为 null
    */
   session(): string | null;
+
+  /**
+   * 已装的包里一个文件的地址（主题的 theme.css、扩展的 main.mjs 与 assets/ 下的文件），没有这个文件时为 null。
+   * 桌面窗口里是 Rust 的 aproxy-pkg 协议：同一个包里的相对地址都能解析，查询串被忽略，可以拿来避开模块缓存。
+   */
+  packageUrl(id: string, path: string): string | null;
 }
 
 /** 把任意的拒绝值整理成 Failure：形状不对的一律当作连接问题，原文不外传 */

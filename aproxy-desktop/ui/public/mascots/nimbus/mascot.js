@@ -1,11 +1,10 @@
 /*
- * 一个「用户自己装的」自定义吉祥物示例：小云。原型把它放在 public/mascots/nimbus/ 冒充扩展文件夹
- * ~/.aproxy/mascots/nimbus/ 里的 mascot.js。
+ * 一个扩展加的吉祥物示例：小云。演示数据里的扩展「小云」import 这个文件，再经 api.ui.registerMascot 把它加进
+ * 吉祥物列表（见 src/lib/backend/demo/packages.ts）；真实的扩展把同样的定义写进自己的 main.mjs 或 assets/ 里。
  *
  * 它就是第三方作者会交出来的东西：一个纯 JavaScript 的 ES 模块，默认导出一个吉祥物定义
  * （契约见 src/lib/mascot/types.ts：拿 MascotState、返回 SVG 字符串、样式全在 css 里）。
- * 界面从不执行它：宿主经 Backend.readMascot 取到源码，原样交给沙箱 iframe（public/mascot-sandbox.js），
- * 在那里 import、渲染。所以它不能也不需要引用界面的任何东西。
+ * 界面在 shadow root 里渲染它（MascotShadow），它不引用界面的任何东西。
  *
  * 天气就是它的表情：
  *   空闲 慢慢飘、偶尔眨眼     忙碌 弯弯笑眼、飘得快些     重试 下雨（上游在下雨，它在扛）

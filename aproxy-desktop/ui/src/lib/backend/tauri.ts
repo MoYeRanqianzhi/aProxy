@@ -25,15 +25,47 @@ class TauriLink implements Link {
 
   async call<N extends CommandName>(name: N, args: Commands[N][0]): Promise<Commands[N][1]> {
     try {
-      // 参数的类型由命令表保证；invoke 要的是带索引签名的对象，接口类型不带，这里只是换个说法
-      return await invoke<Commands[N][1]>(name, args as Record<string, unknown>);
+      return (await this.send(name, args)) as Commands[N][1];
     } catch (raw) {
       throw toFailure(raw);
     }
   }
 
+  /**
+   * 大多数命令的参数是一个 JSON 对象。传文件内容的三个命令不走 JSON：字节原样作为请求体，
+   * 其余参数放进请求头（文件名按 UTF-8 百分号编码，头里只能放 ASCII）；读文件的结果是 ArrayBuffer
+   */
+  private async send(name: CommandName, args: unknown): Promise<unknown> {
+    switch (name) {
+      case 'package_check_file': {
+        const a = args as Commands['package_check_file'][0];
+        return invoke(name, a.bytes, { headers: { 'x-aproxy-file-name': encodeURIComponent(a.name) } });
+      }
+      case 'extension_file_write': {
+        const a = args as Commands['extension_file_write'][0];
+        return invoke(name, a.bytes, {
+          headers: { 'x-aproxy-extension': a.id, 'x-aproxy-file-name': encodeURIComponent(a.name) },
+        });
+      }
+      case 'extension_file_read':
+        return new Uint8Array(await invoke<ArrayBuffer>(name, args as Record<string, unknown>));
+      default:
+        // 参数的类型由命令表保证；invoke 要的是带索引签名的对象，接口类型不带，这里只是换个说法
+        return invoke(name, args as Record<string, unknown>);
+    }
+  }
+
   session(): string | null {
     return this.current;
+  }
+
+  /**
+   * Tauri 把自定义协议在 Windows 上映射成 http://<协议名>.localhost/，别的平台是 <协议名>://localhost/。
+   * id 与路径逐段编码：路径里的 / 是分隔符，不能像 convertFileSrc 那样整个编码掉
+   */
+  packageUrl(id: string, path: string): string | null {
+    const base = navigator.userAgent.includes('Windows') ? 'http://aproxy-pkg.localhost' : 'aproxy-pkg://localhost';
+    return `${base}/${encodeURIComponent(id)}/${path.split('/').map(encodeURIComponent).join('/')}`;
   }
 
   attach(handler: EventHandler): void {

@@ -9,17 +9,17 @@
   import { onMount } from 'svelte';
   import { ui, parseHash, pageHash } from './lib/state.svelte';
   import { store } from './lib/store.svelte';
-  import { store as legacy } from './lib/legacy.svelte';
+  import { packages } from './lib/packages.svelte';
+  import { host } from './lib/extensions/host.svelte';
   import { overlays } from './lib/overlays.svelte';
   import { mascotPalette } from './lib/mascot/palette.svelte';
-  import { mascots } from './lib/mascot/registry.svelte';
   import { applyTheme } from './lib/theme';
   import { pageIn } from './lib/motion';
   import Titlebar from './components/Titlebar.svelte';
   import Nav from './components/Nav.svelte';
   import ConfirmDialog from './components/ConfirmDialog.svelte';
-  import ConsentDialog from './components/ConsentDialog.svelte';
-  import ThemePreviewBar from './components/ThemePreviewBar.svelte';
+  import InstallDialog from './components/InstallDialog.svelte';
+  import DropOverlay from './components/DropOverlay.svelte';
   import CommandPalette from './components/CommandPalette.svelte';
   import Toasts from './components/Toasts.svelte';
   import Overview from './pages/Overview.svelte';
@@ -28,6 +28,7 @@
   import Config from './pages/Config.svelte';
   import Update from './pages/Update.svelte';
   import Settings from './pages/Settings.svelte';
+  import ExtensionPage from './pages/ExtensionPage.svelte';
   import { inTauri, syncWindow } from './lib/shell';
 
   // 原型件只在浏览器开发模式里加载。生产构建里 import.meta.env.DEV 是常量 false，整个分支连同
@@ -53,15 +54,6 @@
     syncWindow();
   });
 
-  // 已装的自定义吉祥物来自扩展列表（kind 为 mascot）。注册表只记名字和位置，代码由 MascotFrame 交给沙箱运行
-  $effect(() => {
-    mascots.setCustom(
-      legacy.extensions
-        .filter((e) => e.kind === 'mascot' && e.enabled)
-        .map((e) => ({ id: e.id, name: e.name, description: e.description, origin: e.origin })),
-    );
-  });
-
   // 整体状态挂在根上：将来的主题与扩展可以按 [data-mood] 换样式，不必依赖内部 DOM 结构
   $effect(() => {
     document.documentElement.dataset.mood = store.mood;
@@ -69,14 +61,15 @@
 
   // 页面 ⇄ 地址栏 hash：可以直接打开 #/logs、#/instance/12346 审核某一页
   $effect(() => {
-    const h = pageHash(ui.page, ui.instancePort);
+    const h = pageHash(ui.page, ui.instancePort, ui.extPage);
     if (location.hash !== h) history.replaceState(null, '', h);
   });
 
   onMount(() => {
     const fromHash = () => {
       const r = parseHash(location.hash);
-      if (r) ui.go(r.page, r.port);
+      if (r?.ext) ui.goExt(r.ext);
+      else if (r) ui.go(r.page, r.port);
     };
     addEventListener('hashchange', fromHash);
 
@@ -91,14 +84,19 @@
     motion.addEventListener('change', sync);
     ui.systemLang = navigator.language.toLowerCase().startsWith('zh') ? 'zh-CN' : 'en';
 
-    // 窗口失焦时标题栏文字变淡，与原生窗口一致
+    // 窗口失焦时标题栏文字变淡，与原生窗口一致。回到前台时重读 desktop.toml 与包的列表：
+    // 用户可能刚手改过设置文件，或者往 extensions/ 里拷了一个包
     const blur = () => document.body.classList.add('inactive');
-    const focus = () => document.body.classList.remove('inactive');
+    const focus = () => {
+      document.body.classList.remove('inactive');
+      void store.refreshOnFocus();
+    };
     addEventListener('blur', blur);
     addEventListener('focus', focus);
 
     store.connect();
-    legacy.connect();
+    packages.watchTheme();
+    host.start();
 
     return () => {
       removeEventListener('hashchange', fromHash);
@@ -131,8 +129,7 @@
   <div class="body">
     <Nav />
     <main class="sheet">
-      <ThemePreviewBar />
-      {#key `${ui.page}:${ui.page === 'instance' || ui.page === 'config' ? ui.instancePort : ''}`}
+      {#key `${ui.page}:${ui.page === 'instance' || ui.page === 'config' ? ui.instancePort : ui.page === 'ext' ? ui.extPage : ''}`}
         <div class="page" class:flush={ui.page === 'logs'} in:pageIn>
           {#if ui.page === 'overview'}
             <Overview />
@@ -144,6 +141,8 @@
             <Config />
           {:else if ui.page === 'update'}
             <Update />
+          {:else if ui.page === 'ext'}
+            <ExtensionPage />
           {:else if ui.page === 'mascots'}
             {#if proto}
               <proto.MascotLab />
@@ -158,7 +157,8 @@
 </div>
 
 <ConfirmDialog />
-<ConsentDialog />
+<InstallDialog />
+<DropOverlay />
 <CommandPalette />
 <Toasts />
 {#if proto}

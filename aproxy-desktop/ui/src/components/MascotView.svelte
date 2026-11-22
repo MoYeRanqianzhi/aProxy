@@ -1,12 +1,10 @@
 <!--
   吉祥物的宿主：把界面状态整理成 MascotState 交给当前吉祥物，再把画面放进一块它独占的地方。
 
-  为什么要隔离：吉祥物可以替换，用户还能装别人写的形象。隔离是为了稳定——一个画错、抛异常或卡死的吉祥物
-  只是「不显示」，而不是把标题栏一起拖垮。两种来源两种隔离：
-    - 内置的（随界面编译、带定义）由 MascotShadow 在 shadow root 里直接渲染，样式互不干扰，try/catch 接住异常；
-    - 用户装的自定义吉祥物由 MascotFrame 放进 sandbox iframe，代码和画面都在不透明源里，界面从不执行它的代码。
-  吉祥物拿到的只有 MascotState（状态、尺寸档位、是否减少动效、解析好的颜色），不依赖界面的 DOM 或全局状态；
-  两种宿主拿到的请求在这里一次备齐，完全一样。
+  为什么要隔离：吉祥物可以替换，扩展也能加自己的形象。隔离是为了稳定——一个画错或抛异常的吉祥物
+  只是「不显示」，而不是把标题栏一起拖垮：内置的与扩展加的都由 MascotShadow 在 shadow root 里渲染，
+  样式互不干扰，try/catch 接住异常。这不是安全边界：扩展本来就在窗口里运行（见 lib/extensions/host.svelte.ts）。
+  吉祥物拿到的只有 MascotState（状态、尺寸档位、是否减少动效、解析好的颜色），不依赖界面的 DOM 或全局状态。
 
   props：
     mood / retries / size   交给吉祥物的状态
@@ -32,7 +30,6 @@
   import { mascotPalette } from '../lib/mascot/palette.svelte';
   import type { MascotMood, MascotPalette, MascotSize } from '../lib/mascot/types';
   import MascotShadow from './MascotShadow.svelte';
-  import MascotFrame from './MascotFrame.svelte';
 
   let {
     mood,
@@ -65,7 +62,7 @@
   const entry = $derived(id ? mascots.get(id) : mascots.current);
   const box = $derived(px ?? icon ?? DEFAULT_PX[size]);
 
-  // 展开成普通对象：调色板是响应式代理，而沙箱那条路要经 postMessage 结构化克隆，代理克隆不了
+  // 展开成普通对象：吉祥物拿到的是一份快照，不是界面的响应式代理
   const pal = $derived<MascotPalette>({ ...mascotPalette.current, ...palette });
   const request = $derived<MascotRequest>(
     icon
@@ -82,12 +79,10 @@
   aria-label={label || undefined}
   aria-hidden={label ? undefined : 'true'}
 >
-  {#if entry?.def}
-    <MascotShadow def={entry.def} {request} {replay} {freezeAt} />
-  {:else if entry}
-    <!-- 换了一个自定义吉祥物就换一个沙箱：旧代码留下的任何东西都不带过去 -->
+  {#if entry}
+    <!-- 换了一个吉祥物就换一个 shadow root：上一个留下的样式与动画都不带过去 -->
     {#key entry.id}
-      <MascotFrame id={entry.id} {request} {replay} {freezeAt} />
+      <MascotShadow def={entry.def} {request} {replay} {freezeAt} />
     {/key}
   {/if}
 </span>

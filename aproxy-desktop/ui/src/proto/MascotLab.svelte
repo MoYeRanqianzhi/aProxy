@@ -155,7 +155,7 @@
     {#each mascots.entries as e (e.id)}
       <div class="m-name">
         <strong>{mascotName(e)}</strong>
-        {#if e.source === 'custom'}<span class="chip pink tiny">{t('set.mascot.custom')}</span>{/if}
+        {#if e.source === 'extension'}<span class="chip pink tiny">{t('set.mascot.custom')}</span>{/if}
       </div>
       {#each MASCOT_MOODS as mood (mood)}
         <div class="m-cell">

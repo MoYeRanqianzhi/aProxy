@@ -422,15 +422,28 @@ export interface SettingsView {
   diagnostics: Issue[];
 }
 
-/** 界面偏好，存在 <home>/desktop/ 下。lang 与 mascot 由页面解释，不认识的回落到默认 */
+/**
+ * 界面偏好，存在 <home>/desktop/desktop.toml，用户也可以手改。lang 与 mascot 由页面解释，不认识的回落到默认
+ */
 export interface Preferences {
   lang: string;
   mode: 'system' | 'light' | 'dark';
   palette: 'soft' | 'standard' | 'vivid';
   mica: boolean;
   mascot: string;
-  /** 主题字符串（aproxy-theme-v1:…）；null 是内置主题 */
-  theme: string | null;
+  /** builtin，或已装主题包的 id；那个主题包不在了，页面就用内置主题 */
+  theme: string;
+}
+
+/**
+ * desktop.toml 读不了或某个键写错了的地方。syntax 带行与列；value 带出错的键（那个键用默认值）；
+ * too-large、io 说明整个文件这次没读成
+ */
+export interface TomlIssue {
+  kind: 'syntax' | 'too-large' | 'io' | 'value';
+  line: number | null;
+  column: number | null;
+  key: string | null;
 }
 
 /** 置顶时抓下来的摘要：原记录被淘汰以后它还在，但不再更新 */
@@ -445,11 +458,19 @@ export interface Bookmark {
 }
 
 export interface DesktopState {
-  preferences: Preferences;
+  /**
+   * desktop.toml 这次没读成（语法错、太大、读不了）时为 null：页面保留手上已有的值，
+   * 免得用户改到一半的文件把窗口打回默认
+   */
+  preferences: Preferences | null;
+  /** 启用的扩展，按加载的先后；与 preferences 同时为 null */
+  enabledExtensions: string[] | null;
   /** 新置顶的在前 */
   bookmarks: Bookmark[];
-  /** 这次读的时候因为损坏被重置成默认的文件：要告诉用户 */
-  reset: ('preferences' | 'bookmarks')[];
+  /** 这次读的时候因为损坏被重置成默认的文件：要告诉用户（desktop.toml 从不被重置，见 desktopToml） */
+  reset: 'bookmarks'[];
+  /** desktop.toml 里的问题；没有问题是 [] */
+  desktopToml: TomlIssue[];
 }
 
 /** 开机自启：每次都是现查系统里的登记 */
@@ -516,6 +537,134 @@ export interface Job {
 export interface InstallEnd {
   outcome: 'installed' | 'up-to-date';
   version: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// 主题包与扩展包
+//
+// 只有两种包：主题（颜色、样式表、图片、字体，没有代码）与扩展（在窗口里运行的代码，也可以改外观）。
+// 不做沙箱、不做逐项授权：装上之后扩展能做页面能做的一切。保护只在安装之前——Rust 交来这里的事实，
+// 页面据此逐条弹窗、每条都要点确认。安装分两步：check 读包、校验、算 sha256，立刻返回；
+// verify 另去 GitHub 查仓库与 release，慢、可能连不上，页面先弹第一个提醒，同时等它。
+// manifest 里的文字都是包作者写的，Rust 已去掉控制字符与改变书写方向的字符，仍只能当文本显示。
+// ---------------------------------------------------------------------------
+
+export type PackageKind = 'theme' | 'extension';
+
+/** 一段给人看的文字：一个字符串，或按语言标签（en、zh-CN…）给的几份 */
+export type Text = string | Record<string, string>;
+
+/** 扩展自己声明会改的东西；只是说明，不做限制 */
+export type WriteKind = 'config' | 'instances' | 'updates' | 'formats';
+
+export interface PackageManifest {
+  schema: 1;
+  kind: PackageKind;
+  /** 小写字母、数字、`.`、`-`，3–100 个字符；也是安装目录名 */
+  id: string;
+  name: Text;
+  version: string;
+  author: string;
+  description: Text;
+  /** 开源仓库地址；null 即作者声明闭源 */
+  repository: string | null;
+  license: string | null;
+  /** 配对的 format 程序名（hello 回复里的 name） */
+  formats: string[];
+  /** 自己声明会连接的主机；只是说明 */
+  network: string[];
+  writes: WriteKind[];
+}
+
+/** 包从哪来：一个文件（有 sha256，能与 release 比对），或一个解开的目录（没有可比对的文件） */
+export type PackageSource =
+  | { kind: 'file'; name: string; sha256: string; bytes: number }
+  | { kind: 'directory'; name: string };
+
+/** 读包、校验之后的结果；token 交给 verify、install 或 discard，单次有效，30 分钟后过期 */
+export interface PackageCheck {
+  token: Token;
+  manifest: PackageManifest;
+  /** 按路径排序 */
+  files: { path: string; bytes: number }[];
+  totalBytes: number;
+  source: PackageSource;
+  /** 同一个 id 已经装着（同一种类）：这次是升级、重装或降级 */
+  installed: { version: string; enabled: boolean } | null;
+  /** 主题包的 theme.json，由页面按 ThemeSpec 校验 */
+  theme: Record<string, unknown> | null;
+}
+
+export type Unreachable = 'network' | 'timeout' | 'rate-limited' | 'http';
+
+/**
+ * GitHub 上查到的事实，只陈述、不下结论；阈值（例如 star 少）由页面定。
+ * 只有 release 的 digest 对上了，仓库的这些数字才说明这个包：没对上时，谁都可以在 manifest 里写一个热门仓库
+ */
+export type GithubFacts =
+  | { state: 'no-repository' }
+  | { state: 'not-github'; url: string }
+  | { state: 'repo-not-found' }
+  | { state: 'unreachable'; reason: Unreachable; status: number | null }
+  | { state: 'checked'; repo: RepoFacts; release: ReleaseFacts };
+
+export interface RepoFacts {
+  fullName: string;
+  url: string;
+  stars: number;
+  forks: number;
+  createdAt: Time;
+  pushedAt: Time;
+  archived: boolean;
+  isFork: boolean;
+  license: string | null;
+  /** 仓库改过名或换了主人：GitHub 把 manifest 里的地址转到了别处 */
+  renamed: boolean;
+}
+
+/**
+ * 安装文件与 tag v<version>（或 <version>）的 release 比对的结果：
+ *   match 有一个 asset 的 digest 等于文件的 sha256；mismatch 有同名的 asset 但 digest 不同；
+ *   no-asset 哪个 asset 都对不上；no-digest 这个 release 的 asset 没有 digest（早期上传的）；
+ *   no-release 两个 tag 都没有 release；not-a-file 从目录安装，没有可比对的文件
+ */
+export type ReleaseFacts =
+  | { state: 'match'; tag: string; asset: string; url: string }
+  | { state: 'mismatch'; tag: string; asset: string }
+  | { state: 'no-asset'; tag: string }
+  | { state: 'no-digest'; tag: string }
+  | { state: 'no-release' }
+  | { state: 'not-a-file' }
+  | { state: 'unreachable'; reason: Unreachable; status: number | null };
+
+/** 已装的包为什么用不了：manifest 读不了或不合格、入口文件不见了（多半是被手改过） */
+export interface PackageIssue {
+  reason: 'manifest' | 'entry' | 'io';
+}
+
+export interface PackageEntry {
+  id: string;
+  kind: PackageKind;
+  /** 装着的 manifest 不再合格时为 null（看 issue） */
+  manifest: PackageManifest | null;
+  /** 扩展是否启用；主题总是 false（主题由偏好的 theme 选中） */
+  enabled: boolean;
+  /** 以下三项来自安装记录；手工拷进来的包没有记录，三项都是 null：它没有经过安装前的检查 */
+  installedAt: Time | null;
+  source: PackageSource | null;
+  github: GithubFacts | null;
+  issue: PackageIssue | null;
+  /** 扩展的数据目录有多大（卸载时问要不要一起删） */
+  dataBytes: number;
+  /** 主题包的 theme.json */
+  theme: Record<string, unknown> | null;
+}
+
+/** 扩展数据目录里的一个文件 */
+export interface DataFile {
+  name: string;
+  bytes: number;
+  modifiedAt: Time;
 }
 
 // ---------------------------------------------------------------------------
@@ -602,11 +751,33 @@ export type Fault =
   | F<'desktop_config', { diagnostics: Issue[] }>
   | F<'desktop_start', { reason: 'spawn' | 'not-ready'; oldStopped: boolean }>
   | F<'desktop_stop', { port: number; reason: 'still-running' | 'unverified' | 'permission' | 'failed' }>
-  | F<'desktop_state_io' | 'desktop_state_reset', { file: 'preferences' | 'bookmarks' }>
+  | F<'desktop_state_io' | 'desktop_state_reset', { file: 'bookmarks' }>
+  | F<'desktop_limit', { resource: 'bookmark-count' | 'bookmark-bytes'; max: number }>
+  /** desktop.toml 这时写不了（语法错、太大、读不了）：文件原样不动，等用户改好 */
+  | F<'desktop_toml', { issue: TomlIssue }>
+  // 以下几个包与扩展数据的码是 Rust 一侧实现之前按任务书先写的，实现交回后按它的码表对齐
+  | F<'package_read', { reason: 'io' | 'too-large' | 'not-zip' | 'compression' | 'encrypted' | 'bomb' }>
   | F<
-      'desktop_limit',
-      { resource: 'bookmark-count' | 'bookmark-bytes' | 'preference-bytes' | 'theme-bytes'; max: number }
+      'package_layout',
+      {
+        reason:
+          | 'no-manifest'
+          | 'path'
+          | 'link'
+          | 'duplicate'
+          | 'too-many-files'
+          | 'file-too-large'
+          | 'too-large'
+          | 'not-allowed'
+          | 'missing-entry';
+        path: string | null;
+      }
     >
+  | F<'package_manifest', { field: string; reason: 'missing' | 'invalid' | 'unsupported' | 'duplicate-key' | 'json' }>
+  | F<'package_kind_changed', { installed: PackageKind }>
+  | F<'package_token'>
+  | F<'package_unknown', { id: string }>
+  | F<'extension_data', { reason: 'corrupt' | 'name' | 'limit'; max: number | null }>
   | F<
       'desktop_registration',
       {
@@ -719,6 +890,35 @@ export interface Commands {
   check_update: [{ channel: 'auto' | 'pre' }, UpdateInfo];
   install_update: [{ check: Token }, InstallEnd];
   about: [None, About];
+
+  package_list: [None, PackageEntry[]];
+  /** 用户在文件选择框里选的包：bytes 是文件内容（传输层把它当请求体发，name 放进请求头） */
+  package_check_file: [{ name: string; bytes: Uint8Array }, PackageCheck];
+  /** 拖进窗口的文件或目录 */
+  package_check_path: [{ path: string }, PackageCheck];
+  package_verify: [{ token: Token }, GithubFacts];
+  /** enable 只对第一次装的扩展有用；升级保留原来的启用状态、设置与数据 */
+  package_install: [{ token: Token; enable: boolean }, PackageEntry];
+  /** 用户取消安装：删掉暂存的包。token 不认识或过期了也不算错 */
+  package_discard: [{ token: Token }, null];
+  /** 只对扩展；主题用 set_preferences 的 theme 选 */
+  package_set_enabled: [{ id: string; enabled: boolean }, PackageEntry];
+  package_uninstall: [{ id: string; removeData: boolean }, null];
+
+  /** 扩展自己的设置：desktop.toml 里 [extensions.settings."<id>"] 这张表 */
+  extension_settings_read: [{ id: string }, Record<string, unknown>];
+  /** changes 里值为 null 的键被删掉；返回改完的整张表 */
+  extension_settings_write: [{ id: string; changes: Record<string, unknown> }, Record<string, unknown>];
+  /** 扩展的键值数据：<home>/desktop/extension-data/<id>/storage.json */
+  extension_storage_read: [{ id: string }, Record<string, unknown>];
+  /** reset 为 true 时从空对象开始改（存储坏了也能这样恢复） */
+  extension_storage_write: [{ id: string; changes: Record<string, unknown>; reset: boolean }, Record<string, unknown>];
+  /** 扩展的文件：<home>/desktop/extension-data/<id>/files/，名字不带路径 */
+  extension_files_list: [{ id: string }, DataFile[]];
+  extension_file_read: [{ id: string; name: string }, Uint8Array];
+  extension_file_write: [{ id: string; name: string; bytes: Uint8Array }, DataFile];
+  /** 文件本来就不在也不算错 */
+  extension_file_delete: [{ id: string; name: string }, null];
 }
 
 export type CommandName = keyof Commands;

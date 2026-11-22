@@ -1,9 +1,6 @@
 /*
- * 界面用到的数据形状：Backend 接口（lib/backend）交给界面的就是这些。
- *
- * 原型里由 mock 后端生成假数据；正式接入后由 Tauri IPC 实现从实例的状态与日志流映射过来。
- * 字段按「界面要显示什么」来定，不要求与线上格式一一对应——映射是各个 Backend 实现自己的事。
- * 密钥永远是打码后的样子：IPC 不返回明文，界面也没有地方能拿到明文。
+ * 原型时期的数据形状：模拟引擎（lib/backend/mock）按它们生成演示用的实例、请求与详情，演示后端（lib/backend/demo）
+ * 再换成契约（lib/backend/contract.ts）交给界面。界面本身只认契约；这里另外定义的只有主题（ThemeSpec）与正文查看器的 Json。
  */
 
 export type InstanceStatus = 'active' | 'idle' | 'unresponsive' | 'stopped' | 'restarting';
@@ -164,59 +161,7 @@ export interface RequestDetail {
 }
 
 // ---------------------------------------------------------------------------
-// 配置、设置、更新
-// ---------------------------------------------------------------------------
-
-export interface RequestTransformConfig {
-  command: string;
-  args: string;
-  mode: 'persistent' | 'spawn';
-  extra: string;
-  every_attempt: boolean;
-}
-
-/** 实例配置里界面能改的那些键，名字与 config.toml 一致 */
-export interface ConfigValues {
-  base_url: string;
-  listen_addr: string;
-  proxy: string;
-  connect_timeout_secs: number;
-  read_timeout_secs: number;
-  max_retry_backoff_secs: number;
-  bounded_retry_paths: string[];
-  forward_only: boolean;
-  spool_limit_mb: number;
-  max_body_mb: number;
-  disk_cache: boolean;
-  keepalive_interval_secs: number;
-  keepalive_trigger: 'any' | 'accept' | 'body_stream';
-  keepalive_heartbeat: string;
-  request_transform: RequestTransformConfig | null;
-  allowed_hosts: string[];
-  allowed_origins: string[];
-}
-
-export type ConfigKey = keyof ConfigValues;
-
-/** 实例保存前检查出的问题：格式之外界面判断不了的那些（端口被占、上游指回 aProxy 自己…） */
-export interface ConfigIssue {
-  key: ConfigKey;
-  /** 实例给出的说明，至少有 en */
-  message: LocalizedText;
-}
-
-export interface InstanceConfig {
-  port: number;
-  path: string;
-  values: ConfigValues;
-  /** 密钥只写不读：已设置时只给打码后的样子，未设置为 null */
-  apiKeyMasked: string | null;
-  /** 改了立即生效的键；其余要重启实例。以实例的实现为准，所以由后端告诉界面 */
-  live: ConfigKey[];
-}
-
-// ---------------------------------------------------------------------------
-// 设置与主题
+// 主题
 // ---------------------------------------------------------------------------
 
 /**
@@ -238,7 +183,7 @@ export interface ThemeColors {
   warn?: string;
 }
 
-/** 主题字符串 aproxy-theme-v1:{...} 里的 JSON。除 name 外都可省略 */
+/** 主题包里 theme.json 的内容（校验见 theme.ts）。除 name 外都可省略 */
 export interface ThemeSpec {
   name: string;
   author?: string;
@@ -258,102 +203,4 @@ export interface ThemeSpec {
   /** 浅色与深色两个变体；只给一个时，另一种模式沿用内置配色 */
   light?: ThemeColors;
   dark?: ThemeColors;
-}
-
-/** 旧数据源（legacy.svelte.ts 与 mock）用的偏好形状。真实的偏好见 backend/contract.ts 的 Preferences，存在 <home>/desktop/ */
-export interface UiPrefs {
-  lang: 'system' | 'zh-CN' | 'en';
-  /** 浅色 / 深色 / 跟随系统 */
-  mode: 'system' | 'light' | 'dark';
-  palette: 'soft' | 'standard' | 'vivid';
-  mica: boolean;
-  mascot: string;
-  /** 导入的主题；null 是内置主题。存解析后的对象而不是字符串，settings.json 里可读可改 */
-  theme: ThemeSpec | null;
-}
-
-export interface AppSettings {
-  watchdog: boolean;
-  autostart: boolean;
-  ui: UiPrefs;
-}
-
-/** 多语言的一句话（发布说明这类后端给的文字）：至少有 en */
-export type LocalizedText = { en: string; [lang: string]: string };
-
-export interface UpdateInfo {
-  channel: 'stable' | 'pre';
-  current: string;
-  latest: string;
-  /** 带界面 / 无界面：升级保持原变体 */
-  variant: 'desktop' | 'headless';
-  publishedAt: number;
-  checkedAt: number;
-  notes: { kind: 'feature' | 'fix'; text: LocalizedText }[];
-}
-
-export type UpdateStage = 'download' | 'verify' | 'notify' | 'swap' | 'restart' | 'done';
-
-export interface UpdateProgress {
-  version: string;
-  stage: UpdateStage;
-  /** 当前阶段的进度 0–1 */
-  progress: number;
-  /** 逐个重启阶段：已经换到新版本的实例端口 */
-  restarted: number[];
-  /** 这次安装涉及的实例（开始时在运行的那些） */
-  targets: number[];
-  downloadedMb: number;
-  totalMb: number;
-}
-
-// ---------------------------------------------------------------------------
-// 扩展
-//
-// 扩展能读到的就是界面能看到的（界面本身不持有密钥、不经手流量，IPC 也不给明文密钥），
-// 所以读不分级。只有「写」——改变实例或配置的操作——要用户同意：扩展第一次调用某类写操作时，
-// 后端发出 consent-request，界面弹框问用户；同意后记住，用户可以在扩展详情里撤销。
-// 授权由后端保存并在执行写操作时检查，界面只负责展示和转达用户的回答。
-// ---------------------------------------------------------------------------
-
-/** 写操作的种类，也是授权的粒度 */
-export type WriteCapability = 'control' | 'config' | 'install';
-
-/** 一次写操作具体做什么：确认框与「最近的写操作」都按它出文案 */
-export type ExtensionAction =
-  | { kind: 'start' | 'stop' | 'restart'; port: number }
-  | { kind: 'write-config'; port: number; keys: string[] }
-  | { kind: 'install'; version: string };
-
-export interface ExtensionInfo {
-  id: string;
-  /** 扩展自己在清单里提供的名字与说明，至少有 en */
-  name: LocalizedText;
-  description: LocalizedText;
-  version: string;
-  author: string;
-  /** 安装位置：给用户看，方便找到文件 */
-  origin: string;
-  /**
-   * extension：在界面里运行，用和界面一样的数据接口。
-   * mascot：自定义吉祥物，只拿到状态数据、隔离渲染（隔离是为了稳定，见 lib/mascot/types.ts），
-   * 没有写操作，也不需要启用开关——在外观里选中它就是在用它。
-   */
-  kind: 'extension' | 'mascot';
-  enabled: boolean;
-  /** 清单里声明会用到的写操作；空数组就是只读 */
-  declares: WriteCapability[];
-  /** 用户已经同意过的写操作 */
-  granted: { capability: WriteCapability; at: number }[];
-  /** 最近执行过的写操作，新的在前 */
-  recent: { action: ExtensionAction; at: number }[];
-}
-
-/** 扩展第一次调用某类写操作时，后端请界面问用户 */
-export interface ConsentRequest {
-  id: string;
-  extension: string;
-  capability: WriteCapability;
-  action: ExtensionAction;
-  at: number;
 }

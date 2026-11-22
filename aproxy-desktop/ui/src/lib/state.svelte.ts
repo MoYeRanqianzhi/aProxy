@@ -10,8 +10,11 @@
 import type { Ref } from './backend/contract';
 import type { ThemeSpec } from './types';
 
-/** mascots 是原型专用的吉祥物预览页，不在导航里，只在浏览器开发模式里从审核工具条或地址栏 #/mascots 进入（见 PAGES） */
-export type Page = 'overview' | 'instance' | 'logs' | 'config' | 'update' | 'settings' | 'mascots';
+/**
+ * mascots 是原型专用的吉祥物预览页，不在导航里，只在浏览器开发模式里从审核工具条或地址栏 #/mascots 进入（见 PAGES）。
+ * ext 是扩展经 api.ui.addPage 加的页面，具体是哪一页看 ui.extPage
+ */
+export type Page = 'overview' | 'instance' | 'logs' | 'config' | 'update' | 'settings' | 'ext' | 'mascots';
 export type Lang = 'zh-CN' | 'en';
 export type LangPref = 'system' | Lang;
 /** 浅色/深色模式的偏好。「主题」另有所指：导入的一整套颜色、圆角、字体与动效（ThemeSpec） */
@@ -31,6 +34,7 @@ const PAGES: Page[] = [
   'config',
   'update',
   'settings',
+  'ext',
   ...(import.meta.env.DEV ? (['mascots'] as const) : []),
 ];
 
@@ -38,6 +42,8 @@ class UiState {
   page = $state<Page>('overview');
   /** 实例详情页与配置页当前看的实例 */
   instancePort = $state(12346);
+  /** 扩展页当前看的那一页：「扩展 id/页面 id」 */
+  extPage = $state('');
   /** 日志页打开详情的那一条；总览、实例页、命令面板也会设置它。raw：整个换掉，不深层代理 */
   selectedRef = $state.raw<Ref | null>(null);
   /** 从别处跳到日志页时预设的实例筛选 */
@@ -49,10 +55,10 @@ class UiState {
   micaEnabled = $state(false);
   /** 选中的吉祥物 id；'none' 表示不显示（见 mascot/registry） */
   mascotId = $state('tumbler');
-  /** 导入的主题，null 为内置主题。raw：整份替换，不需要深层代理 */
+  /** 选中的主题：builtin，或已装主题包的 id（偏好里的 theme） */
+  themeId = $state('builtin');
+  /** 选中的主题包解析出来的主题；null 为内置主题（没选、包不在了、theme.json 不合格）。raw：整份替换 */
   themeSpec = $state.raw<ThemeSpec | null>(null);
-  /** 导入前的预览：整个窗口临时换上它（可以切到别的页面看），应用或取消后清空 */
-  themePreview = $state.raw<ThemeSpec | null>(null);
 
   // 系统事实
   systemLang = $state<Lang>('zh-CN');
@@ -86,9 +92,9 @@ class UiState {
     return this.modePref;
   }
 
-  /** 窗口上正穿着的主题：预览优先；null 为内置主题 */
+  /** 窗口上正穿着的主题；null 为内置主题 */
   get activeTheme(): ThemeSpec | null {
-    return this.themePreview ?? this.themeSpec;
+    return this.themeSpec;
   }
 
   /** 动效强度为 0 的主题等于打开了减少动效：没有位移，只留淡入淡出 */
@@ -105,6 +111,12 @@ class UiState {
     if (port !== undefined) this.instancePort = port;
     this.page = page;
   }
+
+  /** 打开扩展加的一页（键是「扩展 id/页面 id」） */
+  goExt(key: string) {
+    this.extPage = key;
+    this.page = 'ext';
+  }
 }
 
 export const ui = new UiState();
@@ -112,18 +124,22 @@ export const ui = new UiState();
 // 启动时先按地址栏 hash 定位页面，必须早于「页面 → hash」的同步，否则会被覆盖回总览
 {
   const initial = parseHash(location.hash);
-  if (initial) ui.go(initial.page, initial.port);
+  if (initial?.ext) ui.goExt(initial.ext);
+  else if (initial) ui.go(initial.page, initial.port);
 }
 
 /** 把 hash（#/logs、#/instance/12346）与页面互相同步，方便直接打开某页审核与截图 */
-export function parseHash(hash: string): { page: Page; port?: number } | null {
+export function parseHash(hash: string): { page: Page; port?: number; ext?: string } | null {
   const parts = hash.replace(/^#\/?/, '').split('/').filter(Boolean);
   const page = parts[0] as Page | undefined;
   if (!page || !PAGES.includes(page)) return null;
+  // 扩展页：#/ext/<扩展 id>/<页面 id>。扩展加载之前这一页还不存在，页面上先显示「正在加载」
+  if (page === 'ext') return parts.length === 3 ? { page, ext: `${parts[1]}/${parts[2]}` } : null;
   const port = parts[1] ? Number(parts[1]) : undefined;
   return { page, port: Number.isFinite(port) ? port : undefined };
 }
 
-export function pageHash(page: Page, port: number): string {
+export function pageHash(page: Page, port: number, ext = ''): string {
+  if (page === 'ext') return `#/ext/${ext}`;
   return page === 'instance' || page === 'config' ? `#/${page}/${port}` : `#/${page}`;
 }

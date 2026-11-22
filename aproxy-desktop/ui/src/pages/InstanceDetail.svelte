@@ -20,6 +20,7 @@
   import FlipNumber from '../components/FlipNumber.svelte';
   import JellyBar from '../components/JellyBar.svelte';
   import Sparkline from '../components/Sparkline.svelte';
+  import ExtensionMounts from '../components/ExtensionMounts.svelte';
 
   const inst = $derived(store.card(ui.instancePort));
   const status = $derived(inst ? statusOf(inst) : null);
@@ -260,6 +261,7 @@
       {/if}
     </div>
   </header>
+  <ExtensionMounts point="instance.top" ctx={{ port: inst.port }} />
 
   {#if forwardOnly(inst)}
     <div class="callout hazard-callout">

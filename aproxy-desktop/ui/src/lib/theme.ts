@@ -1,7 +1,7 @@
 /*
- * 主题字符串：一段可以复制分享的文字，形如 aproxy-theme-v1:{"name":"抹茶",...}。
+ * 主题包里的 theme.json：名字、作者、对比度、圆角、字体、动效、标题栏高度与浅色、深色两组种子色。
  *
- * 主题只改 CSS 变量，不碰组件结构：这里把主题解析、校验后生成一张只有自定义属性声明的样式表，
+ * 主题的这一部分只改 CSS 变量，不碰组件结构（包里另有 theme.css 时，它作为普通样式表挂在后面，见 applyThemeCss）：这里把主题解析、校验后生成一张只有自定义属性声明的样式表，
  * 挂在 document 上（constructable stylesheet：经 CSSOM 写入，不是内联 <style>，不受 CSP 的内联样式限制）。
  * 变量名就是 app.css 里的令牌，所以组件与将来的扩展都不必知道主题的存在。
  *
@@ -11,12 +11,10 @@
  * 这和 Material You 的动态取色是一个思路：种子色给色调，每个角色在固定的色阶上取色。
  * 计算交给浏览器的相对颜色语法 oklch(from <种子> L C H)，所以这里不需要任何色彩空间换算。
  *
- * 字符串是外部输入（从别处粘贴来的），所以严格校验：颜色只认 #rgb、#rrggbb 与 oklch(L C H)，数字有范围，
+ * theme.json 是包作者写的，所以严格校验：颜色只认 #rgb、#rrggbb 与 oklch(L C H)，数字有范围，
  * 字体只能从界面自带的几种里选。校验通过的值才会拼进样式表，不存在注入。不认识的字段直接忽略，给以后的版本留余地。
  */
 import type { ThemeColors, ThemeSpec } from './types';
-
-export const THEME_PREFIX = 'aproxy-theme-v1:';
 
 type ColorRole = keyof ThemeColors;
 type Variant = 'light' | 'dark';
@@ -206,7 +204,7 @@ const FONT_STACKS: Record<Exclude<NonNullable<ThemeSpec['font']>, 'rounded'>, st
 };
 
 /**
- * 内置主题本身也是一份主题：「复制主题字符串」在没导入过主题时导出的就是它，拿去改几个颜色就是新主题。
+ * 内置主题本身也是一份主题：作者写自己的 theme.json 时可以从它改起。
  * 种子写成 oklch() 而不是十六进制：内置的几个颜色略超出 sRGB，换成十六进制会被截断、色相偏几度。
  */
 export const BUILTIN_THEME: ThemeSpec = {
@@ -236,43 +234,16 @@ export const BUILTIN_THEME: ThemeSpec = {
   },
 };
 
-/** 设置页「填入示例」填进去的主题：和内置主题差别够大，一眼看得出主题换了什么 */
-export const SAMPLE_THEME: ThemeSpec = {
-  name: '抹茶 Matcha',
-  author: 'aProxy',
-  radius: 0.6,
-  font: 'system',
-  motion: 0.6,
-  light: {
-    primary: '#9ccc7a',
-    text: '#2f3527',
-    surface: '#f4f1e6',
-    ok: '#4fd1b5',
-    retry: '#86b8f2',
-    error: '#f2908a',
-    warn: '#f2cd5c',
-  },
-  dark: {
-    primary: '#9ccc7a',
-    text: '#eef1e6',
-    surface: '#1b2019',
-    ok: '#4fd1b5',
-    retry: '#86b8f2',
-    error: '#f2908a',
-    warn: '#f2cd5c',
-  },
-};
-
 // ---------------------------------------------------------------------------
-// 解析与导出
+// 解析
 // ---------------------------------------------------------------------------
 
 /** 校验失败的原因，由界面翻译成一句话（i18n 键 theme.err.<key>） */
 export interface ThemeError {
-  key: 'empty' | 'prefix' | 'version' | 'json' | 'shape' | 'name' | 'color' | 'range' | 'enum';
+  key: 'shape' | 'name' | 'color' | 'range' | 'enum';
   /** 出错的字段，例如 light.primary */
   field?: string;
-  /** 补充：JSON 的报错、允许的取值、版本号 */
+  /** 补充：允许的取值 */
   detail?: string;
 }
 
@@ -300,21 +271,10 @@ function color(v: unknown): string | null {
   return `oklch(${l} ${c} ${h})`;
 }
 
-export function parseTheme(text: string): ThemeParse {
+/** 校验 theme.json（Rust 已确认它是一个 JSON 对象，字段由这里逐个查） */
+export function parseTheme(raw: unknown): ThemeParse {
   const fail = (key: ThemeError['key'], field?: string, detail?: string): ThemeParse => ({ ok: false, error: { key, field, detail } });
-  const s = text.trim();
-  if (!s) return fail('empty');
-  const m = /^aproxy-theme-v(\d+):/.exec(s);
-  if (!m) return fail('prefix');
-  if (m[1] !== '1') return fail('version', undefined, `v${m[1]}`);
-
-  let raw: unknown;
-  try {
-    raw = JSON.parse(s.slice(m[0].length));
-  } catch (e) {
-    return fail('json', undefined, (e as Error).message);
-  }
-  if (!isObject(raw)) return fail('shape', 'JSON');
+  if (!isObject(raw)) return fail('shape', 'theme.json');
 
   if (typeof raw.name !== 'string' || !raw.name.trim() || raw.name.trim().length > 40) return fail('name', 'name');
   const spec: ThemeSpec = { name: raw.name.trim() };
@@ -357,10 +317,6 @@ export function parseTheme(text: string): ThemeParse {
     spec[variant] = out;
   }
   return { ok: true, spec };
-}
-
-export function serializeTheme(spec: ThemeSpec): string {
-  return THEME_PREFIX + JSON.stringify(spec);
 }
 
 // ---------------------------------------------------------------------------
@@ -408,4 +364,22 @@ export function applyTheme(spec: ThemeSpec | null) {
     document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
   }
   sheet.replaceSync(spec ? themeCss(spec) : '');
+}
+
+let link: HTMLLinkElement | null = null;
+
+/**
+ * 挂上主题包的 theme.css（null 摘掉）。它排在界面自己的样式与主题的令牌之后，所以能覆盖它们；
+ * 包里的相对地址（url(assets/…)）相对它自己解析。没有 theme.css 的主题包请求会落空，不影响别的
+ */
+export function applyThemeCss(url: string | null) {
+  if (link?.href === url) return;
+  link?.remove();
+  link = null;
+  if (!url) return;
+  link = document.createElement('link');
+  link.rel = 'stylesheet';
+  link.href = url;
+  link.dataset.aproxyTheme = '';
+  document.head.append(link);
 }

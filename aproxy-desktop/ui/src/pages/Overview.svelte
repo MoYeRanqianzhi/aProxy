@@ -19,6 +19,7 @@
   import Icon from '../components/Icon.svelte';
   import ResultChip from '../components/ResultChip.svelte';
   import StartMenu from '../components/StartMenu.svelte';
+  import ExtensionMounts from '../components/ExtensionMounts.svelte';
 
   const mood = $derived(store.mood);
   /** 在运行的：有可信的运行记录、进程还在 */
@@ -178,6 +179,7 @@
     </button>
   </section>
 {:else}
+  <ExtensionMounts point="overview.top" />
   <section class="hero mood-{mood}" class:bare={!mascots.current}>
     {#if mood === 'retrying'}<div class="rain" aria-hidden="true"></div>{/if}
     {#if mascots.current}

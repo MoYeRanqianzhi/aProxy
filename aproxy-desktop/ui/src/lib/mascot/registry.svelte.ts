@@ -1,12 +1,11 @@
 /*
  * 吉祥物注册表：界面只通过它拿「当前选中的那一个」，不直接引用任何具体形象。
  *
- * 两种来源：
- *   - 内置的几种随界面一起编译，带着定义（def），由 MascotView 在 shadow root 里直接渲染；
- *   - 用户装的自定义吉祥物来自扩展列表（kind 为 mascot 的条目），这里只记名字和装在哪——
- *     它们是别人写的代码，只在沙箱 iframe 里运行（见 MascotFrame），界面这边从不持有、也不执行它的函数。
+ * 两种来源，都带着定义（def），由 MascotView 在 shadow root 里渲染：
+ *   - 内置的几种随界面一起编译；
+ *   - 启用的扩展经 api.ui.registerMascot 加进来的，扩展停用时随之撤掉。
  * 设置页的吉祥物列表、标题栏、总览都只看条目，不必关心它是哪来的。
- * 选择本身（含「不显示」）是用户偏好，存在 ui.mascotId。
+ * 选择本身（含「不显示」）是用户偏好，存在 ui.mascotId；选中的那个不在了，就回落到「不显示」以外的默认形象。
  */
 import { ui } from '../state.svelte';
 import type { MascotDefinition } from './types';
@@ -14,17 +13,16 @@ import { tumbler } from './tumbler';
 import { courier } from './courier';
 import { orb } from './orb';
 
-export type MascotSource = 'builtin' | 'custom';
+export type MascotSource = 'builtin' | 'extension';
 
 export interface MascotEntry {
   id: string;
   name: MascotDefinition['name'];
   description?: MascotDefinition['description'];
   source: MascotSource;
-  /** 只有内置的有：界面直接调用它渲染。自定义的没有，它的代码只在沙箱里跑 */
-  def?: MascotDefinition;
-  /** 自定义吉祥物装在哪里（显示给用户看，方便找到文件删除） */
-  origin?: string;
+  def: MascotDefinition;
+  /** 扩展加的：是哪个扩展 */
+  extension?: string;
 }
 
 /** 「不显示」在设置里是一个和吉祥物并列的选项，用一个不可能撞上的 id 表示 */
@@ -52,19 +50,18 @@ class MascotRegistry {
   }
 
   /**
-   * 换上当前装好的自定义吉祥物。清单来自扩展，是系统边界：id 撞上内置的或「不显示」的直接跳过，
-   * 免得一个自定义吉祥物顶掉内置形象。只拼内置常量与传进来的清单、不读 entries，
-   * 所以可以放在 $effect 里调用而不会自己触发自己。
+   * 扩展加一个吉祥物，返回撤掉它的函数。定义来自扩展：id 撞上内置的、「不显示」或别的扩展已经加的，
+   * 就不加（返回的函数什么也不做），免得一个扩展顶掉别人的形象；名字缺了 en 的用 id 顶上
    */
-  setCustom(list: { id: string; name: MascotEntry['name']; description?: MascotEntry['description']; origin: string }[]) {
-    const taken = new Set([NO_MASCOT, ...BUILTINS.map((e) => e.id)]);
-    const custom: MascotEntry[] = [];
-    for (const m of list) {
-      if (!m.id || taken.has(m.id)) continue;
-      taken.add(m.id);
-      custom.push({ id: m.id, name: m.name, description: m.description, source: 'custom', origin: m.origin });
-    }
-    this.entries = [...BUILTINS, ...custom];
+  addExtension(extension: string, def: MascotDefinition): () => void {
+    const id = String(def.id);
+    if (!id || id === NO_MASCOT || this.entries.some((e) => e.id === id)) return () => {};
+    const name = def.name && typeof def.name.en === 'string' ? def.name : { en: id };
+    const entry: MascotEntry = { id, name, description: def.description, source: 'extension', def, extension };
+    this.entries = [...this.entries, entry];
+    return () => {
+      this.entries = this.entries.filter((e) => e !== entry);
+    };
   }
 }
 

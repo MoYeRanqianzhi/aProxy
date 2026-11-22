@@ -34,6 +34,7 @@ import { Engine } from '../mock/engine';
 import type { SimEntry } from '../mock/fake';
 import { applyEdits, docFor, fileToken, listenPort, validate, viewOf, type Doc } from './config';
 import { bodyBytes, cardOf, detailOf, restoreToken, rowOf, RunBook, runOf, toBase64, watchdogOf } from './project';
+import { demoPackageUrl, enabledExtensions, packageHandlers } from './packages';
 
 const SESSION = 'demo';
 /** 快照里带多少条最近的请求 */
@@ -243,7 +244,10 @@ async function bringUp(inst: Instance): Promise<Run> {
 
 let watchdogEnabled = true;
 let registration: Registration = { enabled: false, issue: null };
-let preferences: Preferences = { lang: 'system', mode: 'system', palette: 'standard', mica: false, mascot: 'tumbler', theme: null };
+let preferences: Preferences = { lang: 'system', mode: 'system', palette: 'standard', mica: false, mascot: 'tumbler', theme: 'builtin' };
+/** 演示 desktop.toml 被手改出语法错误：读到的偏好为 null，写入被拒绝（审核工具条上切换） */
+let tomlBroken = false;
+const TOML_ISSUE = { kind: 'syntax', line: 7, column: 12, key: null } as const;
 /** 新置顶的在前 */
 let bookmarks: Bookmark[] = rows(engine.logs.filter((e) => e.pinned))
   .reverse()
@@ -457,9 +461,17 @@ const handlers: Handlers = {
     return later(watchdogEnabled, 150);
   },
 
-  read_desktop_state: () => later({ preferences: { ...preferences }, bookmarks: structuredClone(bookmarks), reset: [] }),
+  read_desktop_state: () =>
+    later({
+      preferences: tomlBroken ? null : { ...preferences },
+      enabledExtensions: tomlBroken ? null : enabledExtensions(),
+      bookmarks: structuredClone(bookmarks),
+      reset: [],
+      desktopToml: tomlBroken ? [{ ...TOML_ISSUE }] : [],
+    }),
 
   async set_preferences({ changes }) {
+    if (tomlBroken) throw fault('desktop_toml', { issue: { ...TOML_ISSUE } });
     preferences = { ...preferences, ...changes };
     return later({ ...preferences });
   },
@@ -504,6 +516,8 @@ const handlers: Handlers = {
   },
 
   about: () => later<About>({ version: CURRENT, variant: 'desktop', home: '~/.aproxy' }),
+
+  ...packageHandlers,
 };
 
 class DemoLink implements Link {
@@ -529,6 +543,10 @@ class DemoLink implements Link {
   session(): string | null {
     return this.attached ? SESSION : null;
   }
+
+  packageUrl(id: string, path: string): string | null {
+    return demoPackageUrl(id, path);
+  }
 }
 
 export const demoLink: Link = new DemoLink();
@@ -539,4 +557,9 @@ export const demoLink: Link = new DemoLink();
 export const demoControls = {
   setScenario: (s: Parameters<Engine['setScenario']>[0]) => engine.setScenario(s),
   celebrate: () => engine.celebrate(),
+  /** 切换「desktop.toml 有语法错误」，并像窗口重新获得焦点那样让页面重读 */
+  breakDesktopToml(on: boolean) {
+    tomlBroken = on;
+    notify({ type: 'desktop-state-changed' });
+  },
 };

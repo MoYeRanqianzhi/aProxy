@@ -34,6 +34,20 @@ export function faultText(f: Failure): string {
       return t('fault.install_foreground_instances', { ports: f.details.ports.join(', ') });
     case 'install_precheck_failed':
       return t('fault.install_precheck_failed', { port: f.details.port });
+    case 'package_read':
+      return t(`fault.package_read.${f.details.reason}`);
+    case 'package_layout':
+      return t(`fault.package_layout.${f.details.reason}`, { path: f.details.path ?? '?' });
+    case 'package_manifest':
+      return t(`fault.package_manifest.${f.details.reason}`, { field: f.details.field });
+    case 'package_kind_changed':
+      return t('fault.package_kind_changed', { kind: t(`install.kind.${f.details.installed}`) });
+    case 'extension_data':
+      return t(`fault.extension_data.${f.details.reason}`);
+    case 'desktop_toml': {
+      const i = f.details.issue;
+      return t(`fault.desktop_toml.${i.kind}`, { line: i.line ?? '?', column: i.column ?? '?' });
+    }
     default: {
       const key = `fault.${f.code}`;
       return hasMessage(key) ? t(key) : t('fault.desktop_unavailable');

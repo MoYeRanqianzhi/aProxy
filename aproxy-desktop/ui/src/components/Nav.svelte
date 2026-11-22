@@ -1,6 +1,7 @@
 <!--
   左侧导航：圆润的胶囊项，选中项是一块丁香色填充，带同色相的柔和投影。
   「实例」下面直接列出每个实例（状态点 + 端口 + 别名），一眼看到谁在线、谁在重试。
+  扩展加的页面（api.ui.addPage）排在「设置」前面，名字与图标由扩展给，认不出的图标用拼图。
   底部是看护者状态与版本号。
 -->
 <script lang="ts">
@@ -8,7 +9,9 @@
   import { ui, type Page } from '../lib/state.svelte';
   import { store } from '../lib/store.svelte';
   import { aliasOf, dotOf, forwardOnly } from '../lib/view';
-  import Icon, { type IconName } from './Icon.svelte';
+  import { host } from '../lib/extensions/host.svelte';
+  import { textOf } from '../lib/packages.svelte';
+  import Icon, { type IconName, ICON_NAMES } from './Icon.svelte';
 
   const items = [
     ['overview', 'home'],
@@ -62,6 +65,16 @@
     </li>
 
     {#each items.slice(1) as [page, icon] (page)}
+      {#if page === 'settings'}
+        {#each host.pages as p (p.key)}
+          <li>
+            <button class="item" aria-current={ui.page === 'ext' && ui.extPage === p.key ? 'page' : undefined} onclick={() => ui.goExt(p.key)}>
+              <Icon name={ICON_NAMES.has(p.spec.icon ?? '') ? (p.spec.icon as IconName) : 'puzzle'} size={18} />
+              <span class="label">{textOf(p.spec.title, p.spec.id)}</span>
+            </button>
+          </li>
+        {/each}
+      {/if}
       <li>
         <button class="item" aria-current={ui.page === page ? 'page' : undefined} onclick={() => ui.go(page)}>
           <Icon name={icon} size={18} />

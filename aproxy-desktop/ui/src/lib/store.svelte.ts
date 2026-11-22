@@ -37,13 +37,14 @@ import type {
   SettingsView,
   StartTarget,
   Token,
+  TomlIssue,
   UpdateInfo,
   Watchdog,
 } from './backend/contract';
 import { toFailure, type Failure } from './backend/link';
 import type { MascotMood } from './mascot/types';
+import { packages } from './packages.svelte';
 import { ui, type LangPref } from './state.svelte';
-import { parseTheme, serializeTheme } from './theme';
 
 /** 救回后庆祝多久：够吉祥物跳一下、撒完星星，又不至于盖住接下来的真实状态 */
 const RESCUE_CELEBRATION_MS = 3_200;
@@ -73,13 +74,6 @@ function langOf(lang: string): LangPref {
   return lang === 'zh-CN' || lang === 'en' ? lang : 'system';
 }
 
-/** 主题字符串整理成本界面会写出的那种写法：比较「改没改」时不被空格、键的顺序这类差别骗到 */
-function normalTheme(text: string | null): string | null {
-  if (!text) return null;
-  const parsed = parseTheme(text);
-  return parsed.ok ? serializeTheme(parsed.spec) : null;
-}
-
 class Store {
   /** 数据是不是演示用的假数据：标题栏据此常驻标明 */
   readonly demo = link.demo;
@@ -107,6 +101,10 @@ class Store {
   offer = $state.raw<UpdateInfo | null>(null);
   /** 最近一次读界面状态时因为损坏被重置成默认的文件：设置页要告诉用户 */
   reset = $state.raw<DesktopState['reset']>([]);
+  /** desktop.toml 里的问题（语法错时页面沿用手上的偏好，写入被拒绝）：设置页要告诉用户错在哪一行 */
+  tomlIssues = $state.raw<TomlIssue[]>([]);
+  /** 读成一次界面状态加一：扩展的 settings.onChange 据此去比一比自己那张表变没变 */
+  desktopReads = $state(0);
 
   /** resync 一次加一：分页的游标、详情的选择看到它变了就作废 */
   epoch = $state(0);
@@ -201,6 +199,7 @@ class Store {
             () => link.call('about', {}),
             (a) => (this.about = a),
           ),
+          packages.refresh(),
         ]);
         this.connected = true;
         break;
@@ -279,33 +278,45 @@ class Store {
       (s) => {
         this.bookmarks = s.bookmarks;
         this.reset = s.reset;
-        // 自己的偏好写到一半时读到的是写之前的样子，套上去会把用户刚改的值闪回去；等写完再说
-        if (this.writingPrefs === 0) this.applyPreferences(s.preferences);
+        this.tomlIssues = s.desktopToml;
+        this.desktopReads++;
+        packages.setEnabledOrder(s.enabledExtensions);
+        // 自己的偏好写到一半时读到的是写之前的样子，套上去会把用户刚改的值闪回去；等写完再说。
+        // desktop.toml 这次没读成（null）时保留手上的偏好：用户改到一半的文件不该把窗口打回默认
+        if (this.writingPrefs === 0 && s.preferences) this.applyPreferences(s.preferences);
       },
     );
   }
 
+  /**
+   * 窗口重新获得焦点：desktop.toml 可能刚被手改过，extensions/ 下可能多了手工拷进来的包。
+   * 偏好与包的列表都重读一遍（不读实例与请求，那些有事件通知）
+   */
+  async refreshOnFocus(): Promise<void> {
+    if (!this.connected) return;
+    await Promise.all([this.readDesktopState(), packages.refresh()]);
+  }
+
   // -------------------------------------------------------------------------
-  // 界面偏好：存在 Rust 那边（<home>/desktop/），界面里的副本在 ui（state.svelte.ts）上
+  // 界面偏好：存在 Rust 那边（<home>/desktop/desktop.toml），界面里的副本在 ui（state.svelte.ts）上
   // -------------------------------------------------------------------------
 
-  /** 最近一次从 Rust 读到或写成的偏好；主题已整理成本界面的写法。读到之前为 null，这时不往回写 */
+  /** 最近一次从 Rust 读到或写成的偏好。读到之前为 null，这时不往回写 */
   private prefs: Preferences | null = null;
   private writingPrefs = 0;
 
   private applyPreferences(p: Preferences) {
-    this.prefs = { ...p, theme: normalTheme(p.theme) };
+    this.prefs = { ...p };
     ui.langPref = langOf(p.lang);
     ui.modePref = p.mode;
     ui.palette = p.palette;
     ui.micaEnabled = p.mica;
-    // 认不出的吉祥物由吉祥物注册表回落到默认的那个
+    // 认不出的吉祥物由吉祥物注册表回落到默认的那个；不在了的主题包由 packages 回落到内置主题
     ui.mascotId = p.mascot;
-    const theme = p.theme ? parseTheme(p.theme) : null;
-    ui.themeSpec = theme?.ok ? theme.spec : null;
+    ui.themeId = p.theme;
   }
 
-  /** 用户在界面上改了偏好就写回去，只写改了的那几项。预览中的主题（ui.themePreview）不落盘 */
+  /** 用户在界面上改了偏好就写回去，只写改了的那几项 */
   private persistPreferences() {
     $effect.root(() => {
       $effect(() => {
@@ -315,7 +326,7 @@ class Store {
           palette: ui.palette,
           mica: ui.micaEnabled,
           mascot: ui.mascotId,
-          theme: ui.themeSpec ? serializeTheme(ui.themeSpec) : null,
+          theme: ui.themeId,
         };
         const saved = this.prefs;
         if (!saved) return;

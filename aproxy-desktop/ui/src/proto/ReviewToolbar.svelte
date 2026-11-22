@@ -8,8 +8,9 @@
   import { store } from '../lib/store.svelte';
   import { overlays } from '../lib/overlays.svelte';
   import { demoControls } from '../lib/backend/demo';
-  // 扩展的写操作还走旧的模拟后端（扩展还没接上桌面契约）；场景与庆祝已经交给新的演示后端
-  import { mockControls } from '../lib/backend/mock';
+  import { INSTALL_SCENARIOS } from '../lib/backend/demo/packages';
+  import { packages } from '../lib/packages.svelte';
+  import { host } from '../lib/extensions/host.svelte';
   import { t } from '../lib/i18n';
   import type { Scenario } from '../lib/state.svelte';
 
@@ -28,12 +29,19 @@
   // 开发期给审核与截图脚本用的句柄，生产构建里不存在。
   // 放在这里而不是 App：只有 proto/ 下的原型件可以直接碰演示后端的控制句柄，应用本身只认契约（Link）
   if (import.meta.env.DEV) {
-    (window as unknown as Record<string, unknown>).__aproxyProto = { ui, store, overlays, demo: demoControls, mock: mockControls };
+    (window as unknown as Record<string, unknown>).__aproxyProto = { ui, store, overlays, packages, host, demo: demoControls };
   }
 
   // 场景只存在于演示后端里：它是审核用的开关，不属于契约
   function setScenario(s: Scenario) {
     demoControls.setScenario(s);
+  }
+
+  // 模拟安装：演示后端按文件名里的关键词挑场景，这里造一个只有名字的空文件走一遍真实的安装流程
+  let installKind = $state<(typeof INSTALL_SCENARIOS)[number]>('clean');
+  let tomlBroken = $state(false);
+  function simulateInstall() {
+    void packages.beginFile(new File([], `${installKind}.zip`));
   }
 </script>
 
@@ -103,12 +111,23 @@
 
         <!-- 模拟流量里「长时间重试后救回」要等一阵才碰得上，审核时直接触发一次看总览的庆祝 -->
         <button class="hide" onclick={() => demoControls.celebrate()}>{t('proto.celebrate')}</button>
-        <!-- 扩展第一次做写操作时的确认框：让「配置同步」先请求改配置、再请求重启 -->
+        <!-- 安装主题包或扩展包时的逐条提醒：挑一个场景（干净的、闭源的、对不上的、连不上的……）走一遍 -->
+        <div class="row">
+          <span class="title">{t('proto.install')}</span>
+          <div class="opts">
+            <select bind:value={installKind} aria-label={t('proto.install')}>
+              {#each INSTALL_SCENARIOS as k (k)}<option value={k}>{k}</option>{/each}
+            </select>
+            <button onclick={simulateInstall}>{t('proto.installGo')}</button>
+          </div>
+        </div>
+        <!-- desktop.toml 被手改出语法错误：设置页顶上应该说清哪一行，界面沿用原来的设置 -->
         <button
           class="hide"
           onclick={() => {
-            if (mockControls.extensionWrite() === 'all-granted') overlays.toast(t('proto.extAllGranted'), 'lilac');
-          }}>{t('proto.extWrite')}</button
+            tomlBroken = !tomlBroken;
+            demoControls.breakDesktopToml(tomlBroken);
+          }}>{t(tomlBroken ? 'proto.tomlFix' : 'proto.tomlBreak')}</button
         >
         <button class="hide" onclick={() => (ui.toolbarHidden = true)}>{t('proto.hide')}</button>
       </div>
@@ -199,6 +218,14 @@
   }
   .opts button:hover {
     border-color: #5d6b85;
+  }
+  .opts select {
+    padding: 3px 6px;
+    border: 1px solid #3c475c;
+    border-radius: 4px;
+    background: #2b3446;
+    color: #d8deea;
+    font: inherit;
   }
   .opts button.on {
     background: #f5c542;

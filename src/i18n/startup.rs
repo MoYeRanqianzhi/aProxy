@@ -329,7 +329,8 @@ mod tests {
                 lines: vec!["different record".into()],
             },
         };
-        assert!(serde_json::to_value(err.evidence()).unwrap()["report"].is_null());
+        let saved = serde_json::to_value(err.evidence()).unwrap();
+        assert!(saved.get("report").is_none(), "{saved}");
     }
 
     #[test]

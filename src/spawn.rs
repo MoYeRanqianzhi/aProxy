@@ -94,6 +94,7 @@ impl SpawnSummary {
 pub struct FailedLaunch {
     summary: SpawnSummary,
     log: Option<StartupLog>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     report: Option<Box<startup::LaunchReport>>,
 }
 impl FailedLaunch {

@@ -93,6 +93,10 @@
     - 范围：语言判定、消息机制、`--help` 的本地化、经 IPC 与 HTTP 传出的错误改为码加参数；测试统一 `APROXY_LANG=en`。
     - 依据：[release-0.2.0](release-0.2.0.md) 的 W3 一节。消息机制（内联宏还是目录文件）开工前由主代理定。
     - 分工：Codex 做机制与迁移，中文与英文的文案由主代理写；Codex 只搬运、不翻译。
+    - 2026-11-23 主代理审了 Codex 起草的 156 条中文（清单在私有的 `t11-i18n.strings.md`，按回执里各段列出的标识符找），
+      质量可用，只改了 4 条用词（forward 诊断的「投递方式」、TooLarge、ipc 的 run_changed、stop 的 generation）。英文草稿只抽看了
+      diagnostic、ipc、help、format_fault 几个模块，没发现要改的；其余约 700 条英文还没逐条过，排在 W5d 的文字通读里。
+      注意 `src/i18n/data.rs` 的英文会写进 HTTP、SSE 与快照，清点时按整句比对还原，改它会让旧记录还原不出中文，不要随手改。
     - 连带：doctor 给人看的诊断现在直接显示登记表里的英文摘要（第四段的审查指出，新加的两条 forward 提示也是）；
       随这一项改成按语言显示，`--json` 里的英文不动。
 12. **tag beta.1**。

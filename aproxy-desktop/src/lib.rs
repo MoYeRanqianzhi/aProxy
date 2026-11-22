@@ -15,7 +15,7 @@
 //!   空的 msvcrt.lib，经 `rustc-link-search` 传给依赖者，配套的 `/NODEFAULTLIB` 却只作用于本包，
 //!   依赖本包的 aproxy.exe 在 MSVC 上链接失败（tauri#16238）。aproxy 一直用动态 CRT，关掉与之一致。
 //! - `app.windows` 为空：主窗口由 [`run`] 用 `WebviewWindowBuilder` 建，才能指定 webview 的数据
-//!   目录、限制导航、单独放宽吉祥物沙箱页的 CSP。
+//!   目录、限制导航并拒绝新窗口与下载。
 //! - 包自带的脚本和样式从 aproxy-pkg 加载；扩展也可以加载 HTTPS 资源。只关闭 Tauri
 //!   对 style-src 的补写：加入 nonce/hash 会让浏览器忽略 unsafe-inline，打断动态样式。
 //! - `withGlobalTauri: false`：页面用打包进来的 @tauri-apps/api，不需要 Tauri 往页面里另注入
@@ -38,8 +38,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
-use tauri::http::HeaderValue;
-use tauri::utils::config::{Csp, CspDirectiveSources};
 use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 // Windows 自定义标题栏：tauri-custom-titlebar skill 的 assets/windows_titlebar.rs 原样复制，
@@ -71,10 +69,6 @@ const MIN_SIZE: (f64, f64) = (900.0, 600.0);
 /// 闪一下白底（WebView2 挂上之前窗口是白的）。页面出了错（脚本异常、CSP 拦截、权限不对）
 /// 就永远不会调用它，所以超过这个时限还没显示时由这里兜底显示。
 const SHOW_FALLBACK: Duration = Duration::from_secs(3);
-
-/// 自定义吉祥物的沙箱页。它要把吉祥物源码转成 blob: URL 再 `import()`，所以只给这一页的
-/// CSP 加上 `script-src blob:`；主界面的 CSP 不放行 blob 脚本。
-const MASCOT_SANDBOX: &str = "/mascot-sandbox.html";
 
 /// 无需运行窗口的本地包请求处理器；由注册协议的后台任务调用。
 pub type PackageResource =
@@ -322,12 +316,7 @@ fn open_main_window(app: &tauri::App, data_dir: PathBuf) -> Result<(), Error> {
         // 界面只显示嵌入的页面：外部网址（扩展或页面里的链接试图把窗口带走）一律不导航
         .on_navigation(is_app_url)
         .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
-        .on_download(|_, _| false)
-        .on_web_resource_request(|request, response| {
-            if request.uri().path() == MASCOT_SANDBOX {
-                allow_blob_scripts(response);
-            }
-        });
+        .on_download(|_, _| false);
     // Mica 要窗口透明、页面在需要透出的地方不画底色（tauri-windows-mica skill）。Mica 只有
     // Windows 有，别的平台不开透明，免得某些 Linux 合成器把窗口画成透明或黑底。
     #[cfg(windows)]
@@ -401,25 +390,6 @@ fn is_app_url(url: &tauri::Url) -> bool {
         ("tauri", "localhost")
     };
     url.scheme() == scheme && url.host_str() == Some(host) && url.port().is_none()
-}
-
-/// 给一个 HTML 响应的 CSP 加上 `script-src blob:`（只用于吉祥物沙箱页）。Tauri 已经按
-/// tauri.conf.json 的 CSP 加上了这一页自己的哈希与 nonce，这里在它的基础上追加。
-fn allow_blob_scripts(response: &mut tauri::http::Response<std::borrow::Cow<'static, [u8]>>) {
-    let Some(header) = response.headers_mut().get_mut("Content-Security-Policy") else {
-        return;
-    };
-    let Ok(policy) = header.to_str() else {
-        return;
-    };
-    let mut csp: std::collections::HashMap<String, CspDirectiveSources> =
-        Csp::Policy(policy.to_string()).into();
-    csp.entry("script-src".to_string())
-        .or_default()
-        .push("blob:");
-    if let Ok(value) = HeaderValue::from_str(&Csp::DirectiveMap(csp).to_string()) {
-        *header = value;
-    }
 }
 
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {

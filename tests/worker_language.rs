@@ -63,14 +63,14 @@ async fn observe(
             .unwrap(),
     );
     let run = h.path().join("run");
-    // 控制端点在启动期间就能回复 ping；只在两次运行都已开始服务后比较原始状态文档。
+    // 先定位本次进程并确认控制端点可用；服务阶段由下面实际参与比较的状态文档确认。
     let info = loop {
         if let Some(rec) = aproxy_ipc::registry::registry_instances_in(&run)
             .into_iter()
             .find(|r| r.pid == child.0.id())
             && aproxy::daemon::ipc_ping_in(&run, aproxy::daemon::port_of(&rec.listen_addr))
                 .await
-                .is_ok_and(|live| live.state == aproxy::daemon::InstanceState::Serving)
+                .is_ok_and(|live| live.instance.instance_id == rec.instance_id)
         {
             break rec;
         }
@@ -88,9 +88,21 @@ async fn observe(
         assert!(out.status.success());
         out.stdout
     };
-    let stdout = get_status("en");
+    // 两次清点之间可能刚好发布 serving。只等待已知的 starting，不删除 state，
+    // 也不丢弃任何活动字段：此时还没有给这个工作进程发送过 HTTP 请求。
+    let (stdout, mut doc) = loop {
+        let raw = get_status("en");
+        let doc: Value = serde_json::from_slice(&raw).unwrap();
+        let status = &doc["instances"][0]["status"];
+        if status["state"] == "starting" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            continue;
+        }
+        assert_eq!(status["state"], "serving");
+        assert_eq!(status["activity"]["requests_total"], 0);
+        break (raw, doc);
+    };
     assert_eq!(stdout, get_status("zh-CN"));
-    let mut doc: Value = serde_json::from_slice(&stdout).unwrap();
     assert_eq!(doc["instances"].as_array().unwrap().len(), 1);
     let one = &mut doc["instances"][0];
     assert_eq!(one["liveness"], "live");

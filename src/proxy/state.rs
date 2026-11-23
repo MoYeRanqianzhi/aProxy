@@ -21,7 +21,7 @@ pub struct AppState {
     /// 启动时编译一次随 AppState 共享，请求热路径只做 is_match。
     pub retry_rules: Arc<Vec<CompiledRetryRule>>,
     /// 配置顺序就是请求方向的调用顺序。同一条目的所有阶段共用一组会话。
-    pub(crate) formats: Arc<[Arc<crate::transform::Pool>]>,
+    pub(crate) formats: crate::transform::Formats,
     /// 入站来源校验策略（源 `config.allowed_hosts` / `allowed_origins` 与监听
     /// 地址）：启动时归一一次，热路径只做小集合比较。
     pub(super) inbound: Arc<InboundPolicy>,
@@ -161,7 +161,7 @@ impl AppState {
             instance_id.clone(),
         );
         let mut stats = crate::daemon::IpcStats::sharing(last_activity_ms.clone(), history.clone());
-        let formats: Arc<[Arc<crate::transform::Pool>]> = config
+        let formats: crate::transform::Formats = config
             .formats
             .iter()
             .enumerate()
@@ -174,8 +174,9 @@ impl AppState {
                     [config.body_limit_bytes(), spool_limit_bytes(&config)],
                 )
             })
-            .collect();
-        stats.formats = formats.iter().map(Arc::downgrade).collect();
+            .collect::<Vec<_>>()
+            .into();
+        stats.formats = formats.0.iter().map(Arc::downgrade).collect();
         Self {
             instance_id,
             history,
@@ -193,7 +194,10 @@ impl AppState {
 
     /// 控制端点就绪后并行协商。按配置顺序报告错误，不让子进程调度影响启动诊断。
     pub async fn handshake_formats(&self) -> Result<(), crate::transform::StartupError> {
-        let results = futures_util::future::join_all(self.formats.iter().map(|p| p.probe())).await;
+        let results = futures_util::future::join_all(
+            self.formats.iter().map(|p| async move { p.probe().await }),
+        )
+        .await;
         for (pool, result) in self.formats.iter().zip(results) {
             if let Err(fault) = result {
                 let name = self.history.secrets().replace(&pool.entry.name);
@@ -249,8 +253,8 @@ impl AppState {
 
     /// 停机开始先并行退役空闲进程；在途请求仍可使用其余会话。
     pub fn drain_idle_formats(&self) {
-        for pool in self.formats.iter() {
-            pool.begin_drain();
+        for slot in self.formats.0.iter() {
+            slot.begin_drain();
         }
     }
     /// 已达到排空截止点，立即结束剩余进程。等操作系统确认退出的时间由实例共用，而非每层一秒。
@@ -260,14 +264,21 @@ impl AppState {
         }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         futures_util::future::join_all(
-            self.formats.iter().map(|p| p.confirm_exits_until(deadline)),
+            self.formats
+                .iter()
+                .map(|p| async move { p.confirm_exits_until(deadline).await }),
         )
         .await;
     }
 
     /// 所有程序同时收到 EOF，正常关闭的宽限不随链长或池大小累加。
     pub async fn retire_formats(&self) {
-        futures_util::future::join_all(self.formats.iter().map(|p| p.shutdown())).await;
+        futures_util::future::join_all(
+            self.formats
+                .iter()
+                .map(|p| async move { p.shutdown().await }),
+        )
+        .await;
     }
 
     /// 只查看配置，不触碰进程和状态；没有相应阶段就走原来的转发路径。

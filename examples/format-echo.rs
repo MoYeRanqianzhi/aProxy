@@ -220,7 +220,9 @@ fn main() {
                 println!("not JSON");
                 return;
             }
-            if mode == "malformed-hello" {
+            if mode == "malformed-hello"
+                || (mode == "role-version" && !std::path::Path::new(arg).is_file())
+            {
                 println!("not JSON");
                 continue;
             }
@@ -235,6 +237,9 @@ fn main() {
                 std::thread::sleep(delay);
             }
             r = json!({"v":1,"seq":0,"name":"format-echo","version":"1.0","protocol":1,"features":[],"stages":["request","retry","decide","response","heartbeat","stream","notify"]});
+            if mode == "role-version" {
+                r["version"] = json!(std::fs::read_to_string(arg).unwrap());
+            }
             if std::env::var_os("ECHO_DECIDE_SUCCESS").is_some() {
                 r["features"] = json!(["decide.success"]);
             }

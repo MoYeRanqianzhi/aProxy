@@ -31,7 +31,7 @@ struct DeliveryEnd {
     /// 响应已经完整交给了客户端
     delivered: bool,
     /// 仅在请求进入配置的格式链之后才登记，丢弃响应也能发出最终结果。
-    notify: Option<(Arc<[Arc<crate::transform::Pool>]>, ExchangeCtx)>,
+    notify: Option<(crate::transform::Formats, ExchangeCtx)>,
     /// 客户端实际收到 SSE 或流程序的输出。
     streamed: bool,
 }

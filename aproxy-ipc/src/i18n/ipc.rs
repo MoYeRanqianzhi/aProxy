@@ -58,6 +58,7 @@ crate::message!(invalid(arg: &str), en: "arg {arg} has the wrong type or value",
 
 crate::message!(unsupported_version(version: &str, supported: &str), en: "unsupported protocol version {version}; this instance supports {supported}", zh: "不支持协议版本 {version}；此实例支持 {supported}");
 
+crate::message!(unknown_format(name: &str), en: "no configured format named {name}", zh: "没有名为 {name} 的 format 条目");
 crate::message!(unknown_op(op: &str), en: "unknown op: {op}", zh: "未知操作：{op}");
 
 crate::message!(unknown_arg(args: &str), en: "unknown arg: {args}", zh: "未知参数：{args}");
@@ -100,6 +101,7 @@ pub(crate) fn fields(code: &str, d: &serde_json::Value) -> Option<&'static [&'st
                         | "attempt"
                         | "keep_restore"
                         | "if_idle_secs"
+                        | "names"
                         | "ttl_secs"
                 ) =>
             {
@@ -118,6 +120,13 @@ pub(crate) fn fields(code: &str, d: &serde_json::Value) -> Option<&'static [&'st
             }) =>
         {
             &["supported"]
+        }
+        "unknown_format"
+            if d["name"]
+                .as_str()
+                .is_some_and(|s| s.len() <= 64 && !s.chars().any(char::is_control)) =>
+        {
+            &["name"]
         }
         UNKNOWN_OP if token(&d["op"]).is_some() => &["op"],
         UNSUPPORTED_ARG
@@ -175,6 +184,7 @@ pub(crate) fn remote(lang: Lang, code: &str, details: &serde_json::Value) -> Opt
             }
             unsupported_version(lang, &IPC_VERSION.to_string(), &supported.join(", "))
         }
+        "unknown_format" => unknown_format(lang, details["name"].as_str()?),
         error_code::UNKNOWN_OP => unknown_op(lang, details["op"].as_str()?),
         error_code::UNSUPPORTED_ARG => unknown_arg(
             lang,

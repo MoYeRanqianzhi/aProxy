@@ -55,6 +55,7 @@ The `code` of the error object an instance returns on its control endpoint.
 | `internal` | A defect in aproxy itself. | — |
 | `bad_request` | Not JSON, missing v or op, line too long, or an argument of the wrong type or value. | `reason` (string), `arg`? (string) |
 | `unsupported_version` | The protocol version v is not supported. | `supported` (integer list) |
+| `unknown_format` | No configured format has this name. Nothing was restarted. | `name` (string) |
 | `unknown_op` | There is no such op. Nothing was done. | `op` (string) |
 | `unsupported_arg` | The request carries arguments this instance does not know. | `args` (string list) |
 | `invalid_state` | Not allowed in the instance's current state. | `state` (string) |
@@ -80,6 +81,7 @@ Why an operation started from the command line or the desktop window failed. Wit
 | `port_in_use` | 1 | The port is taken. | `port` (integer), `owner` (string) |
 | `start_failed` | the child's code, else 1 | The daemon could not start. | `code`? (integer), `startup_log` (string list) |
 | `ready_timeout` | 1 | The instance did not reach serving within the time limit. | `timeout_ms` (milliseconds) |
+| `format_restart_failed` | 1 | The format restart operation was not completed. | `port` (integer), `reason` (string) |
 | `restart_unsupported` | 1 | The target has no desired-state record (a foreground instance). | `port` (integer) |
 | `instance_unresponsive` | 1 | The instance's process is there but it does not answer. | `port` (integer), `pid` (integer) |
 | `instance_incompatible` | 1 | The instance answered, but its protocol is incompatible or its identity does not match. | `port` (integer), `reason` (string) |

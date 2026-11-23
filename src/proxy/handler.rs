@@ -103,7 +103,7 @@ async fn handle(
     use crate::config::file::Stage;
     use axum::body::HttpBody as _;
     let forward = state.config.forward_only_enabled();
-    let formatted = !state.formats.is_empty();
+    let formatted = !state.formats.0.is_empty();
     let trigger = state.config.keepalive_trigger();
     // 不含 format 的直通请求沿用转发头取历史摘要；程序眼中的客户端元数据则始终来自入站头。
     let source = if forward && !formatted {

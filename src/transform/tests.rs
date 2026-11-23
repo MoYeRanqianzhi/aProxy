@@ -1031,3 +1031,55 @@ async fn cancelled_written_open_drains_then_aborts_on_the_same_worker() {
     assert_eq!(abort["reason"]["code"], "client_gone");
     assert_eq!(p.snapshot().1["breaker"]["failures"], 0);
 }
+
+/// 老代请求和流在重启期间保持原 PID；同时新池能在旧的唯一名额未归还时完成往返。
+#[tokio::test]
+async fn restarting_preserves_busy_request_and_stream() {
+    let d = tempfile::tempdir().unwrap();
+    let gate = d.path().join("release");
+    let events = d.path().join("events");
+    let old = pool(Process::Persistent, "gate-request", |e| {
+        e.pool_max = 1;
+        e.timeout_secs = 0;
+        e.args.push(gate.display().to_string());
+        e.env
+            .insert("ECHO_OBSERVE".into(), events.display().to_string());
+    });
+    let slot = FormatSlot::new(old.clone());
+    let (mut stream, (open, _)) = old
+        .open_stream(stream_frame("live", true), false, None)
+        .await
+        .unwrap();
+    let mut request = std::pin::pin!(call(&old, "blocked", false));
+    tokio::select! {_=&mut request=>panic!("early return"),_=wait_observed(&events,"request",1)=>{}}
+    assert!(matches!(
+        slot.restart().await,
+        aproxy_ipc::wire::RestartOutcome::Restarted { .. }
+    ));
+    let current = slot.current();
+    let new = worker(call(&current, "after", false).await.unwrap(), "after");
+    std::fs::write(gate, b"release").unwrap();
+    let busy = worker(request.await.unwrap(), "blocked");
+    let end = stream.event(stream_frame("live", false)).await.unwrap().0;
+    assert_eq!(end.state, open.state);
+    stream.finish();
+    assert_ne!(
+        new.split_once('/').unwrap().1,
+        busy.split_once('/').unwrap().1
+    );
+    let observed = wait_observed(&events, "stream", 2).await;
+    assert_eq!(observed[0]["pid"], observed[1]["pid"]);
+    assert_ne!(
+        observed[0]["pid"].to_string(),
+        new.split_once('/').unwrap().1
+    );
+    wait_observed(&events, "eof", 2).await;
+    current.open_at_startup(Fault::Spawn);
+    assert_eq!(slot.snapshot().1["breaker"]["state"], "open");
+    slot.restart().await;
+    assert_eq!(
+        slot.snapshot().1["breaker"],
+        serde_json::json!({"state":"closed","failures":0})
+    );
+    slot.current().shutdown().await;
+}

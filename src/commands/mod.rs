@@ -453,7 +453,7 @@ mod tests {
     async fn lifecycle_results_return_to_the_runtime_owner() {
         assert_eq!(stop::handle_stop_cmd(None, Some(1), false, false).await, 2);
         assert_eq!(
-            restart::handle_restart_cmd(None, Some(1), false, false).await,
+            restart::handle_restart_cmd(None, Some(1), false, Vec::new(), false).await,
             2
         );
         assert_eq!(Results::new(None).finish(false), 0);

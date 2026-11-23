@@ -475,6 +475,12 @@ pub const TABLE: &[Code] = &[
         &[req("supported", T::IntegerList)],
     ),
     plain(
+        "unknown_format",
+        IPC,
+        "No configured format has this name. Nothing was restarted.",
+        &[req("name", T::String)],
+    ),
+    plain(
         "unknown_op",
         IPC,
         "There is no such op. Nothing was done.",
@@ -591,6 +597,13 @@ pub const TABLE: &[Code] = &[
         Exit(EXIT_FAILED),
         "The instance did not reach serving within the time limit.",
         &[req("timeout_ms", T::Millis)],
+    ),
+    exiting(
+        "format_restart_failed",
+        OPERATION,
+        Exit(EXIT_FAILED),
+        "The format restart operation was not completed.",
+        &[req("port", T::Integer), req("reason", T::String)],
     ),
     exiting(
         "restart_unsupported",

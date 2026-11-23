@@ -828,3 +828,53 @@ fn stop_and_restart_render_their_own_terminal_notices() {
     assert_eq!(en.stdout, zh.stdout);
     assert_eq!(document(&zh)["error"]["code"], "target_not_running");
 }
+
+/// format-only 命令与实例重启共享汇总外壳，但逐条目计数；改坏一个角色文件不影响其余条目。
+#[test]
+fn restart_formats_json_document() {
+    let home = TestHome::new();
+    let port = free_port();
+    let addr = port.to_string();
+    let cfg = home.path().join("formats.toml");
+    let role = home.path().join("version");
+    fs::write(&role, "2").unwrap();
+    fs::write(&cfg,format!("base_url='http://127.0.0.1'\nlisten_addr='127.0.0.1:{port}'\n[[format]]\nname='a'\ncommand={0}\nstages=['request']\n[[format]]\nname='b'\ncommand={0}\nargs=['role-version',{1}]\nstages=['request']",json!(common::format_echo_path()),json!(role))).unwrap();
+    home.stop_on_drop(port);
+    run(&home, &["start", cfg.to_str().unwrap()]);
+    let args = ["restart", &addr, "--format", "b", "--json"];
+    let one = run(&home, &args);
+    let item = json!({"target":addr,"port":port,"name":"b","outcome":"restarted","program":"format-echo","version":"2","configReloaded":false});
+    assert_eq!(
+        document(&one),
+        json!({"schema":1,"results":[item],"summary":{"ok":1,"failed":0}})
+    );
+    let text = String::from_utf8_lossy(&one.stderr);
+    assert!(text.contains(&format!("Port {port}: restarted format b (format-echo 2).")));
+    assert!(text.contains("config.toml was not reloaded"));
+    fs::remove_file(role).unwrap();
+    let (doc, text) = failed_document(&home, &["restart", &addr, "--format", "all", "--json"], 5);
+    assert_eq!(doc["summary"], json!({"ok":1,"failed":1}));
+    assert_eq!(
+        doc["results"][1],
+        json!({"target":addr,"port":port,"name":"b","outcome":"handshake-failed","reason":"invalid_output","configReloaded":false})
+    );
+    assert!(text.contains("format b handshake failed: invalid_output"));
+    let (doc, text) = failed_document(
+        &home,
+        &["restart", &addr, "--format", "missing", "--json"],
+        1,
+    );
+    assert_eq!(
+        doc["results"][0]["error"]["details"]["reason"],
+        "unknown_format"
+    );
+    assert!(text.contains("no configured format named missing"));
+    let (doc, _) = failed_document(
+        &home,
+        &[
+            "restart", &addr, "--format", "all", "--format", "a", "--json",
+        ],
+        2,
+    );
+    assert_eq!(doc["error"]["code"], "usage");
+}

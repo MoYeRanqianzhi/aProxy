@@ -59,6 +59,8 @@ async fn worker_pipe(
     Ok((server, Stdio::from(client)))
 }
 
+mod generation;
+pub(crate) use generation::{FormatSlot, Formats};
 mod notify;
 /// 能逐请求改变的键在握手时逐项公布；未协商的键不会成为隐式配置入口。
 const OVERRIDES: [&str; 8] = [
@@ -491,6 +493,10 @@ impl Cooldown {
 struct Circuit {
     /// 每次状态变化单独编号；订阅的初始快照可能已包含队列中的前几项。
     revision: u64,
+    /// 已切走的代仍处理在途消息，但不能覆盖本条目发布的状态。
+    superseded: bool,
+    /// 本代由显式重启产生的时刻；初次启动没有此字段值。
+    restarted_at: Option<u64>,
     /// 当前冷却代；活跃消息在派发时记下它。
     epoch: u64,
     /// 进程级连续失败次数，合法 fail 回信也清零。
@@ -589,7 +595,7 @@ pub(crate) struct Pool {
     /// 同一池只探测一次；同时询问的调用方共享第一次握手的结果。
     startup: tokio::sync::OnceCell<Result<(), Fault>>,
     /// 因空闲正常退役的进程在后台限时等待 EOF；实例关闭时一起等完。
-    retiring: Mutex<tokio::task::JoinSet<()>>,
+    retiring: Arc<Mutex<tokio::task::JoinSet<()>>>,
     /// 首次 poll_write 与打开熔断器在同一锁内排序；从不持锁跨越 await。
     circuit: Mutex<Circuit>,
     /// 只有声明 notify 的程序才分配观察队列与独立的故障计数。
@@ -615,6 +621,17 @@ impl Pool {
         events: Option<(usize, std::sync::Weak<crate::history::History>)>,
         body_limits: [usize; 2],
     ) -> Arc<Self> {
+        let limits = body_limits.map(|n| n.saturating_mul(2).saturating_add(FRAME_OVERHEAD));
+        Self::with_limits(entry, home, secrets, events, limits)
+    }
+    /// 重启沿用已解析的帧上限；不重新读取实例配置。
+    fn with_limits(
+        entry: FormatEntry,
+        home: PathBuf,
+        secrets: Secrets,
+        events: Option<(usize, std::sync::Weak<crate::history::History>)>,
+        frame_limits: [usize; 2],
+    ) -> Arc<Self> {
         let n = entry.pool_max as usize;
         Arc::new(Self {
             notices: entry
@@ -623,7 +640,7 @@ impl Pool {
             entry,
             home,
             secrets,
-            frame_limits: body_limits.map(|n| n.saturating_mul(2).saturating_add(FRAME_OVERHEAD)),
+            frame_limits,
             stderr_window: Arc::new(Mutex::new(LogWindow::new())),
             turns: Semaphore::new(n),
             parked: Default::default(),
@@ -647,6 +664,9 @@ impl Pool {
     }
     /// 在修改者仍持有熔断锁时取值；发到队列不等待 IPC 写出，也不锁其他进程池。
     fn transition(&self, c: &mut Circuit) {
+        if c.superseded {
+            return;
+        }
         c.revision += 1;
         if let Some((index, history)) = &self.events
             && let Some(history) = history.upgrade()
@@ -659,6 +679,7 @@ impl Pool {
         use serde_json::json;
         let breaker = c.view();
         let mut snap = json!({"name":self.secrets.replace(&self.entry.name),"process":if self.entry.process==Process::Spawn{"spawn"}else{"persistent"},"required":self.entry.required,"stages":self.entry.stages.iter().map(|s|s.as_str()).collect::<Vec<_>>(),"breaker":breaker});
+        snap["restarted_at"] = json!(c.restarted_at);
         if let Some(n) = &self.notices {
             let lane = n.lock().unwrap();
             snap["notify_breaker"] = lane.breaker.view();

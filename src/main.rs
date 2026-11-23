@@ -297,11 +297,15 @@ async fn run(cli: Cli) -> u8 {
             json,
         }) => return commands::stop::handle_stop_cmd(target, threshold, force, json).await,
         Some(Commands::Restart {
+            formats,
             target,
             threshold,
             force,
             json,
-        }) => return commands::restart::handle_restart_cmd(target, threshold, force, json).await,
+        }) => {
+            return commands::restart::handle_restart_cmd(target, threshold, force, formats, json)
+                .await;
+        }
         Some(Commands::Logs {
             target,
             lines,

@@ -41,6 +41,7 @@ const PINNED_IN_MODULES: &[(&str, &str)] = &[
         "read_request_lines_are_pinned_and_round_trip_through_the_server_parser",
     ),
     ("src/daemon.rs", "read_rejections_are_pinned"),
+    ("src/daemon.rs", "format_restart_frames_are_pinned"),
     // 请求记录
     ("src/history.rs", "record_shape_is_pinned"),
     // 成功应答与状态快照
@@ -1149,4 +1150,117 @@ fn the_samples_pinned_in_the_modules_are_still_there() {
             "{file} 里应有钉住契约样本的单测 {test}"
         );
     }
+}
+
+/// 通过运行中的端点验证命名选择、握手结果与失败时的实例身份；不经 CLI 解码器。
+#[test]
+fn format_restart_operation_contract() {
+    let home = TestHome::new();
+    let port = free_port();
+    let cfg = home.path().join("format.toml");
+    let role = home.path().join("role");
+    std::fs::write(&role, "1").unwrap();
+    std::fs::write(&cfg,format!("base_url='http://127.0.0.1'\nlisten_addr='127.0.0.1:{port}'\n[[format]]\nname='role'\ncommand={}\nargs=['role-version',{}]\nstages=['request']\nrequired=true",json!(common::format_echo_path()),json!(role))).unwrap();
+    let instance = start(&home, port, &["start", cfg.to_str().unwrap()]);
+    let ping = "{\"v\":1,\"op\":\"ping\"}\n";
+    let before = instance.snapshot(ping);
+    assert!(
+        before["ops"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("restart_formats"))
+    );
+    let named = "{\"v\":1,\"op\":\"restart_formats\",\"args\":{\"names\":[\"role\"]}}\n";
+    instance.rejected(
+        "{\"v\":1,\"op\":\"restart_formats\",\"args\":{\"names\":[\"role\",\"missing\"]}}\n",
+        &json!({"code":"unknown_format","details":{"name":"missing"}}),
+    );
+    assert!(instance.snapshot(ping)["formats"][0]["restarted_at"].is_null());
+    std::fs::write(&role, "2").unwrap();
+    std::fs::write(&cfg, "invalid config!").unwrap();
+    assert_eq!(
+        instance.snapshot(named),
+        json!({"configReloaded":false,"entries":[{"name":"role","program":"format-echo","version":"2","outcome":"restarted"}]})
+    );
+    std::fs::remove_file(role).unwrap();
+    assert_eq!(
+        instance.snapshot(named),
+        json!({"configReloaded":false,"entries":[{"name":"role","outcome":"handshake-failed","reason":"invalid_output"}]})
+    );
+    let after = instance.snapshot(ping);
+    assert_eq!(after["instance"], before["instance"]);
+    assert_eq!(after["state"], "serving");
+    assert_eq!(after["formats"][0]["breaker"]["state"], "open");
+}
+
+/// 模拟只公布 ping 的旧实例。第二条连接已经绑定对端，但不能收到任何更改状态的帧。
+#[tokio::test]
+async fn older_instance_never_receives_format_restart() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let home = TestHome::new();
+    let port = free_port();
+    let dir = home.path().join("run");
+    std::fs::create_dir_all(&dir).unwrap();
+    let endpoint = aproxy::daemon::endpoint_for_in(&dir, &port.to_string());
+    #[cfg(windows)]
+    let mut listener = tokio::net::windows::named_pipe::ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&endpoint)
+        .unwrap();
+    #[cfg(unix)]
+    let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
+    let mut snapshot = snapshot_sample();
+    snapshot["instance"]["pid"] = json!(std::process::id());
+    snapshot["instance"]["listen_addr"] = json!(format!("127.0.0.1:{port}"));
+    let reply = json!({"v":1,"ok":true,"result":snapshot}).to_string() + "\n";
+    let server = tokio::spawn(async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..3 {
+            #[cfg(windows)]
+            let pipe = {
+                listener.connect().await.unwrap();
+                std::mem::replace(
+                    &mut listener,
+                    tokio::net::windows::named_pipe::ServerOptions::new()
+                        .create(&endpoint)
+                        .unwrap(),
+                )
+            };
+            #[cfg(unix)]
+            let pipe = listener.accept().await.unwrap().0;
+            let reply = reply.clone();
+            tasks.spawn(async move {
+                let (r, mut w) = tokio::io::split(pipe);
+                let mut line = String::new();
+                BufReader::new(r).read_line(&mut line).await.unwrap();
+                if !line.is_empty() {
+                    assert_eq!(line, "{\"v\":1,\"op\":\"ping\"}\n");
+                    w.write_all(reply.as_bytes()).await.unwrap();
+                }
+                line.is_empty()
+            });
+        }
+        let mut empty = 0;
+        while let Some(r) = tasks.join_next().await {
+            empty += usize::from(r.unwrap());
+        }
+        assert_eq!(empty, 1);
+    });
+    let out = tokio::task::spawn_blocking(move || {
+        home.cmd()
+            .args(["restart", &port.to_string(), "--format", "all", "--json"])
+            .output()
+            .report_exit()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let doc = common::output_document(&out);
+    assert_eq!(
+        doc["results"][0]["error"]["details"]["reason"],
+        "unknown_op"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("does not support restarting formats"));
+    server.await.unwrap();
 }

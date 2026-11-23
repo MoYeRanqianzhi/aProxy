@@ -37,11 +37,32 @@ pub(crate) async fn handle_restart_cmd(
     target: Option<String>,
     threshold: Option<u64>,
     force: bool,
+    formats: Vec<String>,
     json: bool,
 ) -> u8 {
     if let Err(f) = require_idle_for_threshold("restart", target.as_deref(), threshold) {
         return f.report(json);
     }
+    let format_op = if formats.is_empty() {
+        None
+    } else {
+        let all = formats.iter().any(|n| n == "all");
+        if (all && formats.len() != 1)
+            || formats
+                .iter()
+                .any(|n| n.is_empty() || n.len() > 64 || n.chars().any(char::is_control))
+        {
+            return Failure::rendered(
+                "usage",
+                |l| restart_text::format_selection(l).to_owned(),
+                json!({"reason":"format_selection"}),
+            )
+            .report(json);
+        }
+        Some(daemon::FormatOp::Restart {
+            names: (!all).then_some(formats),
+        })
+    };
     let mode = StopMode::from_force(force);
     let mut results = Results::new(target.as_deref());
     let selection = match target::select(target.as_deref(), threshold, force).await {
@@ -85,6 +106,13 @@ pub(crate) async fn handle_restart_cmd(
             say(json, stop_text::none_idle(current(), idle_secs))
         }
         _ => {}
+    }
+    if let Some(op) = format_op {
+        for info in &selection.instances {
+            restart_formats(info, &op, &mut results, json).await;
+        }
+        say(json, restart_text::format_config(current()));
+        return results.finish(json);
     }
     let exe = std::env::current_exe().expect("cannot locate the current executable");
     // 多实例时最后再汇总一遍：逐条失败信息可能已被后续实例的输出冲散
@@ -136,6 +164,102 @@ pub(crate) async fn handle_restart_cmd(
         }
     }
     results.finish(json)
+}
+
+/// 只在已核验身份的连接上操作，失败没有退回到重启实例的路径。计数与输出项都是逐条目。
+async fn restart_formats(
+    info: &InstanceRecord,
+    op: &daemon::FormatOp,
+    results: &mut Results,
+    json: bool,
+) {
+    use aproxy_ipc::{
+        client::{IpcError, RunIdentity, TransportIssue, format_for_run_in},
+        wire::{RestartOutcome, RestartReport},
+    };
+    let port = daemon::port_of(&info.listen_addr);
+    let expected = RunIdentity {
+        pid: info.pid,
+        instance_id: info.instance_id.clone(),
+    };
+    let report = format_for_run_in(&daemon::run_dir(), port, &expected, op)
+        .await
+        .and_then(|v| {
+            serde_json::from_value::<RestartReport>(v).map_err(|e| {
+                IpcError::Protocol(TransportIssue::ReplyFormat {
+                    error: e.to_string(),
+                })
+            })
+        });
+    match report {
+        Ok(report) => {
+            let safe = |s: &str| s.chars().filter(|c| !c.is_control()).collect::<String>();
+            for entry in report.entries {
+                let mut item = match &entry {
+                    RestartOutcome::Restarted {
+                        name,
+                        program,
+                        version,
+                    } => {
+                        say(
+                            json,
+                            restart_text::format_done(
+                                current(),
+                                port,
+                                &safe(name),
+                                &safe(program.as_deref().unwrap_or("")),
+                                &safe(version.as_deref().unwrap_or("")),
+                            ),
+                        );
+                        results.ok += 1;
+                        results.item(port, "restarted")
+                    }
+                    RestartOutcome::HandshakeFailed { name, reason } => {
+                        eprintln!(
+                            "{}",
+                            restart_text::format_failed(
+                                current(),
+                                port,
+                                &safe(name),
+                                &safe(reason)
+                            )
+                        );
+                        results.failed.push(aproxy_ipc::code::EXIT_FAILED);
+                        results.item(port, "handshake-failed")
+                    }
+                };
+                item.extend(
+                    serde_json::to_value(entry)
+                        .unwrap()
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+                item.insert("configReloaded".into(), report.config_reloaded.into());
+                results.items.push(item.into());
+            }
+        }
+        Err(e) => {
+            let reason = match &e {
+                IpcError::Remote { code, .. } => code.as_str(),
+                IpcError::RunChanged => "run_changed",
+                _ => "ipc",
+            };
+            let failure = Failure::rendered(
+                "format_restart_failed",
+                |l| {
+                    if reason == "unknown_op" {
+                        restart_text::format_unsupported(l, port)
+                    } else {
+                        restart_text::format_refused(l, port, &e.render(l))
+                    }
+                },
+                json!({"port":port_value(port),"reason":reason}),
+            );
+            eprintln!("{}", failure.terminal());
+            results.failed(port, "failed", &failure);
+        }
+    }
 }
 
 /// 一个实例没能重启：失败所处的阶段决定码与说明。旧实例已经停下的那一种，先说它是怎样停下的

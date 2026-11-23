@@ -44,6 +44,7 @@ message!(results_json(), en: "Write a JSON document with each instance outcome a
 
 message!(restart(), en: "Restart running instances using their original configuration file, overrides and environment. Does not start stopped instances. With multiple instances, specify a port, configuration alias, `all` or `idle`, as for stop", zh: "重启运行中的实例（停下它，再按它启动时的配置文件、覆盖参数与环境重新拉起）。 只负责重启已运行的实例：未启动的 target 会提示「未启动」而不会拉起。 单个实例时可直接 `aproxy restart`；多实例必须指定端口号、`all`、配置 别名或 `idle`（可加 --idle-threshold-secs），语义与 stop 一致。");
 
+message!(restart_formats(), en: "Restart only the named format (repeatable), or all formats; do not reload config.toml", zh: "只重启指定的 format（可重复指定）或全部 format，不重读 config.toml");
 message!(restart_force(), en: "Terminate the old process immediately without waiting for graceful shutdown, then restart it", zh: "立即强制终止旧进程（跳过优雅关闭，零等待）再重启");
 
 message!(logs(), en: "Print the last lines of one instance log. Use -f to follow new lines until Ctrl+C. With multiple instances, select a port or alias; all is not supported", zh: "打印一个实例的守护日志的最近若干行然后退出；加 -f 接着实时输出新写进来的 （Ctrl+C 退出）。单个实例时可直接 `aproxy logs`；多实例必须指定端口号或配置别名。 不支持 all：一次只看一个实例。");

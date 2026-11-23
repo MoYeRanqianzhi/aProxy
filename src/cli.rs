@@ -117,6 +117,8 @@ pub enum Commands {
         #[arg(help = help::idle_threshold(current()))]
         #[arg(long = "idle-threshold-secs", value_name = "SECS")]
         threshold: Option<u64>,
+        #[arg(long="format", value_name="NAME|all", conflicts_with_all=["force", "threshold"], help=help::restart_formats(current()))]
+        formats: Vec<String>,
         #[arg(help = help::restart_force(current()))]
         #[arg(long)]
         force: bool,

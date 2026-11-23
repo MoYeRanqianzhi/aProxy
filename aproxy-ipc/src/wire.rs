@@ -235,7 +235,7 @@ pub enum IpcOp {
 impl IpcOp {
     /// 实例支持的全部 op 的名字（快照里的 `ops`）：这里的三个控制 op，加上读请求历史的
     /// 四个（见 [`ReadOp`]）
-    pub const NAMES: [&'static str; 7] = [
+    pub const NAMES: [&'static str; 8] = [
         "ping",
         "shutdown",
         "prepare_swap",
@@ -243,6 +243,7 @@ impl IpcOp {
         "request",
         "body",
         "subscribe",
+        "restart_formats",
     ];
 
     /// 本版本认得的 op 参数（快照里的 `features`）
@@ -539,10 +540,91 @@ impl ReadOp {
     }
 }
 
+/// Format operations have their own result shapes, unlike the instance-wide control operations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FormatOp {
+    /// None selects every entry; named selections are validated before any entry changes.
+    Restart { names: Option<Vec<String>> },
+}
+impl FormatOp {
+    /// Capability to check on the verified run before writing this operation.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Restart { .. } => "restart_formats",
+        }
+    }
+    /// Serialize one request without its newline; null explicitly requests all entries.
+    pub fn request_line(&self) -> String {
+        let args = match self {
+            Self::Restart { names } => serde_json::json!({"names":names}),
+        };
+        serde_json::json!({"v":IPC_VERSION,"op":self.name(),"args":args}).to_string()
+    }
+    fn parse(
+        name: &str,
+        args: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<Self, Rejection> {
+        let invalid = |key| Rejection::BadRequest {
+            reason: "invalid_arg",
+            arg: Some(key),
+        };
+        let arg = |key| {
+            args.and_then(|a| a.get(key)).ok_or(Rejection::BadRequest {
+                reason: "missing_arg",
+                arg: Some(key),
+            })
+        };
+        match name {
+            "restart_formats" => {
+                reject_unknown_args(args, &["names"])?;
+                let names: Option<Vec<String>> =
+                    serde_json::from_value(arg("names")?.clone()).map_err(|_| invalid("names"))?;
+                if names.as_ref().is_some_and(|v| {
+                    v.is_empty()
+                        || v.iter().any(|n| {
+                            n.is_empty()
+                                || n.len() > 64
+                                || n == "all"
+                                || n.chars().any(char::is_control)
+                        })
+                }) {
+                    return Err(invalid("names"));
+                }
+                Ok(Self::Restart { names })
+            }
+            _ => Err(Rejection::UnknownOp(name.into())),
+        }
+    }
+}
+/// A restart always returns one observation per selected entry, in configuration order.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "kebab-case")]
+pub enum RestartOutcome {
+    /// The fresh process negotiated the configured stages.
+    Restarted {
+        name: String,
+        program: Option<String>,
+        version: Option<String>,
+    },
+    /// The instance stays live; reason is a machine-readable format fault kind.
+    HandshakeFailed { name: String, reason: String },
+}
+/// Explicitly distinguish process restarts from a configuration reload.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestartReport {
+    /// False because entries keep their instance-start configuration.
+    pub config_reloaded: bool,
+    /// Each selected entry appears exactly once.
+    pub entries: Vec<RestartOutcome>,
+}
+
 /// 一个解析好的请求：控制 op，或读请求历史的 op。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Parsed {
     Control(IpcOp),
+    /// An operation addressed to this instance’s format entries.
+    Format(FormatOp),
     Read(ReadOp),
 }
 
@@ -608,6 +690,8 @@ pub enum Rejection {
     /// 请求里的 `v`（原样）不受支持
     UnsupportedVersion(String),
     UnknownOp(String),
+    /// No configured entry matched this sanitized selector.
+    UnknownFormat(String),
     UnsupportedArg(Vec<String>),
     /// 此刻的状态不允许这个 op
     InvalidState(&'static str),
@@ -661,6 +745,11 @@ impl Rejection {
                 error_code::UNSUPPORTED_VERSION,
                 text::unsupported_version(Lang::En, v, &IPC_VERSION.to_string()),
                 json!({ "supported": [IPC_VERSION] }),
+            ),
+            Rejection::UnknownFormat(name) => (
+                "unknown_format",
+                text::unknown_format(Lang::En, name),
+                json!({"name":name}),
             ),
             Rejection::UnknownOp(op) => (
                 error_code::UNKNOWN_OP,
@@ -764,6 +853,7 @@ pub fn parse_request(line: &str) -> Result<Parsed, Rejection> {
         Some(_) => return Err(Rejection::bad("args_not_object")),
     };
     match name {
+        "restart_formats" => FormatOp::parse(name, args).map(Parsed::Format),
         "requests" | "request" | "body" | "subscribe" => {
             ReadOp::from_request(name, args).map(Parsed::Read)
         }
@@ -850,6 +940,7 @@ mod tests {
                 }
                 .name(),
                 ReadOp::Subscribe.name(),
+                FormatOp::Restart { names: None }.name(),
             ]
         );
         assert_eq!(

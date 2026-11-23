@@ -12,7 +12,7 @@ use tokio::io::AsyncWriteExt;
 #[path = "i18n/format_fault.rs"]
 pub(crate) mod fault_text;
 mod pool;
-pub(crate) use pool::{Fault, Pool, StreamWorker};
+pub(crate) use pool::{Fault, FormatSlot, Formats, Pool, StreamWorker};
 /// 头表 → 信封：键小写（HeaderMap 迭代即小写）、跳过 hop-by-hop 头（含
 /// content-length——由 aproxy 按实际字节回填，format 不该看到也不能改）。
 /// 编码头按顺序合并；**其余多值头仅保留首值**（set-cookie 的 Expires 含逗号，逗号合并不合法；拒绝

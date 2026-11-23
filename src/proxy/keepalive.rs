@@ -60,7 +60,7 @@ pub(super) struct Heartbeat {
 /// 一个请求的动态心跳生成器（在各拍的独立任务间共享）。
 pub(super) struct DynamicHeartbeat {
     /// 配置顺序与请求方向相同，逐拍逆序遍历。
-    pub(super) pools: Arc<[Arc<crate::transform::Pool>]>,
+    pub(super) pools: crate::transform::Formats,
     pub(super) ctx: ExchangeCtx,
     /// 最近一次尝试的失败，不会把别的请求的状态带进心跳。
     pub(super) last: std::sync::Mutex<Option<aproxy_envelope::Failure>>,

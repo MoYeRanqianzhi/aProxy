@@ -252,7 +252,7 @@ impl RequestChain {
         responder: &mut Responder,
         pending: &mut Option<ClientUpload>,
     ) -> Result<bool, ChainError> {
-        if self.cursor == state.formats.len() {
+        if self.cursor == state.formats.0.len() {
             let Some(p) = &mut self.prefix else {
                 return Ok(false);
             };
@@ -270,8 +270,8 @@ impl RequestChain {
         } else if let Some(previous) = self.failed_overrides.take() {
             previous.restore(state, self, responder);
         }
-        while self.cursor < state.formats.len() {
-            let pool = state.formats[self.cursor].clone();
+        while self.cursor < state.formats.0.len() {
+            let pool = state.formats.0[self.cursor].current();
             if self.prefix.is_none() && pool.entry.has_stage(Stage::Retry) {
                 self.prefix = Some(Prefix {
                     overrides: None,
@@ -629,7 +629,7 @@ pub(super) async fn transform_response_layer(
     mut headers: HeaderMap,
     mut body: SpooledBody,
 ) -> (StatusCode, HeaderMap, SpooledBody) {
-    let p = &state.formats[layer];
+    let p = state.formats.0[layer].current();
     // 每个层界按当前头解释当前的体：上一层可以刚刚重新编码，而外层也可能完全跳过。
     let raw_encoding = request_encoding(&headers, true);
     let encoding = raw_encoding

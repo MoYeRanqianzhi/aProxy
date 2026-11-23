@@ -384,6 +384,35 @@ pub async fn read_for_run_in(
     }
 }
 
+/// Issue a format operation on a held, identity-verified connection. An older peer never receives it.
+pub async fn format_for_run_in(
+    dir: &std::path::Path,
+    port: &str,
+    expected: &RunIdentity,
+    op: &crate::wire::FormatOp,
+) -> Result<serde_json::Value, IpcError> {
+    let endpoint = endpoint_for_in(dir, port);
+    let exchange = async {
+        let (stream, snap) = verified_connection(&endpoint, Some(expected)).await?;
+        if !snap.ops.iter().any(|n| n == op.name()) {
+            return Err(IpcError::Remote {
+                code: "unknown_op".into(),
+                message: text::unknown_op(Lang::En, op.name()),
+                details: serde_json::json!({"op":op.name()}),
+            });
+        }
+        parse_result(&exchange_over(stream, &op.request_line()).await?)
+    };
+    tokio::time::timeout(Duration::from_secs(30), exchange)
+        .await
+        .map_err(|_| {
+            IpcError::Transient(TransportIssue::Timeout {
+                endpoint: endpoint.clone(),
+            })
+        })?
+        .map_err(|e| e.at(&endpoint))
+}
+
 /// Keep the operation's transport open while verifying its OS peer against a
 /// snapshot. Endpoint reuse between the verification and the operation cannot
 /// redirect that held connection to a replacement process.

@@ -269,7 +269,7 @@ pub struct IpcStats {
     /// 与请求记录使用同一组凭据做替换；没有请求历史的空计数器没有配置密钥。
     history: Option<Arc<crate::history::History>>,
     /// 池的生命期由实例持有；IPC 仅读取快照，不延长进程生命期。
-    pub(crate) formats: Vec<std::sync::Weak<crate::transform::Pool>>,
+    pub(crate) formats: Vec<std::sync::Weak<crate::transform::FormatSlot>>,
     /// 实例阶段变动唤醒状态读者；熔断变化另有带快照的有界队列。
     pub state_changed: Arc<tokio::sync::Notify>,
     /// 控制端点已上线，但格式程序尚未全部协商，或启动记录尚未落盘。
@@ -1123,6 +1123,13 @@ where
     }
     let op = match parse_request(&line) {
         Ok(Parsed::Control(op)) => op,
+        Ok(Parsed::Format(op)) => {
+            let reply = match format_operation(&state, op).await {
+                Ok(v) => ok_reply(&v.to_string()),
+                Err(e) => e.reply(),
+            };
+            return write_line(&mut writer, &reply).await;
+        }
         Ok(Parsed::Read(ReadOp::Subscribe)) => {
             // 请求行之后客户端不再发东西；读端留着，只为看出它关了连接
             return serve_events(limited.into_inner(), writer, state).await;
@@ -1199,6 +1206,52 @@ where
         let _ = state.on_shutdown.send(true);
     }
     Ok(())
+}
+
+/// 先核对整个选择，再启动任何一次握手；未知条目不能使前面的有效条目被部分重启。
+async fn format_operation(
+    state: &ControlState,
+    op: FormatOp,
+) -> Result<serde_json::Value, Rejection> {
+    if *state.on_shutdown.borrow() {
+        return Err(Rejection::InvalidState("stopping"));
+    }
+    if state
+        .stats
+        .starting
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(Rejection::InvalidState("starting"));
+    }
+    let slots: Vec<_> = state
+        .stats
+        .formats
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect();
+    match op {
+        FormatOp::Restart { names } => {
+            if let Some(names) = &names {
+                for name in names {
+                    if !slots.iter().any(|s| s.current().entry.name == *name) {
+                        return Err(Rejection::UnknownFormat(
+                            state.history.secrets().replace(name),
+                        ));
+                    }
+                }
+            }
+            let selected = slots.iter().filter(|s| {
+                names
+                    .as_ref()
+                    .is_none_or(|names| names.contains(&s.current().entry.name))
+            });
+            let entries = futures_util::future::join_all(selected.map(|s| s.restart())).await;
+            Ok(serde_json::json!(RestartReport {
+                config_reloaded: false,
+                entries
+            }))
+        }
+    }
 }
 
 /// 成功应答的一行（不含换行）。`result` 是已经写成 JSON 文本的结果。
@@ -1447,7 +1500,7 @@ fn recover_subscription(
 /// 尚未交付的状态；否则短暂的 half_open 会被它之后的 closed 越过。
 struct SubscriberStatus {
     /// 配置位置、进程池和订阅者已收到的状态修订号，位置不受脱敏后名字重复的影响。
-    pools: Vec<(usize, std::sync::Weak<crate::transform::Pool>, u64)>,
+    pools: Vec<(usize, std::sync::Weak<crate::transform::FormatSlot>, u64)>,
     /// 最近一次取样的活动与实例状态，以及到当前事件为止的各池状态。
     snapshot: InstanceStatus,
 }
@@ -2152,6 +2205,82 @@ mod tests {
         id
     }
 
+    /// 独立核对选择帧、拒绝与结果；协议的逐字比较不依赖客户端解码器。
+    #[tokio::test]
+    async fn format_restart_frames_are_pinned() {
+        let (state, _rx) = control(sample_info("0"));
+        let ask = |line: &'static str| {
+            let state = state.clone();
+            async move {
+                match parse_request(&format!("{line}\n")) {
+                    Ok(Parsed::Format(op)) => format_operation(&state, op)
+                        .await
+                        .map(|v| ok_reply(&v.to_string()))
+                        .unwrap_or_else(|e| e.reply()),
+                    Err(e) => e.reply(),
+                    _ => panic!("not a format op"),
+                }
+            }
+        };
+        let all = r#"{"v":1,"op":"restart_formats","args":{"names":null}}"#;
+        assert_eq!(FormatOp::Restart { names: None }.request_line(), all);
+        assert_eq!(
+            ask(all).await,
+            r#"{"v":1,"ok":true,"result":{"configReloaded":false,"entries":[]}}"#
+        );
+        let named = r#"{"v":1,"op":"restart_formats","args":{"names":["missing"]}}"#;
+        assert_eq!(
+            FormatOp::Restart {
+                names: Some(vec!["missing".into()])
+            }
+            .request_line(),
+            named
+        );
+        assert_eq!(
+            ask(named).await,
+            r#"{"v":1,"ok":false,"error":{"code":"unknown_format","message":"no configured format named missing","details":{"name":"missing"}}}"#
+        );
+        assert_eq!(
+            ask(r#"{"v":1,"op":"restart_formats"}"#).await,
+            r#"{"v":1,"ok":false,"error":{"code":"bad_request","message":"arg names is required","details":{"reason":"missing_arg","arg":"names"}}}"#
+        );
+        for line in [
+            r#"{"v":1,"op":"restart_formats","args":{"names":[]}}"#,
+            r#"{"v":1,"op":"restart_formats","args":{"names":["all","keys"]}}"#,
+            r#"{"v":1,"op":"restart_formats","args":{"names":true}}"#,
+        ] {
+            assert_eq!(
+                ask(line).await,
+                r#"{"v":1,"ok":false,"error":{"code":"bad_request","message":"arg names has the wrong type or value","details":{"reason":"invalid_arg","arg":"names"}}}"#
+            )
+        }
+        assert_eq!(
+            ask(r#"{"v":1,"op":"restart_formats","args":{"extra":true}}"#).await,
+            r#"{"v":1,"ok":false,"error":{"code":"unsupported_arg","message":"unknown arg: extra","details":{"args":["extra"]}}}"#
+        );
+        let entries = vec![
+            RestartOutcome::Restarted {
+                name: "a".into(),
+                program: Some("tool".into()),
+                version: Some("1".into()),
+            },
+            RestartOutcome::HandshakeFailed {
+                name: "b".into(),
+                reason: "invalid".into(),
+            },
+        ];
+        assert_eq!(
+            ok_reply(
+                &serde_json::to_string(&RestartReport {
+                    config_reloaded: false,
+                    entries
+                })
+                .unwrap()
+            ),
+            r#"{"v":1,"ok":true,"result":{"configReloaded":false,"entries":[{"outcome":"restarted","name":"a","program":"tool","version":"1"},{"outcome":"handshake-failed","name":"b","reason":"invalid"}]}}"#
+        );
+    }
+
     /// 读类 op 的拒绝：未知参数、缺必填、类型或取值不对、取不到。应答行逐字钉住。
     #[test]
     fn read_rejections_are_pinned() {
@@ -2659,7 +2788,8 @@ mod tests {
             Some((0, Arc::downgrade(&state.history))),
             [1024; 2],
         );
-        Arc::get_mut(&mut state.stats).unwrap().formats = vec![Arc::downgrade(&pool)];
+        let slot = crate::transform::FormatSlot::new(pool.clone());
+        Arc::get_mut(&mut state.stats).unwrap().formats = vec![Arc::downgrade(&slot)];
         let held = pool.turn(false).await.unwrap();
         let (mut client, server) = tokio::io::duplex(1 << 16);
         let handler = tokio::spawn(handle_conn(server, control));
@@ -2744,10 +2874,13 @@ mod tests {
         let (state, _rx) = control(sample_info("12345"));
         state.stats.requests_total.store(120, Ordering::Relaxed);
         state.stats.retries_total.store(7, Ordering::Relaxed);
+        // 逐项核对追加的能力，再逐字比对已有快照样本，不能隐藏旧字段的变化。
+        let mut snapshot = status_snapshot(&state);
+        assert_eq!(snapshot.ops.pop().as_deref(), Some("restart_formats"));
         let reply = serde_json::to_string(&WireResponse {
             v: IPC_VERSION,
             ok: true,
-            result: Some(status_snapshot(&state)),
+            result: Some(snapshot),
             error: None,
         })
         .unwrap();
@@ -2938,7 +3071,8 @@ mod tests {
                 "requests",
                 "request",
                 "body",
-                "subscribe"
+                "subscribe",
+                "restart_formats"
             ]
         );
         assert_eq!(status.activity.requests_total, 7);

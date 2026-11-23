@@ -101,6 +101,7 @@ Problems found in config.toml and settings.json. Each diagnostic is an object wi
 | `config_missing_key` | error | A required key is missing. | — |
 | `config_unknown_key` | error | A key that is not recognized. | — |
 | `config_not_supported` | error | A form whose shape is defined but which is not implemented yet. | — |
+| `format_name_reserved` | error | The format name is reserved for selecting all entries. | `name` (string) |
 | `config_conflict` | error | A combination of settings that exclude each other. | — |
 | `secret_placeholder_unmatched` | error | A secret placeholder written back does not match any original value. | — |
 | `default_credential_withheld` | warning | A credential in the settings defaults was not inherited because the target differs, and this config has none of its own. | `key` (string), `reason` (string) |

@@ -727,6 +727,16 @@ fn check_format_chain(ctx: &mut Ctx, formats: &[FormatEntry], tables: &[Tbl]) {
     let mut retry_seen: Option<&str> = None;
     for format in formats {
         let (path, span) = position(format).unwrap_or_else(|| ("format".to_string(), None));
+        // all 始终选择整个列表；显式名和从命令推导出的名字使用同一个命名空间。
+        if format.name == "all" {
+            ctx.push(
+                "format_name_reserved",
+                &format!("{path}.name"),
+                span.clone(),
+                Reason::ReservedFormat,
+                json!({"name":"all"}),
+            );
+        }
         if !seen.insert(format.name.as_str()) {
             ctx.push(
                 "config_conflict",

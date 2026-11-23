@@ -423,6 +423,25 @@ pool_max = 0
         assert_eq!(cfg.format.unwrap()[0].name, "short");
     }
 
+    /// 选择全部条目的关键字不能通过省略名字绕过，普通名字仍区分大小写。
+    #[test]
+    fn format_selection_reserves_all() {
+        for (table, reserved) in [
+            ("command='all.exe'", true),
+            ("command='tool'\nname=' all '", true),
+            ("command='All.exe'", false),
+        ] {
+            let (_, ds) = parse_text(&format!("[[format]]\n{table}\nstages=['request']"));
+            if reserved {
+                assert_eq!(ds.len(), 1);
+                assert_eq!(ds[0].code, "format_name_reserved");
+                assert_eq!(ds[0].details["name"], "all");
+            } else {
+                assert!(ds.is_empty());
+            }
+        }
+    }
+
     #[test]
     fn format_names_default_to_the_command_stem_and_must_be_unique() {
         let (config, diagnostics) = parse_text(

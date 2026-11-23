@@ -126,6 +126,9 @@ reasons! {
     UnknownStage { stage: String },
         en: "{stage:?} is not a stage; the stages are request, retry, decide, response, stream, heartbeat and notify",
         zh: "{stage:?} 不是有效阶段；可用阶段为 request、retry、decide、response、stream、heartbeat 和 notify";
+    ReservedFormat,
+        en: "the format name 'all' is reserved for selecting every format",
+        zh: "format 名 all 用于选择全部 format，不能用作条目名";
     DuplicateFormat { name: String },
         en: "two formats are named {name:?}; names must be unique in the list",
         zh: "两个 format 都名为 {name:?}；列表中的名称必须唯一";

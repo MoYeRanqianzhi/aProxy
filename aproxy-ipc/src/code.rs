@@ -686,6 +686,12 @@ pub const TABLE: &[Code] = &[
         &[],
     ),
     diagnostic(
+        "format_name_reserved",
+        Severity::Error,
+        "The format name is reserved for selecting all entries.",
+        &[req("name", T::String)],
+    ),
+    diagnostic(
         "config_conflict",
         Severity::Error,
         "A combination of settings that exclude each other.",

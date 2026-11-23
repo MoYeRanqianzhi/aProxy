@@ -279,7 +279,7 @@ impl std::fmt::Display for Fault {
 
 /// 直到操作系统确认进程退出才释放编号与进程名额；取消往返也不能造成两个活进程同号。
 struct Slot {
-    /// 发给该进程的永久 worker_id。
+    /// 内部槽号直到进程退出才归还；一次性进程在线上统一报告 0。
     id: u32,
     /// 这个程序仍在使用的所有编号。
     used: Arc<Mutex<BTreeMap<u32, Option<u32>>>>,
@@ -615,11 +615,7 @@ impl Pool {
         events: Option<(usize, std::sync::Weak<crate::history::History>)>,
         body_limits: [usize; 2],
     ) -> Arc<Self> {
-        let n = if entry.process == Process::Spawn {
-            1
-        } else {
-            entry.pool_max as usize
-        };
+        let n = entry.pool_max as usize;
         Arc::new(Self {
             notices: entry
                 .has_stage(crate::config::file::Stage::Notify)
@@ -920,7 +916,11 @@ impl Pool {
                 .iter()
                 .map(|s| s.as_str().into())
                 .collect(),
-            id,
+            if self.entry.process == Process::Spawn {
+                0
+            } else {
+                id
+            },
         );
         let [request, response] = self
             .frame_limits

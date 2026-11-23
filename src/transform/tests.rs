@@ -124,12 +124,31 @@ fn transform_error_display_carries_reason() {
             .contains("stages")
     );
 }
-/// spawn 始终只有一个 0 号槽。
+/// 第一个一次性进程已读到请求但不能回信，第二个仍可完成；线上编号相同，实际 PID 不同。
 #[tokio::test]
-async fn spawn_mode_pool_max_is_one() {
-    let p = pool(Process::Spawn, "echo", |_| {});
-    assert_eq!(p.entry.pool_max, 4);
-    assert_eq!(p.turns.available_permits(), 1);
+async fn spawn_messages_overlap_up_to_pool_max() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("release");
+    let obs = dir.path().join("seen");
+    let p = pool(Process::Spawn, "gate-request", |e| {
+        e.pool_max = 2;
+        e.timeout_secs = 0;
+        e.args.push(gate.display().to_string());
+        e.env
+            .insert("ECHO_OBSERVE".into(), obs.display().to_string());
+    });
+    let mut first = std::pin::pin!(call(&p, "blocked", false));
+    tokio::select! {_=&mut first=>panic!("completed before release"),_=wait_observed(&obs,"request",1)=>{}}
+    assert_eq!(
+        p.turns.available_permits(),
+        1,
+        "second message cannot enter"
+    );
+    let second = worker(call(&p, "other", false).await.unwrap(), "other");
+    std::fs::write(gate, b"ok").unwrap();
+    let first = worker(first.await.unwrap(), "blocked");
+    assert!(first.starts_with("0/") && second.starts_with("0/"));
+    assert_ne!(first, second);
 }
 /// persistent 复用的是原进程，而不是碰巧编号相同的另一个进程。
 #[tokio::test]

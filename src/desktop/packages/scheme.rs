@@ -28,7 +28,8 @@ fn mime(name: &str) -> &'static str {
 }
 fn load(home: &Path, raw: &str, head: bool) -> Option<(&'static str, u64, Vec<u8>)> {
     let raw = raw.split(['?', '#']).next()?.strip_prefix('/')?;
-    if raw.len() > 904 {
+    // 代号连同分隔符也可能逐字节百分号编码；磁盘路径仍按原来的独立上限校验。
+    if raw.len() > 904 + 65 * 3 {
         return None;
     }
     let mut parts = Vec::new();
@@ -48,7 +49,19 @@ fn load(home: &Path, raw: &str, head: bool) -> Option<(&'static str, u64, Vec<u8
         }
         parts.push(p.into_owned());
     }
-    let (id, files) = parts.split_first()?;
+    let (first, files) = parts.split_first()?;
+    // 代号只改变浏览器的模块与资源 URL，不参与磁盘寻址。先解码一次再检查，不能借它穿透目录。
+    let id = match first.split_once('~') {
+        None => first.as_str(),
+        Some((id, g))
+            if (1..=64).contains(&g.len())
+                && g.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) =>
+        {
+            id
+        }
+        _ => return None,
+    };
     if !preferences::package_id(id) || !valid_path(&files.join("/")) {
         return None;
     }

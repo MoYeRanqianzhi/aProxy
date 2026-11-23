@@ -754,11 +754,24 @@ fn package_urls_serve_only_regular_descendants_without_a_window() {
         ] {
             assert_eq!(r.headers()[k], v);
         }
+        for id in ["sample.one~g7", "sample.one%7Eg7"] {
+            let generated = run("GET", &path.replacen("sample.one", id, 1));
+            assert_eq!(generated.status(), r.status());
+            assert_eq!(generated.headers(), r.headers());
+            assert_eq!(generated.body(), r.body());
+        }
         let head = run("HEAD", &path);
         assert!(head.body().is_empty());
         assert_eq!(head.headers()["content-length"], "3");
     }
+    fs::write(d.join("x"), b"visible").unwrap();
+    assert_eq!(run("GET", "sample.one/x").status(), 200);
     for path in [
+        "sample.one~/x",
+        "sample.one~a~b/x",
+        "sample.one~bad!/x",
+        ".staging-secret~g7/x",
+        "sample.one~%2F/x",
         "sample.one/../outside",
         "sample.one/%2e%2e/outside",
         "sample.one/%252e%252e/outside",

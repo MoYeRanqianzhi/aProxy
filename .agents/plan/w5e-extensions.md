@@ -166,6 +166,14 @@ Codex 交回 Strings 后对齐 Fault 码）、演示后端（`lib/backend/demo/p
 `npm run check` 0 错误，`npm run build` 通过。还没在真实窗口里验证：包地址的 CORS 与模块加载、CSP 放开后的样式注入、
 Tauri 拖放交来的路径，都等 t10b 合入后在 W5d 里看。
 
+**t10b 合入之后（主代理 2026-11-23）。** Rust 一侧已合入 master（见 [codex-tasks-0.2.0](codex-tasks-0.2.0.md) 的 9b）。前端按下面
+英文契约的「Faults to localize」对齐（`3e47277e`）：包与扩展数据的错误都是 `desktop_package`，按 `reason` 选句子，带包里的
+路径、manifest 的字段或超出的上限；`desktop_toml` 的细节就是那条 TomlIssue；`desktop_state_io` 的文件多了 `preferences` 与
+`packages`；已装包的问题（`EntryIssue`：manifest、entry、io）各有修复的说法。真实窗口验证按英文契约末尾「Real-window
+qualification」的四步做，用 t10c 开工前构建的 `.agents/codex.local/desktop-t10b/aproxy.exe`，只在临时 home 里运行。
+下面的英文契约是 Codex 在 t10b 里写的；t10c 会在文件末尾再追加一节英文，两节等 t10c 合入后一起改写成中文，与代码重复的
+类型清单改为指向 `aproxy-ipc/src/desktop/packages.rs` 与 `aproxy-desktop/ui/src/lib/backend/contract.ts`。
+
 **分工。** Codex 做 Rust 侧：包的读取与安装、列出、启停、卸载，包文件的 sha256，GitHub 查询，format 的 control 进程（hello 回复里的 control 参数、独立进程的启动与退役、实例 IPC、桌面命令），相应的桌面命令（安装分两步：
 先「检查」返回清单摘要与可信度事实，再带检查时的句柄「安装」），并删掉 master 上 t10 的沙箱、租约、授权与审计代码；按上面的标准校验 manifest 与文件；`desktop.toml` 换掉
 `preferences.json`；扩展的设置、键值与文件三组命令；（用户同意后）format 的数据目录。

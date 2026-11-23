@@ -8,12 +8,23 @@ metadata:
   last_verified: 2026-11-23
 ---
 
-Keep package resources at hierarchical URLs. In Tauri 2.12.3 `scripts/core.js` applies `encodeURIComponent` to the entire `convertFileSrc` argument. Pass the package ID alone and append the individually encoded path segments: a percent-encoded slash is not a segment separator. With this app's default protocol options the Windows origin is `http://aproxy-pkg.localhost`; macOS/Linux use `aproxy-pkg://localhost`. The query distinguishes successive ES module activations in the webview, not files in the installer.
+包里的资源要放在有层级的 URL 上。Tauri 2.12.3 的 `scripts/core.js` 对 `convertFileSrc` 的整个参数做
+`encodeURIComponent`：只把包的 id 交给它，包里的路径逐段编码后接在后面；编码过的斜杠不再是路径分隔符。按本应用默认的
+协议选项，Windows 上的源是 `http://aproxy-pkg.localhost`，macOS 与 Linux 上是 `aproxy-pkg://localhost`。地址里的查询串
+用来区分 webview 里同一个模块先后几次激活，不用来区分安装器里的文件。
 
-**Why:** Browsers resolve CSS URLs and module imports against their parent resource. They also ignore style `'unsafe-inline'` when a nonce or hash is present. Tauri's manager tests the script and style CSP-modification switches independently; disabling the style modification alone leaves script handling intact and permits the page's injected styles. Neither the declared resource URLs nor a successful Rust response prove all engines loaded a font, a stylesheet or a module.
+**Why:** 浏览器按父资源解析 CSS 里的 URL 与模块的相对 import。style-src 里只要有 nonce 或哈希，浏览器就忽略
+`'unsafe-inline'`。Tauri 的 manager 分别判断 script 与 style 两处 CSP 改写开关：只关掉 style 的改写，脚本的保护不变，
+页面注入的样式也能生效。资源地址写得对、Rust 回了响应，都证明不了每个引擎真的加载了字体、样式表或模块。
 
-**How to apply:** Preserve hierarchy and check computed style, actual module activation and relative requests in each real engine when changing the host. For provenance, bind the *original ZIP* to a release asset by sha256, not filename. A renamed download can still match. Stars, license and other repository facts without a matching digest describe a repository anyone could name, not the bytes selected by the user. See [[desktop-extension-trust]] and the [page contract](../plan/w5e-extensions.md) for the decisions the page owns.
+**How to apply:** 改宿主时保持地址的层级，并在每个真实引擎里看计算后的样式、模块是否真的激活、相对路径的请求是否发出。
+核对来源要拿**原始 ZIP** 的 sha256 去对 release asset 的摘要，不按文件名：改过名的下载照样能对上。摘要没对上时，star、
+许可证这些仓库事实描述的只是一个谁都能写进 manifest 的仓库，不是用户选中的这些字节。另见 [[desktop-extension-trust]]
+与[页面契约](../plan/w5e-extensions.md)里页面自己负责的决定。
 
-**Evidence:** Tauri 2.12.3 `scripts/core.js` (`convertFileSrc`) and `src/manager/mod.rs` (per-directive nonce/hash processing); `tests/desktop_packages.rs` exercises hierarchical requests and a local GitHub fake including renamed downloads, mismatches and absent digests. A read-only GET of `repos/MoYeRanqianzhi/aProxy/releases/latest` showed `sha256:` on uploaded release assets. Native engine qualification is separate.
+**Evidence:** Tauri 2.12.3 的 `scripts/core.js`（`convertFileSrc`）与 `src/manager/mod.rs`（按指令分别处理 nonce 与哈希）；
+`tests/desktop_packages.rs` 覆盖有层级的请求，以及本地模拟的 GitHub（含改名的下载、摘要不符、没有摘要）。对
+`repos/MoYeRanqianzhi/aProxy/releases/latest` 的只读 GET 显示，上传的 release asset 带 `sha256:` 摘要。各平台原生引擎
+上的验证另做（Codex 在 t10b 中查证，2026-11-23）。
 
-**Recheck when:** Upgrading Tauri/Wry, changing HTTPS scheme options, changing CSP injection, or when GitHub changes the release asset digest contract.
+**Recheck when:** 升级 Tauri 或 Wry、改 HTTPS 协议选项、改 CSP 的注入方式，或 GitHub 改了 release asset 摘要的契约。

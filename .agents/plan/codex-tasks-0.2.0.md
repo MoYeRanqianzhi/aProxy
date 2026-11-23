@@ -96,6 +96,10 @@
      测试本身不适用）、1 `desktop.toml`、2 删 t10 的设计、3 读包与检查、4 GitHub 事实、5 安装列出启停卸载、6 包地址
      `aproxy-pkg`、CSP 与拖放、7 扩展的设置键值文件、8 文档与 Gate F。写任务书时定下、与 [w5e-extensions](w5e-extensions.md)
      顶部一节不同或更细的地方记在那一节的「t10b 任务书定下的细节」。
+   - 结果（2026-11-23）：完成，Gate F 两个变体各 1,290 通过、0 失败、11 忽略。代码按惯例逐个 cherry-pick 进 master
+     （`b11540a9..dfde3220`，与分支上通过检查的代码逐字节相同），文档提交 `dcc02534`。前端随即对齐了 Rust 的错误
+     （`desktop_package` 的原因、`desktop_toml` 的细节，`3e47277e`）。剩下的：真实窗口验证（步骤在 w5e 计划的
+     「Real-window qualification」），macOS 上两个原生用例等 CI 确认。
 9c. **t10c：format 的运行时控制**（t10b 之后，Rust 侧；设计见 [w5e-extensions](w5e-extensions.md) 顶部的「扩展与 format 互通」
    与「重启 format」）
    - 范围：control 进程（hello 回复里的 `control.args`、独立进程的启动与退役、实例 IPC 的转交、桌面命令）；单独重启 format
@@ -104,6 +108,10 @@
    - 验收：用测试 format 测有无 `control.args`、超时只换 control 进程、超长、control 进程崩溃不影响请求；重启全部或某个条目时
      在途请求与进行中的流不受影响、新消息落到新进程（看 pid）、改过的角色文件被新进程读到、熔断被清零、握手失败如实报告；
      两个变体全量过。CLI 的参数写法与输出先列在回执里，由主代理审。
+   - 状态：已派出（2026-11-23，任务书 `.agents/codex.local/t10c-format-control.md`，分支 `codex/t10c-format-control`，起点 master
+     `3e47277e`，新会话）。开工前先构建界面与带界面的 aproxy.exe，拷到 `.agents/codex.local/desktop-t10b/`，供主代理在临时 home
+     里做真实窗口验证。两个新的实例 IPC 操作属于只增不改的 0.2 实例协议，要求在 `src/daemon.rs` 单测与
+     `tests/contract_v0_2.rs` 里钉住形状，`restart --format` 的 `--json` 进 `tests/json_docs.rs`。
 9a. **随 t10b 顺带**：`cargo update -p url`（到 ≥2.5.9）。RUSTSEC-2026-0592（`Url::origin()` 对嵌套
    `blob:` 递归、栈溢出），2026-11-22 起 main 的 Review 工作流（cargo-deny）因此失败；aproxy-format 的 convert/keys/route
    对配置与上游地址调用 `origin()`，都不是客户端给的输入，风险低。只动 Cargo.lock，验收是 cargo-deny 过、两个变体全量过。

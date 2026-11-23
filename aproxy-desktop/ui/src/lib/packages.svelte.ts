@@ -160,7 +160,11 @@ class Packages {
   async beginFile(file: File): Promise<void> {
     if (this.busy) return;
     if (file.size > MAX_FILE) {
-      this.flow = { step: 'failed', name: file.name, failure: { code: 'package_read', details: { reason: 'too-large' } } };
+      this.flow = {
+        step: 'failed',
+        name: file.name,
+        failure: { code: 'desktop_package', details: { reason: 'limit', field: null, path: null, limit: 'zip-bytes', max: MAX_FILE } },
+      };
       return;
     }
     this.flow = { step: 'reading', name: file.name };

@@ -12,6 +12,7 @@ import type {
   GithubFacts,
   PackageCheck,
   PackageEntry,
+  PackageIssue,
   PackageManifest,
   PackageSource,
   Token,
@@ -24,6 +25,11 @@ function later<T>(value: T, ms = 25): Promise<T> {
 
 function fault<C extends Fault['code']>(code: C, details: Extract<Fault, { code: C }>['details']): Fault {
   return { code, details } as Fault;
+}
+
+/** desktop_package：用不到的细节与 Rust 一样给 null */
+function pkgFault(reason: PackageIssue['reason'], extra: Partial<Omit<PackageIssue, 'reason'>> = {}): Fault {
+  return fault('desktop_package', { reason, field: null, path: null, limit: null, max: null, ...extra });
 }
 
 const DAY = 86_400_000;
@@ -259,7 +265,8 @@ function list(): PackageEntry[] {
 
 function extension(id: string): Installed {
   const i = installed.get(id);
-  if (!i || i.entry.kind !== 'extension') throw fault('package_unknown', { id });
+  if (!i) throw pkgFault('not-installed');
+  if (i.entry.kind !== 'extension') throw pkgFault('not-extension');
   return i;
 }
 
@@ -419,8 +426,8 @@ const SCENARIOS: Record<string, Scenario> = {
 
 /** 这些关键词直接以错误结束：演示读包失败时的提示 */
 const BROKEN: Record<string, Fault> = {
-  broken: fault('package_layout', { reason: 'not-allowed', path: 'bin/helper.exe' }),
-  notzip: fault('package_read', { reason: 'not-zip' }),
+  broken: pkgFault('unexpected-file', { path: 'bin/helper.exe' }),
+  notzip: pkgFault('archive'),
 };
 
 function scenarioOf(name: string): Scenario | Fault {
@@ -442,7 +449,7 @@ let pending: { token: Token; p: Pending } | null = null;
 let seq = 0;
 
 function take(token: Token): Pending {
-  if (!pending || pending.token !== token || pending.p.expires < Date.now()) throw fault('package_token', {});
+  if (!pending || pending.token !== token || pending.p.expires < Date.now()) throw pkgFault('token');
   return pending.p;
 }
 
@@ -450,7 +457,7 @@ function check(scenario: Scenario | Fault, source: PackageSource): Promise<Packa
   if ('code' in scenario) return Promise.reject(scenario);
   const m = scenario.manifest;
   const old = installed.get(m.id);
-  if (old && old.entry.kind !== m.kind) return Promise.reject(fault('package_kind_changed', { installed: old.entry.kind }));
+  if (old && old.entry.kind !== m.kind) return Promise.reject(pkgFault('kind-change'));
   const files = [{ path: 'manifest.json', bytes: 412 }, ...Object.entries(scenario.files).map(([path, text]) => ({ path, bytes: Math.max(text.length, 1_200) }))].sort((a, b) =>
     a.path.localeCompare(b.path),
   );
@@ -520,14 +527,14 @@ export const packageHandlers = {
 
   package_set_enabled: ({ id, enabled: on }: { id: string; enabled: boolean }) => {
     const i = installed.get(id);
-    if (!i) return Promise.reject(fault('package_unknown', { id }));
-    if (i.entry.kind !== 'extension') return Promise.reject(fault('desktop_bad_input', {}));
+    if (!i) return Promise.reject(pkgFault('not-installed'));
+    if (i.entry.kind !== 'extension') return Promise.reject(pkgFault('not-extension'));
     enabled = on ? (enabled.includes(id) ? enabled : [...enabled, id]) : enabled.filter((x) => x !== id);
     return later(entryOf(i));
   },
 
   package_uninstall: ({ id, removeData }: { id: string; removeData: boolean }) => {
-    if (!installed.delete(id)) return Promise.reject(fault('package_unknown', { id }));
+    if (!installed.delete(id)) return Promise.reject(pkgFault('not-installed'));
     enabled = enabled.filter((x) => x !== id);
     if (removeData) {
       settings.delete(id);
@@ -570,13 +577,13 @@ export const packageHandlers = {
   extension_file_read: ({ id, name }: { id: string; name: string }) => {
     extension(id);
     const f = files.get(id)?.get(name);
-    if (!f) return Promise.reject(fault('extension_data', { reason: 'name', max: null }));
+    if (!f) return Promise.reject(pkgFault('missing', { path: name }));
     return later(f.bytes.slice());
   },
 
   extension_file_write: ({ id, name, bytes }: { id: string; name: string; bytes: Uint8Array }) => {
     extension(id);
-    if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/.test(name) || name.endsWith('.')) return Promise.reject(fault('extension_data', { reason: 'name', max: null }));
+    if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/.test(name) || name.endsWith('.')) return Promise.reject(fault('desktop_bad_input', {}));
     let dir = files.get(id);
     if (!dir) files.set(id, (dir = new Map()));
     const f = { bytes: bytes.slice(), modifiedAt: Date.now() };

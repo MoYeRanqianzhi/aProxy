@@ -637,8 +637,11 @@ export type ReleaseFacts =
   | { state: 'not-a-file' }
   | { state: 'unreachable'; reason: Unreachable; status: number | null };
 
-/** 已装的包为什么用不了：manifest 读不了或不合格、入口文件不见了（多半是被手改过） */
-export interface PackageIssue {
+/**
+ * 已装的包为什么用不了：manifest 读不了或不合格、入口文件不见了或坏了（多半是被手改过）、读文件出错。
+ * 页面按它给出修复的说法；有它的包不能启用、不能选作主题，只能卸载或重装
+ */
+export interface EntryIssue {
   reason: 'manifest' | 'entry' | 'io';
 }
 
@@ -653,7 +656,7 @@ export interface PackageEntry {
   installedAt: Time | null;
   source: PackageSource | null;
   github: GithubFacts | null;
-  issue: PackageIssue | null;
+  issue: EntryIssue | null;
   /** 扩展的数据目录有多大（卸载时问要不要一起删） */
   dataBytes: number;
   /** 主题包的 theme.json */
@@ -713,6 +716,69 @@ export interface Frame {
 
 type F<C extends string, D = None> = C extends unknown ? { code: C; details: D } : never;
 
+/**
+ * 包与扩展数据的操作为什么被拒（desktop_package 的 details）。reason 是稳定的类别，界面按它选句子；其余几项只在相关时有值：
+ * field 是 manifest 里出错的字段，path 是包里的相对路径或扩展数据的文件名（清理过、至多 200 个字符，从不是本机的绝对路径），
+ * limit 与 max 是超出的哪一项上限与它的值（files、extension-files 是个数，其余是字节数）。
+ * 比本版本新的 Rust 可能给出这里没列出的 reason 或 limit，界面落到通用的说法上
+ */
+export interface PackageIssue {
+  reason: PackageReason;
+  field: string | null;
+  path: string | null;
+  limit: PackageLimit | null;
+  max: number | null;
+}
+
+export type PackageReason =
+  // zip 本身：不是合格的 zip、加了密码、压缩方式不支持、成员读不出来、实际大小与声明不符
+  | 'archive'
+  | 'encrypted'
+  | 'compression'
+  | 'content'
+  | 'size-mismatch'
+  // 包里的内容：不安全的路径、重复或只差大小写、链接、类型不对、这种包不允许的文件、缺少必需的文件、不是文本、不是 JSON 对象
+  | 'path'
+  | 'collision'
+  | 'link'
+  | 'file-type'
+  | 'unexpected-file'
+  | 'missing'
+  | 'text'
+  | 'json'
+  // manifest：某个字段缺失或不合格（看 field）、包格式比本版本新
+  | 'field'
+  | 'unsupported-schema'
+  // 安装、启用与扩展数据：换种类、不在了、不是扩展、坏包不能启用、安装句柄失效、检查后变了、存储坏了、读写出错、出错后没能恢复
+  | 'kind-change'
+  | 'not-installed'
+  | 'not-extension'
+  | 'manifest'
+  | 'entry'
+  | 'token'
+  | 'changed'
+  | 'corrupt-storage'
+  | 'io'
+  | 'rollback'
+  // 超出上限（看 limit 与 max）
+  | 'limit';
+
+export type PackageLimit =
+  | 'files'
+  | 'extension-files'
+  | 'zip-bytes'
+  | 'file-bytes'
+  | 'total-bytes'
+  | 'json-bytes'
+  | 'settings-bytes'
+  | 'css-bytes'
+  | 'storage-bytes'
+  | 'extension-bytes'
+  | 'records-bytes';
+
+/** 窗口自己的私有文件：读写出错（desktop_state_io）或损坏后被重置（desktop_state_reset）时说是哪一个 */
+export type StateFile = 'preferences' | 'packages' | 'bookmarks';
+
 type InstallSimple =
   | 'install_in_progress'
   | 'install_version_not_found'
@@ -751,33 +817,12 @@ export type Fault =
   | F<'desktop_config', { diagnostics: Issue[] }>
   | F<'desktop_start', { reason: 'spawn' | 'not-ready'; oldStopped: boolean }>
   | F<'desktop_stop', { port: number; reason: 'still-running' | 'unverified' | 'permission' | 'failed' }>
-  | F<'desktop_state_io' | 'desktop_state_reset', { file: 'bookmarks' }>
+  | F<'desktop_state_io' | 'desktop_state_reset', { file: StateFile }>
   | F<'desktop_limit', { resource: 'bookmark-count' | 'bookmark-bytes'; max: number }>
-  /** desktop.toml 这时写不了（语法错、太大、读不了）：文件原样不动，等用户改好 */
-  | F<'desktop_toml', { issue: TomlIssue }>
-  // 以下几个包与扩展数据的码是 Rust 一侧实现之前按任务书先写的，实现交回后按它的码表对齐
-  | F<'package_read', { reason: 'io' | 'too-large' | 'not-zip' | 'compression' | 'encrypted' | 'bomb' }>
-  | F<
-      'package_layout',
-      {
-        reason:
-          | 'no-manifest'
-          | 'path'
-          | 'link'
-          | 'duplicate'
-          | 'too-many-files'
-          | 'file-too-large'
-          | 'too-large'
-          | 'not-allowed'
-          | 'missing-entry';
-        path: string | null;
-      }
-    >
-  | F<'package_manifest', { field: string; reason: 'missing' | 'invalid' | 'unsupported' | 'duplicate-key' | 'json' }>
-  | F<'package_kind_changed', { installed: PackageKind }>
-  | F<'package_token'>
-  | F<'package_unknown', { id: string }>
-  | F<'extension_data', { reason: 'corrupt' | 'name' | 'limit'; max: number | null }>
+  /** desktop.toml 这时写不了（语法错、太大、读不了）：文件原样不动，等用户改好。details 就是那条问题本身 */
+  | F<'desktop_toml', TomlIssue>
+  /** 包与扩展数据：装不了、用不了、超出上限 */
+  | F<'desktop_package', PackageIssue>
   | F<
       'desktop_registration',
       {

@@ -6,7 +6,7 @@
   让人回头也看得出当初装的是什么。扩展的运行状态（运行中、出错了）来自扩展宿主。
 -->
 <script lang="ts">
-  import { t, bytes, fmtNum } from '../lib/i18n';
+  import { t, bytes, fmtNum, hasMessage } from '../lib/i18n';
   import { ui } from '../lib/state.svelte';
   import { overlays } from '../lib/overlays.svelte';
   import { packages, packageName, textOf } from '../lib/packages.svelte';
@@ -93,6 +93,12 @@
   /** 1.2k 这样的短写法：列表上的标签放不下长数字 */
   function compact(n: number): string {
     return new Intl.NumberFormat(ui.lang, { notation: 'compact', maximumFractionDigits: 1 }).format(n);
+  }
+
+  /** 坏包为什么用不了、怎么修：按 Rust 给的原因选说法；新版本多出来的原因按 manifest 的说法讲（重装都能修好） */
+  function brokenWhy(e: PackageEntry): string {
+    const key = `set.pkg.brokenWhy.${e.issue?.reason ?? 'manifest'}`;
+    return t(hasMessage(key) ? key : 'set.pkg.brokenWhy.manifest');
   }
 
   function status(e: PackageEntry): { text: string; tone: string } {
@@ -201,7 +207,7 @@
                 <p class="note coral"><Icon name="alert" size={14} />{t('set.pkg.failedWhy', { message: run.message })}</p>
               {/if}
               {#if e.issue || !e.manifest}
-                <p class="note coral"><Icon name="alert" size={14} />{t('set.pkg.brokenWhy')}</p>
+                <p class="note coral"><Icon name="alert" size={14} />{brokenWhy(e)}</p>
               {/if}
               {#if !e.source}
                 <p class="note warn"><Icon name="alert" size={14} />{t('set.pkg.manualTitle')}</p>

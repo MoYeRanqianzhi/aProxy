@@ -471,7 +471,7 @@ const handlers: Handlers = {
     }),
 
   async set_preferences({ changes }) {
-    if (tomlBroken) throw fault('desktop_toml', { issue: { ...TOML_ISSUE } });
+    if (tomlBroken) throw fault('desktop_toml', { ...TOML_ISSUE });
     preferences = { ...preferences, ...changes };
     return later({ ...preferences });
   },

@@ -974,7 +974,16 @@ async fn chain_runs_request_in_order_and_response_and_heartbeat_in_reverse() {
 fn snapshot_lists_formats_with_their_breaker() {
     let (_home, out) = start("echo", true);
     assert!(out.status.success(), "{out:?}");
-    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    // 先逐项核对控制与换代字段；余下的对象仍须完全等于原协议样本，不能漏查未知字段。
+    let facts = doc["instance"]["formats"][0].as_object_mut().unwrap();
+    for (key, value) in [
+        ("program", serde_json::json!("format-echo")),
+        ("control", Value::Bool(false)),
+        ("restarted_at", Value::Null),
+    ] {
+        assert_eq!(facts.shift_remove(key), Some(value), "{key}");
+    }
     assert_eq!(
         doc["instance"]["formats"][0],
         serde_json::json!({"name":"test-layer","stages":["request"],"required":true,"process":"spawn","protocol":1,"version":"1.0","breaker":{"state":"closed","failures":0}})

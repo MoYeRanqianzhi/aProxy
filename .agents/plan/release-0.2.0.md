@@ -1266,3 +1266,11 @@
   - **边界：** 这里没有 format 的 control 进程（t10c），页面一侧由主代理另做（`596bb92c`，错误对齐在 `3e47277e`）。GitHub API
     的测试只走回环地址。真实窗口里的拖放、相对路径的字体与模块、注入的样式、重新激活，以及 macOS 原生的进程存活判断，
     留给主代理与 CI。
+- **W5e——format 的 control 进程与单独重启（Rust 一侧，t10c，2026-11-24）。** 每个条目可以另起一个 control 进程；命令行与
+  窗口可以只重启选中的 format，不换实例、不打断在途的流式响应、不重读 `config.toml`。spawn 模式的消息可以并发到 `pool_max`。
+  桌面按运行实例列出条目，包地址的第一段可以带激活代号（`<id>~<generation>`），让相对路径的资源换代时拿到新的缓存键。
+  见[协议与窗口契约](w5e-extensions.md#format-control-and-restart-as-built)。
+  - **验证：** Windows 上两种全量测试各为 1,303 通过、0 失败、11 忽略；headless、带界面与交叉编译到 Linux 的全目标 Clippy
+    都在拒绝警告的设置下通过（Linux 只编译，没有执行测试）。
+  - **边界：** control 改动何时影响请求进程由 format 作者决定。扩展 API、实例卡片，以及相对模块与字体换代在各个真实 webview
+    里的表现，归页面一侧。

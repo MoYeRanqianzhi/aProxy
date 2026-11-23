@@ -46,3 +46,4 @@
 - [Desktop extension trust](memory/desktop-extension-trust.md) -- 扩展包与主题包不做沙箱与授权，只在安装前逐条弹窗讲清风险（用户 2026-11-23 裁定）。
 - [Security contributions](memory/security-contributions.md) -- 给审查 skill 补危险信号：只增不减、先查重，PR 披露发现来源与 AI 参与程度；默认 PR 模板对所有 PR 问简版披露（用户 2026-11-23）。
 - [Desktop package origins and provenance](memory/desktop-package-origins.md) -- 包资源的地址要保留层级、style-src 不能带 nonce；仓库事实只有在原始 ZIP 的摘要对上 release asset 时才描述这个包。
+- [Format process generations](memory/format-process-generations.md) -- 单独重启 format 时，哪些状态要跨代保留、哪些不能，旧的流式响应怎样收尾。

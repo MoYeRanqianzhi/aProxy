@@ -370,7 +370,9 @@ Faults have `{code,details}`. Do not parse OS messages or treat failed GitHub ve
 
 ### Resource URLs, CSP and drops
 
-Serve `http://aproxy-pkg.localhost/<id>/<path>` on Windows and `aproxy-pkg://localhost/<id>/<path>` on macOS/Linux. Construct the **origin and first segment** with `convertFileSrc(id, 'aproxy-pkg')`, then append `'/' + path.split('/').map(encodeURIComponent).join('/')`. Do not pass the whole nested path to `convertFileSrc`: Tauri encodes its slashes. Query and fragment do not enter lookup. Import `main.mjs?v=<version>&n=<activation-counter>` on reactivation or upgrade; the ES module map is keyed by URL even when HTTP caching is disabled.
+Serve `http://aproxy-pkg.localhost/<first>/<path>` on Windows and `aproxy-pkg://localhost/<first>/<path>` on macOS/Linux. For reactivation and upgrades use `<id>~<generation>` as the first segment: `convertFileSrc(id + '~' + generation, 'aproxy-pkg')`, then append `'/' + path.split('/').map(encodeURIComponent).join('/')`. Tauri would encode the slashes if passed the entire path. Choose a distinct generation for the activation. Unlike a query on `main.mjs`, this prefix survives relative resolution: nested imports, images and fonts now have distinct browser cache keys too. Query and fragment still do not enter file lookup.
+
+The handler decodes the first segment once (`%7E` works), splits at `~`, and looks up only the installed ID. The generation is 1–64 ASCII bytes from `[A-Za-z0-9._-]`; empty, invalid or multiple generations give an empty 404. Legacy `<id>/<path>` still works. The suffix grants no access to staging/retired directories and changes neither bytes nor headers.
 
 GET returns the bytes; HEAD gives the same headers, no body. Unsupported method: 405. Missing, unrepresentable or unsafe paths, links and internal staging IDs: empty 404. Decode path segments exactly once; encoded separators cannot create hierarchy. Responses include `Content-Length`, `Access-Control-Allow-Origin: *` (module and font CORS), `X-Content-Type-Options: nosniff` and `Cache-Control: no-cache`. I/O runs off the window thread. Content types (case-insensitive): `mjs/js` → `text/javascript; charset=utf-8`, `css` → `text/css; charset=utf-8`, `json` → `application/json`, `svg` → `image/svg+xml`, `png/webp/gif/avif` → corresponding `image/*`, `jpg/jpeg` → `image/jpeg`, `woff2/woff/ttf/otf` → corresponding `font/*`, `wasm` → `application/wasm`, `html/htm` → `text/html; charset=utf-8`, `txt/md` → `text/plain; charset=utf-8`, otherwise `application/octet-stream`.
 
@@ -392,5 +394,97 @@ Tauri 2.12.3's manager controls script/style CSP modification separately. Disabl
 
 1. Start the built app in a **disposable home**. Pick a ZIP with a non-ASCII filename and separately drop the ZIP and an unpacked directory. Confirm the inventory before any network result, cancel at each warning in turn, and check nothing was installed. Repeat to completion. Verify the page distinguishes a digest match, an unverified named repository and a hand copy with no source.
 2. Activate a theme with CSS referencing a relative image and font; inspect the request origin, CORS, MIME and applied style in each platform engine. Refocus after a valid edit to `desktop.toml`, then after a syntax error: keep the previous appearance, show the issue and refuse a save until repaired.
-3. Enable an extension importing `./assets/lib.mjs`. In the main page verify its relative assets, injected shadow-root style, and binary file write/read. Disable, upgrade the entry to visibly different behavior and re-enable. Inspect the activation-counter URL and confirm the changed code actually ran. Check the stored settings/files survive upgrade and disappear only after choosing removal of data.
+3. Enable an extension importing `./assets/lib.mjs`. In the main page verify its relative assets, injected shadow-root style, and binary file write/read. Disable, upgrade the entry to visibly different behavior and re-enable. Inspect the generation segment on both module URLs and confirm the upgraded nested code actually ran. Check the stored settings/files survive upgrade and disappear only after choosing removal of data.
 4. Try an external top-level navigation, popup and download: all remain denied. Inspect the shipped CSP header (no style nonce/hash), confirm native drops still arrive after listener teardown/re-registration, and repeat package URL, module and font checks on WebView2 and both WebKit hosts. The Rust tests do not substitute for these engine checks.
+
+## Format control and restart (as built)
+
+This is an instance interface, separate from package installation. Use `[[format]].name` to select an **entry**. Use the hello reply's `name` (`program` in a view) to discover an author's extension. Two entries can run the same program; keep both, and send mutations to the entry and run the user selected. A control call does not by itself change a running worker: the author defines the methods, storage, and when changes take effect. The official role programs read their role file at process start: restart the entry after editing that file. Changing `[[format]]` itself still requires restarting the instance.
+
+### Format program: a separate control process
+
+A protocol-1 worker's hello reply can include `"control":{"args":["control-mode"]}`. Omit it if the program offers no control. The list may be empty; at most 32 strings, each at most 4096 UTF-8 bytes. A malformed offer invalidates the hello. The first call starts the same executable in the workers' directory and environment, **substituting** these arguments for the configured ones. Its hello has `seq:0`, `process:"persistent"`, `stages:["control"]`, `worker_id:4294967295`; the reply must list `control` in `stages`. Ordinary spawn workers still see ID 0. Neither the control process nor a pinned stream consumes a request worker slot.
+
+Exchange one UTF-8 JSON object per line. After hello, `seq` starts at 1 and advances once per valid reply. For example, the request and two alternative replies are:
+
+```jsonl
+{"v":1,"seq":1,"stage":"control","method":"settings.read","params":null}
+{"v":1,"seq":1,"result":{"enabled":true}}
+{"v":1,"seq":1,"fail":{"code":"unconfigured","reason":"No profile selected"}}
+```
+
+`method` matches `[A-Za-z0-9._-]{1,64}`. `params` is required, may be any JSON value (including null), and is limited to 65,536 bytes of compact serialized JSON. It is passed unchanged. Reply limits include the newline: 64 KiB for hello and `limits.control` (1 MiB) for the call. A valid `fail` does not end the session. Before returning either alternative, the instance replaces known secrets in string values, object keys, and both strings of a `fail`; a collision of redacted keys is a protocol fault, not permission to discard data.
+
+One call runs and at most 16 wait **per entry**; the next is refused. The five-second deadline includes waiting, launch, hello and exchange. A caller that expires in the queue does not kill the active caller's process. Timeout during the exchange, wrong sequence, malformed/oversized reply or process death discards that process; the next call starts a fresh one. The idle process receives EOF after five minutes. A restart or shutdown retires it too. None of this opens the request breaker or occupies a request worker.
+
+### Instance IPC (v1)
+
+Read `ping.result.ops` first. Only send a mutating op to the verified instance that advertised it, not a new occupant of the same port. Use the ordinary success or error envelope; example request lines and replies (each is a separate line):
+
+```jsonl
+{"v":1,"op":"restart_formats","args":{"names":["keys"]}}
+{"v":1,"ok":true,"result":{"configReloaded":false,"entries":[{"outcome":"restarted","name":"keys","program":"keys","version":"1"}]}}
+{"v":1,"op":"restart_formats","args":{"names":null}}
+{"v":1,"ok":true,"result":{"configReloaded":false,"entries":[{"outcome":"handshake-failed","name":"keys","reason":"invalid_output"}]}}
+{"v":1,"op":"format_control","args":{"name":"keys","method":"settings.read","params":null}}
+{"v":1,"ok":true,"result":{"result":null}}
+{"v":1,"ok":true,"result":{"fail":{"code":"unconfigured","reason":"No profile selected"}}}
+{"v":1,"ok":false,"error":{"code":"format_control_error","message":"format control failed: no-control","details":{"reason":"no-control"}}}
+```
+
+`names:null` means every configured entry, possibly none. A non-empty list selects names case-sensitively; `"all"` is not an entry name. Missing `names` is not authorization to restart all. Resolve the whole selection before changing anything. Return each selected entry once in configuration order. Each replacement probes from the instance's existing configuration; the publication of that replacement is the cutover. Old messages and streams finish on their original processes. A successful restart starts with a closed breaker and zero failures. On handshake failure the instance remains up: optional entries can be bypassed, required entries follow the existing unavailable/open-breaker behavior, notify-only entries use their own breaker, and a disabled breaker still permits later attempts. `reason` is the format fault kind (e.g. `spawn`, `io`, `died`, `timeout`, `protocol`, `invalid_output`), not localized prose.
+
+`ping.result.formats` and the live `status --json` entry snapshot expose `program` and `version` once negotiated, `control` (false without an offer), and `restarted_at` (null until an explicit restart; the epoch-millisecond timestamp is set even on a failed attempt). The enumerated `status.formats` array is omitted when empty. Do not use program names as unique row keys or expose command arguments through the page view.
+
+### CLI
+
+`aproxy restart <PORT|ALIAS|all|idle> --format all` restarts all entries of each selected instance. Repeat `--format NAME` for a subset. Do not combine the format selector with `--force`, `--idle-threshold-secs`, or `all` plus individual format names. The instance is never restarted by a format selection.
+
+| Notice | English | Chinese |
+|---|---|---|
+| Restarted | `Port {port}: restarted format {name} ({program} {version}).` | `端口 {port}：已重启 format {name}（{program} {version}）。` |
+| Handshake failure | `Port {port}: format {name} handshake failed: {reason}.` | `端口 {port}：format {name} 握手失败：{reason}。` |
+| Older instance | `Port {port}: this instance does not support restarting formats.` | `端口 {port}：此实例不支持单独重启 format。` |
+| Other refusal | `Port {port}: could not restart formats: {message}` | `端口 {port}：无法重启 format：{message}` |
+| Selection error | `Use --format all alone, or specify one or more format names.` | `请单独使用 --format all，或指定一个或多个 format 条目名。` |
+| Configuration notice | `config.toml was not reloaded; restart the instance to change a [[format]] entry.` | `未重读 config.toml；修改 [[format]] 条目须重启实例。` |
+
+With `--json`, stdout is one schema-1 document and notices go to stderr. Example mixed result:
+
+```json
+{"schema":1,"results":[{"target":"work","port":19901,"outcome":"restarted","name":"keys","program":"keys","version":"1","configReloaded":false},{"target":"work","port":19901,"outcome":"handshake-failed","name":"other","reason":"invalid_output","configReloaded":false}],"summary":{"ok":1,"failed":1}}
+```
+
+An instance-wide refusal instead produces one `outcome:"failed"` result with the ordinary nested `error`. Exit 0 for all successes, 1 for format failures only, 5 for mixed success/failure, 2 for invalid selection/flags. Ordinary target resolution retains its own exit codes. `configReloaded:false` on an entry is not a failed config reload; none was attempted.
+
+### Window commands and faults
+
+```ts
+type Run = { port: number; instanceId: string };
+type FormatView = {
+  name: string; program: string | null; version: string | null;
+  process: 'spawn' | 'persistent'; stages: string[]; required: boolean;
+  breaker: 'closed' | 'open' | 'probing'; control: boolean; restartedAt: number | null;
+};
+type RestartOutcome =
+  | { name: string; outcome: 'restarted'; program: string | null; version: string | null }
+  | { name: string; outcome: 'handshake-failed'; reason: string };
+type FormatCommands = {
+  format_list:    [{ run: Run }, FormatView[]];
+  format_restart: [{ run: Run; names: string[] | null }, RestartOutcome[]];
+  format_call:    [{ run: Run; name: string; method: string; params: unknown }, unknown];
+};
+```
+
+`format_list` is a separate read for the instance page rather than a change to every card. It projects snapshot `half_open` as `probing`; absent hello facts or restart time become null. `format_call` resolves the actual JSON result, **not** `{result:…}`; a valid program failure rejects with the author's redacted details. Keep error layers distinct:
+
+| Code | Details and meaning |
+|---|---|
+| `format_name_reserved` | Config diagnostic `{name:"all"}`: choose another entry name. |
+| `unknown_format` | IPC `{name}`: no matching entry; the whole selection was refused. |
+| `format_control_error` | IPC `{reason}`: `no-control` (no offer/retired), `busy` (queue full), `timeout` (deadline), `protocol` (bad session/exit), `too-large` (params or reply), `spawn` (cannot start the process). |
+| `bad_request`, `unsupported_arg`, `invalid_state`, `unknown_op` | Ordinary IPC validation, unexpected keys, non-serving state, or unavailable operation; check `ops` before sending. |
+| `format_restart_failed` | CLI `{port,reason}`: one instance-wide refusal; the reason is the remote code, `run_changed`, or `ipc`. |
+| `desktop_format` | Window `{reason}`: the six host-side control reasons above, `unknown-format`, or `unsupported` (older instance). |
+| `desktop_format_fail` | Window `{code,reason}`: valid program-level refusal. Neither value is a host enum. |
+| `desktop_bad_input`, `desktop_changed`, `desktop_busy`, `desktop_unavailable` | Existing window faults for invalid arguments, stale selection, state change in progress, or unavailable transport/response respectively. The usual run-selection faults also apply. |

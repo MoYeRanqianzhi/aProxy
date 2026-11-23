@@ -314,7 +314,9 @@
                   {#if src.icon === 'hourglass'}<span class="spinner tiny" aria-hidden="true"></span>{:else}<Icon name={src.icon} size={14} stroke={2.4} />{/if}
                   {src.text}
                 </span>
-                {#if review.facts?.state === 'checked'}
+                <!-- 仓库的 star、创建时间与许可证只在 release 摘要对上这个文件时才说明这个包：没对上时谁都可以在 manifest 里
+                     写一个知名仓库借它的数字，所以这里不列，只留上面的地址与「没能核对」 -->
+                {#if review.facts?.state === 'checked' && review.facts.release.state === 'match'}
                   {@const r = review.facts.repo}
                   <span class="repo-facts">
                     <span><Icon name="star" size={13} />{t('install.source.stars', { n: fmtNum(r.stars) })}</span>

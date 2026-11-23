@@ -169,6 +169,8 @@
     <p>{store.readFault ? faultText(store.readFault) : t('ov.connecting')}</p>
   </section>
 {:else if store.cards.length === 0}
+  <!-- 扩展挂在总览顶上的内容，没有实例时也照样显示：否则扩展的作者看不出它为什么没出来；要不要在空状态下显示什么，由扩展自己按实例列表决定 -->
+  <ExtensionMounts point="overview.top" />
   <!-- 空状态：没有任何实例。吉祥物在睡觉，给出唯一的下一步 -->
   <section class="empty">
     {#if mascots.current}<MascotView mood="sleeping" size="hero" px={150} />{/if}

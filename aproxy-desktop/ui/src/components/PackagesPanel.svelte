@@ -126,15 +126,13 @@
         return t('install.source.repoMissing');
       case 'checked': {
         const r = g.release;
-        const head =
-          r.state === 'match'
-            ? t('install.source.match', { tag: r.tag })
-            : r.state === 'mismatch'
-              ? t('install.source.mismatch', { tag: r.tag })
-              : r.state === 'not-a-file'
-                ? t('install.source.dir')
-                : t('install.source.unverified');
-        return `${head} · ${t('install.source.stars', { n: fmtNum(g.repo.stars) })}`;
+        // star 数只在摘要对上时附上：没对上时它是 manifest 里写的那个仓库的数字，说明不了这个包
+        if (r.state === 'match') return `${t('install.source.match', { tag: r.tag })} · ${t('install.source.stars', { n: fmtNum(g.repo.stars) })}`;
+        return r.state === 'mismatch'
+          ? t('install.source.mismatch', { tag: r.tag })
+          : r.state === 'not-a-file'
+            ? t('install.source.dir')
+            : t('install.source.unverified');
       }
     }
   }

@@ -99,7 +99,9 @@
    - 结果（2026-11-23）：完成，Gate F 两个变体各 1,290 通过、0 失败、11 忽略。代码按惯例逐个 cherry-pick 进 master
      （`b11540a9..dfde3220`，与分支上通过检查的代码逐字节相同），文档提交 `dcc02534`。前端随即对齐了 Rust 的错误
      （`desktop_package` 的原因、`desktop_toml` 的细节，`3e47277e`）。剩下的：真实窗口验证（步骤在 w5e 计划的
-     「Real-window qualification」），macOS 上两个原生用例等 CI 确认。
+     「Real-window qualification」）。macOS 上那两个原生用例已由 CI 确认（运行 45098815028：macOS 的库测试 458 个全过）；
+     同一次运行里 `cargo test` 接着跑到了 `tests/cli_tree.rs`，暴露出一个以前被挡住的 macOS 专有失败（期望路径没按
+     `/private/var` 解析），交给 t10c 的 Revision 1.2。
 9c. **t10c：format 的运行时控制**（t10b 之后，Rust 侧；设计见 [w5e-extensions](w5e-extensions.md) 顶部的「扩展与 format 互通」
    与「重启 format」）
    - 范围：control 进程（hello 回复里的 `control.args`、独立进程的启动与退役、实例 IPC 的转交、桌面命令）；单独重启 format
@@ -112,6 +114,8 @@
      `3e47277e`，新会话）。开工前先构建界面与带界面的 aproxy.exe，拷到 `.agents/codex.local/desktop-t10b/`，供主代理在临时 home
      里做真实窗口验证。两个新的实例 IPC 操作属于只增不改的 0.2 实例协议，要求在 `src/daemon.rs` 单测与
      `tests/contract_v0_2.rs` 里钉住形状，`restart --format` 的 `--json` 进 `tests/json_docs.rs`。
+   - 任务书修订：Revision 1.1（真实窗口验证发现扩展升级后子模块不更新：包地址第一段允许 `<id>~<代次>`，Rust 只按 id 找文件，
+     放在第 4 部分）；Revision 1.2（上面那个 macOS 测试期望路径的修正，单独一个 `test:` 提交）。
 9a. **随 t10b 顺带**：`cargo update -p url`（到 ≥2.5.9）。RUSTSEC-2026-0592（`Url::origin()` 对嵌套
    `blob:` 递归、栈溢出），2026-11-22 起 main 的 Review 工作流（cargo-deny）因此失败；aproxy-format 的 convert/keys/route
    对配置与上游地址调用 `origin()`，都不是客户端给的输入，风险低。只动 Cargo.lock，验收是 cargo-deny 过、两个变体全量过。

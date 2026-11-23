@@ -1114,3 +1114,74 @@ async fn restore_publication_and_conditional_forget_exclude_each_other() {
         Forget::Removed
     ));
 }
+
+/// 使用与页面相同的宿主接口核对 DTO、作者失败与陈旧 Run；配置不必改写，实例 PID 不变。
+#[tokio::test]
+async fn format_window_commands_project_one_selected_run() {
+    use aproxy_ipc::desktop::*;
+    let h = TestHome::new();
+    h.settings(r#"{"watchdog":{"enabled":false}}"#);
+    let cfg = h.path().join("config.toml");
+    std::fs::write(&cfg,format!("base_url='http://127.0.0.1'\nlisten_addr='127.0.0.1:0'\n[[format]]\nname='role'\ncommand={}\nargs=['control-role']\nprocess='persistent'\nstages=['request']\nrequired=true",json!(common::format_echo_path()))).unwrap();
+    let host = DesktopHome::new(h.path().into(), env!("CARGO_BIN_EXE_aproxy").into()).unwrap();
+    let choices = host.list_configs().await.unwrap();
+    let run = host
+        .start_instance(
+            choices
+                .into_iter()
+                .find(|c| c.target.kind == ChoiceKind::Default)
+                .unwrap()
+                .target,
+        )
+        .await
+        .unwrap();
+    h.stop_on_drop(run.port);
+    let list = host.format_list(run.clone()).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(list).unwrap(),
+        json!([{"name":"role","program":"format-echo","version":"1.0","process":"persistent","stages":["request"],"required":true,"breaker":"closed","control":true,"restartedAt":null}])
+    );
+    let out = h
+        .cmd()
+        .args(["status", "--json"])
+        .output()
+        .report_exit()
+        .unwrap();
+    let doc = common::output_document(&out);
+    let entry = &doc["instances"][0]["status"]["formats"][0];
+    assert_eq!(entry["program"], "format-echo");
+    assert_eq!(entry["control"], true);
+    let call =
+        |method: &str| host.format_call(run.clone(), "role".into(), method.into(), json!({"x":1}));
+    assert_eq!(call("echo").await.unwrap(), json!({"x":1}));
+    assert_eq!(
+        serde_json::to_value(call("fail").await.unwrap_err()).unwrap(),
+        json!({"code":"desktop_format_fail","details":{"code":"refused","reason":"author declined"}})
+    );
+    assert_eq!(
+        serde_json::to_value(host.format_restart(run.clone(), None).await.unwrap()).unwrap(),
+        json!([{"name":"role","outcome":"restarted","program":"format-echo","version":"1.0"}])
+    );
+    assert!(
+        host.format_list(run.clone()).await.unwrap()[0]
+            .restarted_at
+            .is_some()
+    );
+    let missing = host
+        .format_restart(run.clone(), Some(vec!["missing".into()]))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        serde_json::to_value(missing).unwrap(),
+        json!({"code":"desktop_format","details":{"reason":"unknown-format"}})
+    );
+    let stale = Run {
+        instance_id: "another".into(),
+        ..run
+    };
+    assert!(matches!(
+        host.format_call(stale, "role".into(), "echo".into(), json!(null))
+            .await,
+        Err(Fault::DesktopChanged {})
+    ));
+}

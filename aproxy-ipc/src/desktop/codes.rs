@@ -105,6 +105,8 @@ pub enum DiagCode {
     ForwardResponseBuffered,
     /// settings.json has a schema newer than this version understands.
     SettingsSchemaTooNew,
+    /// The entry selector is reserved for all formats.
+    FormatNameReserved,
     /// A format's handshake failed at startup.
     FormatHandshakeFailed,
     /// A format does not support a stage the config declares for it.
@@ -307,6 +309,10 @@ pub struct Issue {
     rename_all_fields = "camelCase"
 )]
 pub enum Fault {
+    /// A host-classified format fault; reason is a fixed code, not arbitrary peer prose.
+    DesktopFormat { reason: String },
+    /// Author-defined, instance-redacted failure of an otherwise valid control exchange.
+    DesktopFormatFail { code: String, reason: String },
     /// Invalid package or package operation with portable context.
     DesktopPackage(super::PackageIssue),
     /// Malformed arguments; never quote input.

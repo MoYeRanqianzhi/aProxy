@@ -139,6 +139,8 @@ Faults returned to the bundled desktop page. They do not change CLI exit codes.
 
 | Code | When | `details` |
 |---|---|---|
+| `desktop_format` | The run cannot complete a format operation. | `reason` (string) |
+| `desktop_format_fail` | The program returned its own control failure. | `code` (string), `reason` (string) |
 | `desktop_package` | Package validation or a package operation failed. | `reason` (string), `field`? (string), `path`? (path), `limit`? (string), `max`? (integer) |
 | `desktop_toml` | The desktop preferences file could not be edited. | `kind` (string), `line`? (integer), `column`? (integer), `key`? (string) |
 

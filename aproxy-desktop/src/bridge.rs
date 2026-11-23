@@ -641,6 +641,49 @@ struct DesireArgs {
     expected_restore: Token,
 }
 
+/// 只列举页面仍选中的那次运行；不从配置文件推断程序能力。
+#[tauri::command]
+pub(crate) async fn format_list(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<Vec<FormatView>> {
+    let a: RunArgs = args(&request)?;
+    ops.format_list(a.run).await
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FormatSelection {
+    run: Run,
+    names: serde_json::Value,
+}
+/// 显式 null 才选择全部，缺少字段不是重启全部的授权。
+#[tauri::command]
+pub(crate) async fn format_restart(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<Vec<aproxy_ipc::wire::RestartOutcome>> {
+    let a: FormatSelection = args(&request)?;
+    let names = serde_json::from_value(a.names).map_err(|_| Fault::DesktopBadInput {})?;
+    ops.format_restart(a.run, names).await
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FormatCall {
+    run: Run,
+    name: String,
+    method: String,
+    params: serde_json::Value,
+}
+/// 作者定义参数与结果；拒绝和传输故障用结构化 Fault 表示，不混入正常结果。
+#[tauri::command]
+pub(crate) async fn format_call(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<serde_json::Value> {
+    let a: FormatCall = args(&request)?;
+    ops.format_call(a.run, a.name, a.method, a.params).await
+}
+
 /// 列举宿主认可的启动目标，显示路径不是操作参数。
 #[tauri::command]
 pub(crate) async fn list_configs(

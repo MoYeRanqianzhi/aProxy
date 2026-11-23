@@ -27,6 +27,51 @@ impl Run {
         }
     }
 }
+/// Process lifetime negotiated for an entry, without exposing its executable or arguments.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FormatProcess {
+    /// One process per message.
+    Spawn,
+    /// Share a persistent session across messages.
+    Persistent,
+}
+/// Whether the next data message is admitted, refused or probing the program.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FormatBreaker {
+    /// Data messages are admitted.
+    Closed,
+    /// The cooldown is active.
+    Open,
+    /// One probe is in flight.
+    #[serde(alias = "half_open")]
+    Probing,
+}
+/// Projection of one configuration entry; repeat program identities are intentional.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormatView {
+    /// Configuration entry selector, not the program identity.
+    pub name: String,
+    /// Program identity reported by hello, if available.
+    pub program: Option<String>,
+    /// Version reported by hello, if available.
+    pub version: Option<String>,
+    /// Configured worker lifetime.
+    pub process: FormatProcess,
+    /// Ordered stage names configured for this entry.
+    pub stages: Vec<String>,
+    /// Whether this program is required on the request path.
+    pub required: bool,
+    /// Current data circuit, separate from the control process.
+    pub breaker: FormatBreaker,
+    /// Whether this entry negotiated a control lane.
+    #[serde(default)]
+    pub control: bool,
+    /// Epoch milliseconds of explicit restart, never an instance startup timestamp.
+    pub restarted_at: Option<SafeUint>,
+}
 /// A request remains tied to its original run, even after port reuse.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -761,6 +806,22 @@ pub trait InstanceOps: Send + Sync + 'static {
     fn list_configs(&self) -> Task<'_, Vec<Choice>>;
     /// Re-resolve the offered choice inside this home, run the CLI's start preflight, launch with the running executable; return the verified run actually ready.
     fn start_instance(&self, target: StartTarget) -> Task<'_, Run>;
+    /// List redacted facts about one verified run, not entries from its edited config file.
+    fn format_list(&self, run: Run) -> Task<'_, Vec<FormatView>>;
+    /// Negotiate selected entries again without replacing the instance or rereading its configuration.
+    fn format_restart(
+        &self,
+        run: Run,
+        names: Option<Vec<String>>,
+    ) -> Task<'_, Vec<crate::wire::RestartOutcome>>;
+    /// Return the program's opaque result; distinguish author failures from host/transport faults.
+    fn format_call(
+        &self,
+        run: Run,
+        name: String,
+        method: String,
+        params: serde_json::Value,
+    ) -> Task<'_, serde_json::Value>;
     /// Resolve by port, require same live identity at send; apply CLI stop intent (remove desire to run), never escalate.
     fn stop_instance(&self, run: Run) -> Task<'_, ()>;
     /// Require same live run and usable restore spec; success may be on a different port.

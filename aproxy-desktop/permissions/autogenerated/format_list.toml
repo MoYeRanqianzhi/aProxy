@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-format-list"
+description = "Enables the format_list command without any pre-configured scope."
+commands.allow = ["format_list"]
+
+[[permission]]
+identifier = "deny-format-list"
+description = "Denies the format_list command without any pre-configured scope."
+commands.deny = ["format_list"]

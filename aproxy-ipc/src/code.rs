@@ -252,6 +252,18 @@ const INSTALL: &[Family] = &[Family::Install];
 /// 整张码表。顺序就是文档里的顺序：按族分段，族内按登记的先后。
 pub const TABLE: &[Code] = &[
     plain(
+        "desktop_format",
+        &[Family::Desktop],
+        "The run cannot complete a format operation.",
+        &[req("reason", T::String)],
+    ),
+    plain(
+        "desktop_format_fail",
+        &[Family::Desktop],
+        "The program returned its own control failure.",
+        &[req("code", T::String), req("reason", T::String)],
+    ),
+    plain(
         "desktop_package",
         &[Family::Desktop],
         "Package validation or a package operation failed.",

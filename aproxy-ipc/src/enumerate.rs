@@ -90,6 +90,9 @@ pub enum Liveness {
 /// 应答了的实例的实时状态：IPC 状态快照去掉 `instance`（它在 [`Enumerated::instance`]）。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LiveStatus {
+    /// 实例已脱敏的条目快照；没有条目时保持旧枚举文档的形状。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formats: Vec<serde_json::Value>,
     pub state: InstanceState,
     pub behavior: Behavior,
     pub activity: Activity,
@@ -328,6 +331,7 @@ fn classify(
             liveness: Liveness::Live,
             instance: Some(status.instance),
             status: Some(LiveStatus {
+                formats: status.formats,
                 state: status.state,
                 behavior: status.behavior,
                 activity: status.activity,
@@ -446,6 +450,7 @@ mod tests {
 
     fn live_status() -> LiveStatus {
         LiveStatus {
+            formats: vec![],
             state: InstanceState::Serving,
             behavior: Behavior {
                 delivery: "retry".into(),

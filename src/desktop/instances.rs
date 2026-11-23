@@ -196,14 +196,22 @@ impl DesktopHome {
         Ok(value)
     }
     pub(super) async fn selected_run(&self, r: &Run, force: bool) -> R<daemon::InstanceRecord> {
+        self.selected_member(r, force)
+            .await?
+            .instance
+            .ok_or(Fault::DesktopChanged {})
+    }
+    /// 读和写都基于同一份经 PID 核验的成员；返回快照使列表不必再经一次发现。
+    async fn selected_member(&self, r: &Run, force: bool) -> R<enumerate::Enumerated> {
         let member = enumerate::enumerate_in(&self.home)
             .await
             .instances
             .into_iter()
             .find(|i| i.port == r.port)
             .ok_or(Fault::DesktopChanged {})?;
-        let rec = member
+        member
             .instance
+            .as_ref()
             .filter(|rec| rec.instance_id == r.instance_id)
             .ok_or(Fault::DesktopChanged {})?;
         if force && member.liveness != Liveness::Unresponsive {
@@ -212,7 +220,7 @@ impl DesktopHome {
         if !force && member.liveness != Liveness::Live {
             return Err(Fault::DesktopUnresponsive { port: r.port });
         }
-        Ok(rec)
+        Ok(member)
     }
     fn ready(&self, rec: daemon::InstanceRecord) -> R<Run> {
         let port = daemon::port_of(&rec.listen_addr)
@@ -254,7 +262,122 @@ impl DesktopHome {
         Ok(e)
     }
 }
+/// 只认可实例协议的拒绝词表；不把端点、管道诊断或未知远端错误原文交给页面。
+fn format_fault(e: aproxy_ipc::client::IpcError) -> Fault {
+    use aproxy_ipc::client::IpcError;
+    match e {
+        IpcError::RunChanged => Fault::DesktopChanged {},
+        IpcError::Remote { code, details, .. } => match code.as_str() {
+            "unknown_op" => Fault::DesktopFormat {
+                reason: "unsupported".into(),
+            },
+            "unknown_format" => Fault::DesktopFormat {
+                reason: "unknown-format".into(),
+            },
+            "format_control_error" => {
+                serde_json::from_value::<aproxy_ipc::wire::ControlIssue>(details["reason"].clone())
+                    .map(|r| Fault::DesktopFormat {
+                        reason: r.as_str().into(),
+                    })
+                    .unwrap_or(Fault::DesktopUnavailable {})
+            }
+            "invalid_state" => Fault::DesktopBusy {},
+            "bad_request" => Fault::DesktopBadInput {},
+            _ => Fault::DesktopUnavailable {},
+        },
+        _ => Fault::DesktopUnavailable {},
+    }
+}
+impl DesktopHome {
+    /// 有副作用的操作既检查页面选择，也在已持有的 IPC 连接上比对对端，端口复用不能重定向调用。
+    async fn format_op(&self, run: &Run, op: aproxy_ipc::wire::FormatOp) -> R<serde_json::Value> {
+        let rec = self.selected_run(run, false).await?;
+        aproxy_ipc::client::format_for_run_in(
+            &self.home.join("run"),
+            &run.port.to_string(),
+            &aproxy_ipc::client::RunIdentity {
+                pid: rec.pid,
+                instance_id: rec.instance_id,
+            },
+            &op,
+        )
+        .await
+        .map_err(format_fault)
+    }
+}
 impl InstanceOps for DesktopHome {
+    fn format_list(&self, r: Run) -> Task<'_, Vec<FormatView>> {
+        Box::pin(async move {
+            let m = self.selected_member(&r, false).await?;
+            m.status
+                .ok_or(Fault::DesktopUnavailable {})?
+                .formats
+                .into_iter()
+                .map(|mut v| {
+                    // 快照的熔断器是结构体；桌面只暴露三种状态，不透传进程配置或后续协议字段。
+                    let o = v.as_object_mut().ok_or(Fault::DesktopUnavailable {})?;
+                    let breaker = o
+                        .get("breaker")
+                        .and_then(|v| v.get("state"))
+                        .cloned()
+                        .ok_or(Fault::DesktopUnavailable {})?;
+                    o.insert("breaker".into(), breaker);
+                    let ts = o
+                        .get("restarted_at")
+                        .and_then(|v| v.as_u64())
+                        .map(SafeUint::saturating);
+                    o.insert("restartedAt".into(), serde_json::json!(ts));
+                    serde_json::from_value(v).map_err(|_| Fault::DesktopUnavailable {})
+                })
+                .collect()
+        })
+    }
+    fn format_restart(
+        &self,
+        r: Run,
+        names: Option<Vec<String>>,
+    ) -> Task<'_, Vec<aproxy_ipc::wire::RestartOutcome>> {
+        Box::pin(async move {
+            let reply = self
+                .format_op(&r, aproxy_ipc::wire::FormatOp::Restart { names })
+                .await?;
+            serde_json::from_value::<aproxy_ipc::wire::RestartReport>(reply)
+                .map(|r| r.entries)
+                .map_err(|_| Fault::DesktopUnavailable {})
+        })
+    }
+    fn format_call(
+        &self,
+        r: Run,
+        name: String,
+        method: String,
+        params: serde_json::Value,
+    ) -> Task<'_, serde_json::Value> {
+        Box::pin(async move {
+            if serde_json::to_vec(&params).unwrap().len() > 64 * 1024 {
+                return Err(Fault::DesktopFormat {
+                    reason: "too-large".into(),
+                });
+            }
+            let reply = self
+                .format_op(
+                    &r,
+                    aproxy_ipc::wire::FormatOp::Call {
+                        name,
+                        method,
+                        params,
+                    },
+                )
+                .await?;
+            match serde_json::from_value(reply).map_err(|_| Fault::DesktopUnavailable {})? {
+                aproxy_ipc::wire::ControlReply::Result { result } => Ok(result),
+                aproxy_ipc::wire::ControlReply::Fail { fail } => Err(Fault::DesktopFormatFail {
+                    code: fail.code,
+                    reason: fail.reason,
+                }),
+            }
+        })
+    }
     fn list_configs(&self) -> Task<'_, Vec<Choice>> {
         Box::pin(async move {
             let mut nonce = [0; 16];

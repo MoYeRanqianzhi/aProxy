@@ -675,7 +675,11 @@ fn expected_machine_output(
         "config_invalid"=>{let message=match args { ["settings","show"|"get",..]=>"settings.json is not a valid JSON object. Repair it manually or delete it to return to built-in defaults:".into(),["settings",..]=>format!("Cannot read settings.json. Nothing was changed. Repair or remove {p} first:\n  {p}:1:1: {syntax} [config_syntax]",p=settings.display()), _=>"settings.json has errors:".into()};(3,failed(error(code,message,json!({"diagnostics":[diag]}))))},
         "target_not_found"=>(4,failed(error(code,"Unknown alias or port: missing-alias\nRun aproxy alias list to see the aliases, or aproxy alias add missing-alias <path> to add one.".into(),json!({"target":"missing-alias"})))),
         "install_download_failed"=>{let e=error(code,"Invalid download proxy URL (credentials withheld).".into(),json!({}));(1,if args[0]=="skill" {json!({"schema":1,"result":"failed","version":env!("CARGO_PKG_VERSION"),"location":home.path().join("skills"),"file_count":0,"error":e})}else{failed(e)})},
-        "install_probe_failed"=>{let p=home.path().join("missing-test-binary");let io=std::fs::metadata(&p).unwrap_err();(1,failed(error(code,format!("Cannot execute {}: {io}",p.display()),json!({}))))},
+        "install_probe_failed"=>{
+            // Unix 的 getcwd 返回物理目录，Windows 的当前目录保留设置时的拼写。
+            #[cfg(unix)] let cwd=std::fs::canonicalize(home.path()).unwrap();
+            #[cfg(windows)] let cwd=home.path();
+            let p=cwd.join("missing-test-binary");let io=std::fs::metadata(&p).unwrap_err();(1,failed(error(code,format!("Cannot execute {}: {io}",p.display()),json!({}))))},
         _=>unreachable!(),
     }
 }

@@ -235,7 +235,7 @@ pub enum IpcOp {
 impl IpcOp {
     /// 实例支持的全部 op 的名字（快照里的 `ops`）：这里的三个控制 op，加上读请求历史的
     /// 四个（见 [`ReadOp`]）
-    pub const NAMES: [&'static str; 8] = [
+    pub const NAMES: [&'static str; 9] = [
         "ping",
         "shutdown",
         "prepare_swap",
@@ -244,6 +244,7 @@ impl IpcOp {
         "body",
         "subscribe",
         "restart_formats",
+        "format_control",
     ];
 
     /// 本版本认得的 op 参数（快照里的 `features`）
@@ -545,18 +546,30 @@ impl ReadOp {
 pub enum FormatOp {
     /// None selects every entry; named selections are validated before any entry changes.
     Restart { names: Option<Vec<String>> },
+    /// Forward a method and its JSON argument to a single entry's dedicated process.
+    Call {
+        name: String,
+        method: String,
+        params: serde_json::Value,
+    },
 }
 impl FormatOp {
     /// Capability to check on the verified run before writing this operation.
     pub fn name(&self) -> &'static str {
         match self {
             Self::Restart { .. } => "restart_formats",
+            Self::Call { .. } => "format_control",
         }
     }
     /// Serialize one request without its newline; null explicitly requests all entries.
     pub fn request_line(&self) -> String {
         let args = match self {
             Self::Restart { names } => serde_json::json!({"names":names}),
+            Self::Call {
+                name,
+                method,
+                params,
+            } => serde_json::json!({"name":name,"method":method,"params":params}),
         };
         serde_json::json!({"v":IPC_VERSION,"op":self.name(),"args":args}).to_string()
     }
@@ -575,6 +588,30 @@ impl FormatOp {
             })
         };
         match name {
+            "format_control" => {
+                reject_unknown_args(args, &["name", "method", "params"])?;
+                let name = arg("name")?
+                    .as_str()
+                    .filter(|s| !s.is_empty() && s.len() <= 64 && !s.chars().any(char::is_control))
+                    .ok_or_else(|| invalid("name"))?;
+                let method = arg("method")?
+                    .as_str()
+                    .filter(|s| {
+                        (1..=64).contains(&s.len())
+                            && s.bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                    })
+                    .ok_or_else(|| invalid("method"))?;
+                let params = arg("params")?;
+                if serde_json::to_vec(params).unwrap().len() > 64 * 1024 {
+                    return Err(Rejection::FormatControl(ControlIssue::TooLarge));
+                }
+                Ok(Self::Call {
+                    name: name.into(),
+                    method: method.into(),
+                    params: params.clone(),
+                })
+            }
             "restart_formats" => {
                 reject_unknown_args(args, &["names"])?;
                 let names: Option<Vec<String>> =
@@ -595,6 +632,53 @@ impl FormatOp {
             _ => Err(Rejection::UnknownOp(name.into())),
         }
     }
+}
+/// Closed vocabulary of host-side failures, independent of any author-defined `fail`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ControlIssue {
+    /// No control arguments were negotiated.
+    NoControl,
+    /// The active call and every waiting position are occupied.
+    Busy,
+    /// The queue, handshake or exchange exceeded the call deadline.
+    Timeout,
+    /// The process exited or violated framing or reply semantics.
+    Protocol,
+    /// Serialized parameters or a reply exceeded its limit.
+    TooLarge,
+    /// The advertised program could not be started.
+    Spawn,
+}
+impl ControlIssue {
+    /// Stable spelling for messages and structured desktop projection.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoControl => "no-control",
+            Self::Busy => "busy",
+            Self::Timeout => "timeout",
+            Self::Protocol => "protocol",
+            Self::TooLarge => "too-large",
+            Self::Spawn => "spawn",
+        }
+    }
+}
+/// Program-defined failure data, already redacted by the instance.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlFail {
+    /// Opaque author-defined machine code.
+    pub code: String,
+    /// Opaque author-provided diagnostic evidence.
+    pub reason: String,
+}
+/// A valid call returns exactly one of the two keys, including a genuine null result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ControlReply {
+    /// Arbitrary JSON selected by the program.
+    Result { result: serde_json::Value },
+    /// A valid failure does not discard the session.
+    Fail { fail: ControlFail },
 }
 /// A restart always returns one observation per selected entry, in configuration order.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -692,6 +776,8 @@ pub enum Rejection {
     UnknownOp(String),
     /// No configured entry matched this sanitized selector.
     UnknownFormat(String),
+    /// The instance could not deliver a control result; a program-level fail is not a rejection.
+    FormatControl(ControlIssue),
     UnsupportedArg(Vec<String>),
     /// 此刻的状态不允许这个 op
     InvalidState(&'static str),
@@ -745,6 +831,11 @@ impl Rejection {
                 error_code::UNSUPPORTED_VERSION,
                 text::unsupported_version(Lang::En, v, &IPC_VERSION.to_string()),
                 json!({ "supported": [IPC_VERSION] }),
+            ),
+            Rejection::FormatControl(issue) => (
+                "format_control_error",
+                text::control_error(Lang::En, issue.as_str()),
+                json!({"reason":issue}),
             ),
             Rejection::UnknownFormat(name) => (
                 "unknown_format",
@@ -853,7 +944,7 @@ pub fn parse_request(line: &str) -> Result<Parsed, Rejection> {
         Some(_) => return Err(Rejection::bad("args_not_object")),
     };
     match name {
-        "restart_formats" => FormatOp::parse(name, args).map(Parsed::Format),
+        "restart_formats" | "format_control" => FormatOp::parse(name, args).map(Parsed::Format),
         "requests" | "request" | "body" | "subscribe" => {
             ReadOp::from_request(name, args).map(Parsed::Read)
         }
@@ -941,6 +1032,12 @@ mod tests {
                 .name(),
                 ReadOp::Subscribe.name(),
                 FormatOp::Restart { names: None }.name(),
+                FormatOp::Call {
+                    name: "a".into(),
+                    method: "read".into(),
+                    params: serde_json::Value::Null
+                }
+                .name(),
             ]
         );
         assert_eq!(

@@ -42,6 +42,7 @@ const PINNED_IN_MODULES: &[(&str, &str)] = &[
     ),
     ("src/daemon.rs", "read_rejections_are_pinned"),
     ("src/daemon.rs", "format_restart_frames_are_pinned"),
+    ("src/daemon.rs", "format_control_frames_are_pinned"),
     // 请求记录
     ("src/history.rs", "record_shape_is_pinned"),
     // 成功应答与状态快照
@@ -1263,4 +1264,59 @@ async fn older_instance_never_receives_format_restart() {
     );
     assert!(String::from_utf8_lossy(&out.stderr).contains("does not support restarting formats"));
     server.await.unwrap();
+}
+
+/// 两个条目共享可执行文件但只控制所选条目；大参数可占满自身的额度，回信须逐个字符串替换已知密钥。
+#[test]
+fn format_control_operation_contract() {
+    let home = TestHome::new();
+    let port = free_port();
+    let cfg = home.path().join("control.toml");
+    let key = "test-key-control-abcdefg";
+    std::fs::write(&cfg,format!("base_url='http://127.0.0.1'\napi_key='{key}'\nlisten_addr='127.0.0.1:{port}'\n[[format]]\nname='a'\ncommand={0}\nstages=['request']\n[[format]]\nname='b'\ncommand={0}\nargs=['control-role']\nenv={{ECHO_SECRET='{key}'}}\nstages=['request']",json!(common::format_echo_path()))).unwrap();
+    let instance = start(&home, port, &["start", cfg.to_str().unwrap()]);
+    let call = |name: &str, method: &str, params: Value| {
+        json!({"v":1,"op":"format_control","args":{"name":name,"method":method,"params":params}})
+            .to_string()
+            + "\n"
+    };
+    let snapshot = instance.snapshot("{\"v\":1,\"op\":\"ping\"}\n");
+    assert!(
+        snapshot["ops"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("format_control"))
+    );
+    assert_eq!(snapshot["formats"][0]["control"], false);
+    assert_eq!(snapshot["formats"][1]["control"], true);
+    assert_eq!(snapshot["formats"][1]["program"], "format-echo");
+    instance.rejected(
+        &call("a", "ping", Value::Null),
+        &json!({"code":"format_control_error","details":{"reason":"no-control"}}),
+    );
+    instance.rejected(
+        &call("missing", "ping", Value::Null),
+        &json!({"code":"unknown_format","details":{"name":"missing"}}),
+    );
+    assert_eq!(
+        instance.snapshot(&call("b", "received", json!(key))),
+        json!({"result":true})
+    );
+    let r = instance.snapshot(&call("b", "echo", json!({key:[key,null]})));
+    assert!(!r.to_string().contains(key));
+    let masked = aproxy_ipc::redact::Secrets::new([key]).replace(key);
+    assert_eq!(r, json!({"result":{masked.clone():[masked,null]}}));
+    assert_eq!(
+        instance.snapshot(&call("b", "fail", Value::Null)),
+        json!({"fail":{"code":"refused","reason":"author declined"}})
+    );
+    let big = json!("x".repeat(65534));
+    assert_eq!(
+        instance.snapshot(&call("b", "echo", big.clone())),
+        json!({"result":big})
+    );
+    instance.rejected(
+        &call("b", "echo", json!("x".repeat(65535))),
+        &json!({"code":"format_control_error","details":{"reason":"too-large"}}),
+    );
 }

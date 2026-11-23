@@ -55,6 +55,7 @@ The `code` of the error object an instance returns on its control endpoint.
 | `internal` | A defect in aproxy itself. | — |
 | `bad_request` | Not JSON, missing v or op, line too long, or an argument of the wrong type or value. | `reason` (string), `arg`? (string) |
 | `unsupported_version` | The protocol version v is not supported. | `supported` (integer list) |
+| `format_control_error` | The dedicated format control channel did not deliver a valid reply. | `reason` (string) |
 | `unknown_format` | No configured format has this name. Nothing was restarted. | `name` (string) |
 | `unknown_op` | There is no such op. Nothing was done. | `op` (string) |
 | `unsupported_arg` | The request carries arguments this instance does not know. | `args` (string list) |

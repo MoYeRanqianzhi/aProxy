@@ -1114,14 +1114,33 @@ where
     // （Windows 上还占着一个管道实例，实例数有上限，占满后新连接全部失败）。
     // 正常客户端连上即发，几毫秒内完成
     const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
-    let mut limited = BufReader::new(reader).take(MAX_REQUEST_LINE);
+    // control 的 params 自身可到 64 KiB，另留出帧头；其他操作仍保持原来的截断边界。
+    let mut limited = BufReader::new(reader).take(MAX_REQUEST_LINE * 2);
     match tokio::time::timeout(REQUEST_READ_TIMEOUT, limited.read_line(&mut line)).await {
         Ok(read) => {
             read?;
         }
         Err(_) => return Ok(()),
     }
-    let op = match parse_request(&line) {
+    let parsed = parse_request(&line);
+    if line.len() > MAX_REQUEST_LINE as usize
+        && !matches!(
+            &parsed,
+            Ok(Parsed::Format(FormatOp::Call { .. }))
+                | Err(Rejection::FormatControl(ControlIssue::TooLarge))
+        )
+    {
+        return write_line(
+            &mut writer,
+            &Rejection::BadRequest {
+                reason: "incomplete_line",
+                arg: None,
+            }
+            .reply(),
+        )
+        .await;
+    }
+    let op = match parsed {
         Ok(Parsed::Control(op)) => op,
         Ok(Parsed::Format(op)) => {
             let reply = match format_operation(&state, op).await {
@@ -1230,6 +1249,21 @@ async fn format_operation(
         .filter_map(std::sync::Weak::upgrade)
         .collect();
     match op {
+        FormatOp::Call {
+            name,
+            method,
+            params,
+        } => {
+            let p = slots
+                .iter()
+                .map(|s| s.current())
+                .find(|p| p.entry.name == name)
+                .ok_or_else(|| Rejection::UnknownFormat(state.history.secrets().replace(&name)))?;
+            p.control_call(&method, params)
+                .await
+                .map(|v| serde_json::json!(v))
+                .map_err(Rejection::FormatControl)
+        }
         FormatOp::Restart { names } => {
             if let Some(names) = &names {
                 for name in names {
@@ -2281,6 +2315,101 @@ mod tests {
         );
     }
 
+    /// 控制调用的 JSON 参数不解释，错误分类与作者自己的 fail 分属协议的不同层。
+    #[test]
+    fn format_control_frames_are_pinned() {
+        let line = r#"{"v":1,"op":"format_control","args":{"name":"role","method":"switch.on","params":null}}"#;
+        let op = FormatOp::Call {
+            name: "role".into(),
+            method: "switch.on".into(),
+            params: serde_json::Value::Null,
+        };
+        assert_eq!(op.request_line(), line);
+        assert_eq!(
+            parse_request(&(line.to_string() + "\n")),
+            Ok(Parsed::Format(op))
+        );
+        let parse = |args: serde_json::Value| {
+            parse_request(
+                &(serde_json::json!({"v":1,"op":"format_control","args":args}).to_string() + "\n"),
+            )
+        };
+        let args = serde_json::json!({"name":"role","method":"switch","params":{}});
+        for key in ["name", "method", "params"] {
+            let mut a = args.clone();
+            a.as_object_mut().unwrap().shift_remove(key);
+            assert_eq!(
+                parse(a).unwrap_err().reply(),
+                format!(
+                    r#"{{"v":1,"ok":false,"error":{{"code":"bad_request","message":"arg {key} is required","details":{{"reason":"missing_arg","arg":"{key}"}}}}}}"#
+                )
+            );
+        }
+        for (key, value) in [
+            ("method", ""),
+            ("method", "space bad"),
+            ("method", "界"),
+            ("name", ""),
+        ] {
+            let mut a = args.clone();
+            a[key] = serde_json::json!(value);
+            assert_eq!(
+                parse(a).unwrap_err().reply(),
+                format!(
+                    r#"{{"v":1,"ok":false,"error":{{"code":"bad_request","message":"arg {key} has the wrong type or value","details":{{"reason":"invalid_arg","arg":"{key}"}}}}}}"#
+                )
+            );
+        }
+        let mut a = args.clone();
+        a["extra"] = true.into();
+        assert_eq!(
+            parse(a).unwrap_err().reply(),
+            r#"{"v":1,"ok":false,"error":{"code":"unsupported_arg","message":"unknown arg: extra","details":{"args":["extra"]}}}"#
+        );
+        for (issue, reason) in [
+            (ControlIssue::NoControl, "no-control"),
+            (ControlIssue::Timeout, "timeout"),
+            (ControlIssue::Busy, "busy"),
+            (ControlIssue::TooLarge, "too-large"),
+            (ControlIssue::Protocol, "protocol"),
+            (ControlIssue::Spawn, "spawn"),
+        ] {
+            assert_eq!(
+                Rejection::FormatControl(issue).reply(),
+                format!(
+                    r#"{{"v":1,"ok":false,"error":{{"code":"format_control_error","message":"format control failed: {reason}","details":{{"reason":"{reason}"}}}}}}"#
+                )
+            );
+        }
+        let mut a = args.clone();
+        a["params"] = "x".repeat(65534).into();
+        assert!(parse(a.clone()).is_ok());
+        a["params"] = "x".repeat(65535).into();
+        assert_eq!(
+            parse(a),
+            Err(Rejection::FormatControl(ControlIssue::TooLarge))
+        );
+        for (reply, wire) in [
+            (
+                ControlReply::Result {
+                    result: serde_json::Value::Null,
+                },
+                r#"{"v":1,"ok":true,"result":{"result":null}}"#,
+            ),
+            (
+                ControlReply::Fail {
+                    fail: ControlFail {
+                        code: "refused".into(),
+                        reason: "off".into(),
+                    },
+                },
+                r#"{"v":1,"ok":true,"result":{"fail":{"code":"refused","reason":"off"}}}"#,
+            ),
+        ] {
+            assert_eq!(ok_reply(&serde_json::to_string(&reply).unwrap()), wire);
+        }
+    }
+
     /// 读类 op 的拒绝：未知参数、缺必填、类型或取值不对、取不到。应答行逐字钉住。
     #[test]
     fn read_rejections_are_pinned() {
@@ -2876,6 +3005,7 @@ mod tests {
         state.stats.retries_total.store(7, Ordering::Relaxed);
         // 逐项核对追加的能力，再逐字比对已有快照样本，不能隐藏旧字段的变化。
         let mut snapshot = status_snapshot(&state);
+        assert_eq!(snapshot.ops.pop().as_deref(), Some("format_control"));
         assert_eq!(snapshot.ops.pop().as_deref(), Some("restart_formats"));
         let reply = serde_json::to_string(&WireResponse {
             v: IPC_VERSION,
@@ -3072,7 +3202,8 @@ mod tests {
                 "request",
                 "body",
                 "subscribe",
-                "restart_formats"
+                "restart_formats",
+                "format_control"
             ]
         );
         assert_eq!(status.activity.requests_total, 7);

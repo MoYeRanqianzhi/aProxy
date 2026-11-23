@@ -58,6 +58,7 @@ crate::message!(invalid(arg: &str), en: "arg {arg} has the wrong type or value",
 
 crate::message!(unsupported_version(version: &str, supported: &str), en: "unsupported protocol version {version}; this instance supports {supported}", zh: "不支持协议版本 {version}；此实例支持 {supported}");
 
+crate::message!(control_error(reason:&str), en: "format control failed: {reason}", zh: "format 控制调用失败：{reason}");
 crate::message!(unknown_format(name: &str), en: "no configured format named {name}", zh: "没有名为 {name} 的 format 条目");
 crate::message!(unknown_op(op: &str), en: "unknown op: {op}", zh: "未知操作：{op}");
 
@@ -101,6 +102,9 @@ pub(crate) fn fields(code: &str, d: &serde_json::Value) -> Option<&'static [&'st
                         | "attempt"
                         | "keep_restore"
                         | "if_idle_secs"
+                        | "name"
+                        | "params"
+                        | "method"
                         | "names"
                         | "ttl_secs"
                 ) =>
@@ -120,6 +124,14 @@ pub(crate) fn fields(code: &str, d: &serde_json::Value) -> Option<&'static [&'st
             }) =>
         {
             &["supported"]
+        }
+        "format_control_error"
+            if matches!(
+                d["reason"].as_str()?,
+                "no-control" | "busy" | "timeout" | "protocol" | "too-large" | "spawn"
+            ) =>
+        {
+            &["reason"]
         }
         "unknown_format"
             if d["name"]
@@ -184,6 +196,7 @@ pub(crate) fn remote(lang: Lang, code: &str, details: &serde_json::Value) -> Opt
             }
             unsupported_version(lang, &IPC_VERSION.to_string(), &supported.join(", "))
         }
+        "format_control_error" => control_error(lang, details["reason"].as_str()?),
         "unknown_format" => unknown_format(lang, details["name"].as_str()?),
         error_code::UNKNOWN_OP => unknown_op(lang, details["op"].as_str()?),
         error_code::UNSUPPORTED_ARG => unknown_arg(

@@ -475,6 +475,12 @@ pub const TABLE: &[Code] = &[
         &[req("supported", T::IntegerList)],
     ),
     plain(
+        "format_control_error",
+        IPC,
+        "The dedicated format control channel did not deliver a valid reply.",
+        &[req("reason", T::String)],
+    ),
+    plain(
         "unknown_format",
         IPC,
         "No configured format has this name. Nothing was restarted.",

@@ -579,3 +579,23 @@ fn owned_response_body_transfers_the_original_allocation() {
     assert!(Body::Absent.into_bytes().is_none());
     assert_eq!(Body::Text(String::new()).into_bytes(), Some(Vec::new()));
 }
+
+/// Only a bounded argument list is a control offer; absence is distinct from explicit null.
+#[test]
+fn control_hello_argument_boundaries() {
+    let base = serde_json::to_value(HelloReply::new(vec![], "tool".into(), "1".into())).unwrap();
+    for (offer, valid) in [
+        (json!({"args":[]}), true),
+        (json!({"args":vec!["界".repeat(1365);32]}), true),
+        (json!({"args":["界".repeat(1366)]}), false),
+        (json!({"args":vec!["";33]}), false),
+        (json!(null), false),
+        (json!({}), false),
+        (json!({"args":[1]}), false),
+        (json!({"args":[],"extra":0}), false),
+    ] {
+        let mut hello = base.clone();
+        hello["control"] = offer;
+        assert_eq!(serde_json::from_value::<HelloReply>(hello).is_ok(), valid);
+    }
+}

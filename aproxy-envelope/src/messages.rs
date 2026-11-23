@@ -189,6 +189,14 @@ impl Hello {
     }
 }
 
+/// Alternate arguments of a dedicated control process, run with the worker's program and environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlOffer {
+    /// Literal arguments, not a shell command; an empty list is a valid invitation.
+    pub args: Vec<String>,
+}
+
 /// Worker selection and capabilities, returned before any stage can be sent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -198,6 +206,9 @@ pub struct HelloReply {
     pub v: u32,
     /// Echo of the opening message sequence.
     pub seq: u64,
+    /// An absent offer means this program has no control channel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control: Option<ControlOffer>,
     /// Selected protocol for subsequent messages.
     pub protocol: u32,
     /// All stages implemented by the worker.
@@ -226,6 +237,16 @@ impl TryFrom<serde_json::Map<String, serde_json::Value>> for HelloReply {
                     .ok_or_else(|| serde_json::Error::missing_field(key))?,
             )
         }
+        let control = obj
+            .remove("control")
+            .map(serde_json::from_value::<ControlOffer>)
+            .transpose()?;
+        if control
+            .as_ref()
+            .is_some_and(|c| c.args.len() > 32 || c.args.iter().any(|s| s.len() > 4096))
+        {
+            return Err(serde_json::Error::custom("control arguments exceed limits"));
+        }
         let request_body = match obj.remove("request_body") {
             None | Some(serde_json::Value::Null) => BTreeMap::new(),
             Some(v) => {
@@ -247,6 +268,7 @@ impl TryFrom<serde_json::Map<String, serde_json::Value>> for HelloReply {
             }
         };
         Ok(Self {
+            control,
             v: field(&mut obj, "v")?,
             seq: field(&mut obj, "seq")?,
             protocol: field(&mut obj, "protocol")?,
@@ -265,6 +287,7 @@ impl HelloReply {
             v: 1,
             seq: 0,
             protocol: 1,
+            control: None,
             stages,
             request_body: BTreeMap::new(),
             features: Vec::new(),

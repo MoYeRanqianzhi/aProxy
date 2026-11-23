@@ -237,6 +237,15 @@ fn main() {
                 std::thread::sleep(delay);
             }
             r = json!({"v":1,"seq":0,"name":"format-echo","version":"1.0","protocol":1,"features":[],"stages":["request","retry","decide","response","heartbeat","stream","notify"]});
+            if mode == "control-role" {
+                r["control"] = json!({"args":["control-peer"]});
+            }
+            if mode == "control-peer" {
+                assert_eq!(m["process"], "persistent");
+                assert_eq!(m["stages"], json!(["control"]));
+                assert_eq!(m["worker_id"], u32::MAX);
+                r["stages"] = json!(["control"]);
+            }
             if mode == "role-version" {
                 r["version"] = json!(std::fs::read_to_string(arg).unwrap());
             }
@@ -279,12 +288,42 @@ fn main() {
             } else {
                 "request"
             };
+            if mode == "control-peer" {
+                assert_eq!(stage, "control");
+                match m["method"].as_str().unwrap() {
+                    "hang" => continue,
+                    "crash" => return,
+                    "oversize" => {
+                        unfinished_frame(1024 * 1024);
+                        return;
+                    }
+                    "wrong-seq" => {
+                        r["seq"] = json!(0);
+                        r["result"] = Value::Null;
+                    }
+                    "invalid" => {
+                        r["result"] = Value::Null;
+                        r["fail"] = Value::Null;
+                    }
+                    "fail" => r["fail"] = json!({"code":"refused","reason":"author declined"}),
+                    "hold" => {
+                        wait_gate(std::path::Path::new(m["params"].as_str().unwrap()));
+                        r["result"] = Value::Null;
+                    }
+                    "received" => {
+                        r["result"] = json!(m["params"] == std::env::var("ECHO_SECRET").unwrap())
+                    }
+                    "pid" => r["result"] = json!(std::process::id()),
+                    _ => r["result"] = m["params"].clone(),
+                }
+            }
             let reason = "error-rejected";
             if matches!(stage, "request" | "retry" | "response")
                 && matches!(
                     mode,
                     "echo"
                         | "inspect"
+                        | "control-role"
                         | "gate-hello"
                         | "gate-request"
                         | "gated-eof"

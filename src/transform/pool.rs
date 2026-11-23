@@ -59,6 +59,7 @@ async fn worker_pipe(
     Ok((server, Stdio::from(client)))
 }
 
+mod control;
 mod generation;
 pub(crate) use generation::{FormatSlot, Formats};
 mod notify;
@@ -602,6 +603,8 @@ pub(crate) struct Pool {
     notices: Option<Mutex<notify::Lane>>,
     /// 上报状态的配置序号和有界事件队列；不用脱敏后的名字作为身份。
     events: Option<(usize, std::sync::Weak<crate::history::History>)>,
+    /// 控制通道独占进程与队列，不占普通进程名额，也不参与熔断。
+    control: control::Lane,
     /// 最近一次成功握手的身份与能力，握手失败时不杜撰版本。
     pub(crate) negotiated: Mutex<Option<Arc<HelloReply>>>,
 }
@@ -653,6 +656,7 @@ impl Pool {
             startup: Default::default(),
             retiring: Default::default(),
             events,
+            control: Default::default(),
             negotiated: Mutex::new(None),
             circuit: Default::default(),
         })
@@ -679,6 +683,7 @@ impl Pool {
         use serde_json::json;
         let breaker = c.view();
         let mut snap = json!({"name":self.secrets.replace(&self.entry.name),"process":if self.entry.process==Process::Spawn{"spawn"}else{"persistent"},"required":self.entry.required,"stages":self.entry.stages.iter().map(|s|s.as_str()).collect::<Vec<_>>(),"breaker":breaker});
+        snap["control"] = json!(false);
         snap["restarted_at"] = json!(c.restarted_at);
         if let Some(n) = &self.notices {
             let lane = n.lock().unwrap();
@@ -686,6 +691,8 @@ impl Pool {
             snap["notify_dropped_total"] = json!(lane.dropped);
         }
         if let Some(h) = self.negotiated.lock().unwrap().as_ref() {
+            snap["program"] = json!(self.secrets.replace(&h.name));
+            snap["control"] = json!(h.control.is_some());
             snap["protocol"] = json!(h.protocol);
             snap["version"] = json!(self.secrets.replace(&h.version));
         }
@@ -804,6 +811,19 @@ impl Pool {
         admission: Option<&Admission<'_>>,
         permit: Option<OwnedSemaphorePermit>,
     ) -> Result<Worker, Fault> {
+        let (mut w, id) = self
+            .start_process(&self.entry.args, admission, permit)
+            .await?;
+        self.handshake(&mut w, id, admission, false).await?;
+        Ok(w)
+    }
+    /// 两种通道使用相同的命令解析、环境、管道安全与生命周期；只接受字面参数，不经过 shell。
+    async fn start_process(
+        &self,
+        args: &[String],
+        admission: Option<&Admission<'_>>,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<(Worker, u32), Fault> {
         let mut stopping = self.stopping.subscribe();
         if *stopping.borrow() {
             return Err(Fault::Died);
@@ -812,7 +832,7 @@ impl Pool {
             .ok_or(Fault::Spawn)?;
         let id = {
             let mut ids = self.ids.lock().unwrap();
-            let id = (0..)
+            let id = (0..u32::MAX)
                 .find(|id| !ids.contains_key(id))
                 .expect("worker count fits u32");
             ids.insert(id, None);
@@ -826,10 +846,7 @@ impl Pool {
             capacity: capacity.clone(),
         };
         let mut command = Command::new(exe);
-        command
-            .args(&self.entry.args)
-            .envs(&self.entry.env)
-            .kill_on_drop(true);
+        command.args(args).envs(&self.entry.env).kill_on_drop(true);
         #[cfg(windows)]
         let (stdin, stdout, stderr) = {
             let security =
@@ -851,15 +868,16 @@ impl Pool {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = {
+        let mut child = if let Some(a) = admission {
             let c = self.circuit.lock().unwrap();
-            if let Some(a) = admission
-                && a.epoch != c.epoch
-            {
+            if a.epoch != c.epoch {
                 return Err(a.refusal());
             }
-            command.spawn().map_err(|_| Fault::Spawn)?
-        };
+            command.spawn()
+        } else {
+            command.spawn()
+        }
+        .map_err(|_| Fault::Spawn)?;
         // 父进程不保留子端的重复句柄，否则即使 worker 正常退出也不会看到 EOF。
         drop(command);
         #[cfg(not(windows))]
@@ -902,7 +920,7 @@ impl Pool {
             drop(slot);
             drop(stopping);
         });
-        let mut w = Worker {
+        let w = Worker {
             capacity,
             exited,
             stderr_abort,
@@ -915,8 +933,7 @@ impl Pool {
             opening: None,
             idle_since: Instant::now(),
         };
-        self.handshake(&mut w, id, admission).await?;
-        Ok(w)
+        Ok((w, id))
     }
     /// 拉起和握手之间别的进程仍能令本票作废；hello 与业务帧共用首次写入的原子检查。
     async fn handshake(
@@ -924,20 +941,28 @@ impl Pool {
         w: &mut Worker,
         id: u32,
         admission: Option<&Admission<'_>>,
+        control: bool,
     ) -> Result<(), Fault> {
-        let mut hello = Hello::new(
-            env!("CARGO_PKG_VERSION").into(),
-            self.entry.name.clone(),
-            match self.entry.process {
-                Process::Persistent => aproxy_envelope::Process::Persistent,
-                Process::Spawn => aproxy_envelope::Process::Spawn,
-            },
+        let stages: Vec<String> = if control {
+            vec!["control".into()]
+        } else {
             self.entry
                 .stages
                 .iter()
                 .map(|s| s.as_str().into())
-                .collect(),
-            if self.entry.process == Process::Spawn {
+                .collect()
+        };
+        let mut hello = Hello::new(
+            env!("CARGO_PKG_VERSION").into(),
+            self.entry.name.clone(),
+            match (control, self.entry.process) {
+                (true, _) | (_, Process::Persistent) => aproxy_envelope::Process::Persistent,
+                (_, Process::Spawn) => aproxy_envelope::Process::Spawn,
+            },
+            stages.clone(),
+            if control {
+                u32::MAX
+            } else if self.entry.process == Process::Spawn {
                 0
             } else {
                 id
@@ -966,12 +991,9 @@ impl Pool {
         if reply.v != 1 || reply.protocol != 1 || reply.seq != 0 {
             return Err(Fault::Protocol);
         }
-        let missing: Vec<_> = self
-            .entry
-            .stages
-            .iter()
-            .filter(|s| !reply.stages.iter().any(|n| n == s.as_str()))
-            .map(|s| s.as_str().into())
+        let missing: Vec<_> = stages
+            .into_iter()
+            .filter(|s| !reply.stages.contains(s))
             .collect();
         if !missing.is_empty() {
             return Err(Fault::Stages(missing));
@@ -979,7 +1001,9 @@ impl Pool {
         // 握手成功只建立会话；只有合法的业务阶段回信才清零连续失败数。
         let hello = Arc::new(reply);
         w.hello = Some(hello.clone());
-        *self.negotiated.lock().unwrap() = Some(hello);
+        if !control {
+            *self.negotiated.lock().unwrap() = Some(hello);
+        }
         w.seq = 1;
         Ok(())
     }
@@ -1008,6 +1032,7 @@ impl Pool {
     }
     /// 停机开始就给空闲会话 EOF，不消耗在途请求的排空期限；随后归还的进程也直接退役。
     pub(crate) fn begin_drain(&self) {
+        self.stop_control();
         let mut idle = self.idle.lock().unwrap();
         self.draining
             .store(true, std::sync::atomic::Ordering::Relaxed);

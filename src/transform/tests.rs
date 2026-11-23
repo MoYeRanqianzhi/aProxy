@@ -696,7 +696,7 @@ async fn revoked_ticket_prevents_the_first_runtime_hello_byte() {
     let a = p.admit().unwrap();
     p.complete(&a, Some(&Fault::Protocol));
     assert!(matches!(
-        p.handshake(&mut w, 0, Some(&a)).await,
+        p.handshake(&mut w, 0, Some(&a), false).await,
         Err(Fault::Open { .. })
     ));
     w.finish().await;
@@ -1082,4 +1082,117 @@ async fn restarting_preserves_busy_request_and_stream() {
         serde_json::json!({"state":"closed","failures":0})
     );
     slot.current().shutdown().await;
+}
+
+/// 错帧、进程退出和超限只淘汰控制进程；合法 fail 则沿用同一序列与 PID。
+#[tokio::test]
+async fn control_faults_do_not_touch_request_workers() {
+    use aproxy_ipc::wire::{ControlIssue as E, ControlReply};
+    use serde_json::{Value, json};
+    let p = pool(Process::Persistent, "control-role", |e| {
+        e.required = true;
+        e.pool_max = 1;
+        e.breaker_failures = 1;
+    });
+    p.probe().await.unwrap();
+    let data = worker(call(&p, "a", false).await.unwrap(), "a");
+    let pid = || p.control_call("pid", Value::Null);
+    let mut id = pid().await.unwrap();
+    let fail = p.control_call("fail", Value::Null).await.unwrap();
+    assert!(matches!(fail,ControlReply::Fail{fail} if fail.code=="refused"));
+    assert_eq!(pid().await.unwrap(), id);
+    for (method, issue) in [
+        ("crash", E::Protocol),
+        ("oversize", E::TooLarge),
+        ("wrong-seq", E::Protocol),
+        ("invalid", E::Protocol),
+    ] {
+        assert_eq!(p.control_call(method, Value::Null).await, Err(issue));
+        assert_eq!(worker(call(&p, "b", false).await.unwrap(), "b"), data);
+        let next = pid().await.unwrap();
+        assert_ne!(next, id);
+        id = next;
+    }
+    assert_eq!(
+        p.snapshot().1["breaker"],
+        json!({"state":"closed","failures":0})
+    );
+    let slot = FormatSlot::new(p.clone());
+    slot.restart().await;
+    assert_ne!(
+        slot.current()
+            .control_call("pid", Value::Null)
+            .await
+            .unwrap(),
+        id
+    );
+    slot.current().shutdown().await;
+}
+/// 用程序观察到的帧确定超时起点；推进单调时钟分别验证调用截止与空闲 EOF。
+#[tokio::test]
+async fn control_deadline_and_idle_retirement() {
+    use aproxy_ipc::wire::ControlIssue;
+    use serde_json::Value;
+    let d = tempfile::tempdir().unwrap();
+    let log = d.path().join("events");
+    let p = pool(Process::Persistent, "control-role", |e| {
+        e.worker_idle_secs = 0;
+        e.env
+            .insert("ECHO_OBSERVE".into(), log.display().to_string());
+    });
+    p.probe().await.unwrap();
+    let id = p.control_call("pid", Value::Null).await.unwrap();
+    let mut hang = std::pin::pin!(p.control_call("hang", Value::Null));
+    tokio::select! {_=&mut hang=>panic!("early reply"),_=wait_observed(&log,"control",2)=>{}}
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert_eq!(hang.await, Err(ControlIssue::Timeout));
+    tokio::time::resume();
+    let next = p.control_call("pid", Value::Null).await.unwrap();
+    assert_ne!(next, id);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(301)).await;
+    tokio::time::resume();
+    wait_observed(&log, "eof", 1).await;
+    assert_ne!(p.control_call("pid", Value::Null).await.unwrap(), next);
+    p.shutdown().await;
+}
+/// 活跃调用持住控制管道时再提交十七次；第十七个等待者被拒，数据管道不必等它们。
+#[tokio::test]
+async fn control_waiting_capacity_is_independent() {
+    use aproxy_ipc::wire::ControlIssue;
+    use serde_json::{Value, json};
+    let d = tempfile::tempdir().unwrap();
+    let log = d.path().join("events");
+    let gate = d.path().join("gate");
+    let p = pool(Process::Persistent, "control-role", |e| {
+        e.pool_max = 1;
+        e.env
+            .insert("ECHO_OBSERVE".into(), log.display().to_string());
+    });
+    p.probe().await.unwrap();
+    let mut held = std::pin::pin!(p.control_call("hold", json!(gate)));
+    tokio::select! {_=&mut held=>panic!("early reply"),_=wait_observed(&log,"control",1)=>{}}
+    let mut queue = Vec::new();
+    for _ in 0..16 {
+        let mut f = Box::pin(p.control_call("pid", Value::Null));
+        assert!(futures_util::poll!(&mut f).is_pending());
+        queue.push(f);
+    }
+    assert_eq!(
+        p.control_call("pid", Value::Null).await,
+        Err(ControlIssue::Busy)
+    );
+    assert_eq!(
+        worker(call(&p, "data", false).await.unwrap(), "data")
+            .split('/')
+            .count(),
+        2
+    );
+    std::fs::write(gate, b"release").unwrap();
+    held.await.unwrap();
+    for r in futures_util::future::join_all(queue).await {
+        r.unwrap();
+    }
+    p.shutdown().await;
 }

@@ -39,9 +39,10 @@ message!(missing(path: std::path::Display<'_>), en: "Configuration file no longe
 
 message!(taken(pid: u32, port: &str), en: "An aProxy instance (pid {pid}) is already running on the new configuration’s listening port {port}.", zh: "新配置的监听端口 {port} 上已有 aProxy 实例（pid {pid}）在运行");
 
+message!(format_flags(), en: "Do not combine --format with --force or --idle-threshold-secs.", zh: "--format 不能与 --force 或 --idle-threshold-secs 同用。");
 message!(format_selection(), en: "Use --format all alone, or specify one or more format names.", zh: "请单独使用 --format all，或指定一个或多个 format 条目名。");
 message!(format_done(port:&str,name:&str,program:&str,version:&str), en: "Port {port}: restarted format {name} ({program} {version}).", zh: "端口 {port}：已重启 format {name}（{program} {version}）。");
-message!(format_failed(port:&str,name:&str,reason:&str), en: "Port {port}: format {name} handshake failed: {reason}.", zh: "端口 {port}：format {name} 握手失败：{reason}。");
+message!(format_failed(port:&str,name:&str,reason:&str), en: "Port {port}: format {name} failed its handshake: {reason}; nothing was replaced.", zh: "端口 {port}：format {name} 握手失败：{reason}；没有替换，仍按原样运行。");
 message!(format_config(), en: "config.toml was not reloaded; restart the instance to change a [[format]] entry.", zh: "未重读 config.toml；修改 [[format]] 条目须重启实例。");
 message!(format_refused(port:&str,message:&str), en: "Port {port}: could not restart formats: {message}", zh: "端口 {port}：无法重启 format：{message}");
 message!(format_unsupported(port:&str), en: "Port {port}: this instance does not support restarting formats.", zh: "端口 {port}：此实例不支持单独重启 format。");

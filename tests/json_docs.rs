@@ -833,14 +833,14 @@ fn stop_and_restart_render_their_own_terminal_notices() {
 #[test]
 fn restart_formats_json_document() {
     let home = TestHome::new();
-    let port = free_port();
-    let addr = port.to_string();
     let cfg = home.path().join("formats.toml");
     let role = home.path().join("version");
     fs::write(&role, "2").unwrap();
-    fs::write(&cfg,format!("base_url='http://127.0.0.1'\nlisten_addr='127.0.0.1:{port}'\n[[format]]\nname='a'\ncommand={0}\nstages=['request']\n[[format]]\nname='b'\ncommand={0}\nargs=['role-version',{1}]\nstages=['request']",json!(common::format_echo_path()),json!(role))).unwrap();
+    fs::write(&cfg,format!("base_url='http://127.0.0.1'\nlisten_addr='127.0.0.1:0'\n[[format]]\nname='a'\ncommand={0}\nstages=['request']\n[[format]]\nname='b'\ncommand={0}\nargs=['role-version',{1}]\nstages=['request']",json!(common::format_echo_path()),json!(role))).unwrap();
+    let start = document(&run(&home, &["start", cfg.to_str().unwrap(), "--json"]));
+    let port = u16::try_from(start["port"].as_u64().unwrap()).unwrap();
     home.stop_on_drop(port);
-    run(&home, &["start", cfg.to_str().unwrap()]);
+    let addr = port.to_string();
     let args = ["restart", &addr, "--format", "b", "--json"];
     let one = run(&home, &args);
     let item = json!({"target":addr,"port":port,"name":"b","outcome":"restarted","program":"format-echo","version":"2","configReloaded":false});
@@ -858,7 +858,9 @@ fn restart_formats_json_document() {
         doc["results"][1],
         json!({"target":addr,"port":port,"name":"b","outcome":"handshake-failed","reason":"invalid_output","configReloaded":false})
     );
-    assert!(text.contains("format b handshake failed: invalid_output"));
+    assert!(text.contains(&format!(
+        "Port {port}: format b failed its handshake: invalid_output; nothing was replaced."
+    )));
     let (doc, text) = failed_document(
         &home,
         &["restart", &addr, "--format", "missing", "--json"],
@@ -869,12 +871,16 @@ fn restart_formats_json_document() {
         "unknown_format"
     );
     assert!(text.contains("no configured format named missing"));
-    let (doc, _) = failed_document(
-        &home,
-        &[
-            "restart", &addr, "--format", "all", "--format", "a", "--json",
-        ],
-        2,
-    );
-    assert_eq!(doc["error"]["code"], "usage");
+    for flags in [
+        &["--format", "a"][..],
+        &["--force"],
+        &["--idle-threshold-secs", "1"],
+    ] {
+        let mut args = vec!["restart", "idle", "--format", "all", "--json"];
+        args.extend(flags);
+        let (doc, _) = failed_document(&home, &args, 2);
+        assert_eq!(doc["schema"], 1);
+        assert_eq!(doc["error"]["code"], "usage");
+        assert_eq!(doc["error"]["details"]["reason"], "format_selection");
+    }
 }

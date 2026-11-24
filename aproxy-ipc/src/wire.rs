@@ -234,7 +234,7 @@ pub enum IpcOp {
 
 impl IpcOp {
     /// 实例支持的全部 op 的名字（快照里的 `ops`）：这里的三个控制 op，加上读请求历史的
-    /// 四个（见 [`ReadOp`]）
+    /// 四个（见 [`ReadOp`]）与 format 的两个（见 [`FormatOp`]）。
     pub const NAMES: [&'static str; 9] = [
         "ping",
         "shutdown",
@@ -672,13 +672,27 @@ pub struct ControlFail {
     pub reason: String,
 }
 /// A valid call returns exactly one of the two keys, including a genuine null result.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
 pub enum ControlReply {
     /// Arbitrary JSON selected by the program.
     Result { result: serde_json::Value },
     /// A valid failure does not discard the session.
     Fail { fail: ControlFail },
+}
+// Decode by key presence: `null` is a result, not a missing field. Other keys are additive.
+impl<'de> Deserialize<'de> for ControlReply {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let mut fields = serde_json::Map::deserialize(deserializer)?;
+        match (fields.remove("result"), fields.remove("fail")) {
+            (Some(result), None) => Ok(Self::Result { result }),
+            (None, Some(value)) => Ok(Self::Fail {
+                fail: serde_json::from_value(value).map_err(D::Error::custom)?,
+            }),
+            _ => Err(D::Error::custom("expected exactly one of result or fail")),
+        }
+    }
 }
 /// A restart always returns one observation per selected entry, in configuration order.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -954,6 +968,29 @@ pub fn parse_request(line: &str) -> Result<Parsed, Rejection> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn control_reply_ignores_extensions_but_requires_one_alternative() {
+        use serde_json::{from_value, json};
+        for value in [
+            json!({"result":null}),
+            json!({"fail":{"code":"off","reason":"disabled"}}),
+        ] {
+            let mut extended = value.clone();
+            extended["revision"] = json!(2);
+            assert_eq!(
+                serde_json::to_value(from_value::<super::ControlReply>(extended).unwrap()).unwrap(),
+                value
+            );
+        }
+        for value in [
+            json!({"revision":2}),
+            json!({"result":null,"fail":null}),
+            json!({"fail":null}),
+        ] {
+            assert!(from_value::<super::ControlReply>(value).is_err());
+        }
+    }
+
     use super::*;
     /// 每个 op 的请求行钉在这里，并且都能被服务端的解析器还原成同一个 op。
     #[test]

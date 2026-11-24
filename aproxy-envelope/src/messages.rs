@@ -239,6 +239,7 @@ impl TryFrom<serde_json::Map<String, serde_json::Value>> for HelloReply {
         }
         let control = obj
             .remove("control")
+            .filter(|v| !v.is_null())
             .map(serde_json::from_value::<ControlOffer>)
             .transpose()?;
         if control

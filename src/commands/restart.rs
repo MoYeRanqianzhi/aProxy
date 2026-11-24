@@ -40,12 +40,17 @@ pub(crate) async fn handle_restart_cmd(
     formats: Vec<String>,
     json: bool,
 ) -> u8 {
-    if let Err(f) = require_idle_for_threshold("restart", target.as_deref(), threshold) {
-        return f.report(json);
-    }
     let format_op = if formats.is_empty() {
         None
     } else {
+        if force || threshold.is_some() {
+            return Failure::rendered(
+                "usage",
+                |l| restart_text::format_flags(l).to_owned(),
+                json!({"reason":"format_selection"}),
+            )
+            .report(json);
+        }
         let all = formats.iter().any(|n| n == "all");
         if (all && formats.len() != 1)
             || formats
@@ -63,6 +68,9 @@ pub(crate) async fn handle_restart_cmd(
             names: (!all).then_some(formats),
         })
     };
+    if let Err(f) = require_idle_for_threshold("restart", target.as_deref(), threshold) {
+        return f.report(json);
+    }
     let mode = StopMode::from_force(force);
     let mut results = Results::new(target.as_deref());
     let selection = match target::select(target.as_deref(), threshold, force).await {

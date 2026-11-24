@@ -544,6 +544,7 @@ class DemoLink implements Link {
     return this.attached ? SESSION : null;
   }
 
+  /** 演示每次都做一个新的 blob: 地址，用不着激活代号 */
   packageUrl(id: string, path: string): string | null {
     return demoPackageUrl(id, path);
   }

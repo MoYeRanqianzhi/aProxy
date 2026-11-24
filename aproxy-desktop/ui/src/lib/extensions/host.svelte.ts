@@ -7,13 +7,14 @@
  * 这里能做的只是让一个出错的扩展不拖垮别的：activate、页面的 render、各种回调都包在 try/catch 里，
  * 出错的扩展在设置页标出原因。挡不住一个有意作恶的扩展——那由安装前的提醒负责。
  *
- * 同一个模块地址在页面的一生里只会执行一次，所以每次加载都给地址带上版本与计数（?v=…&n=…）：
- * 升级、停用后再启用都拿到新代码。旧模块的代码还在内存里，但它的页面、面板、订阅都已经收回。
+ * 同一个模块地址在页面的一生里只会执行一次，所以每次加载都取一个新的激活代号，写进包地址的第一段
+ * （见 link.packageUrl）：升级、停用后再启用，入口与它相对 import 的子模块、引用的图片字体都是新地址、新代码。
+ * 旧模块的代码还在内存里，但它的页面、面板、订阅都已经收回。
  */
 import { untrack } from 'svelte';
 import { link } from '../backend';
 import type { PackageEntry } from '../backend/contract';
-import { toFailure } from '../backend/link';
+import { newGeneration, toFailure } from '../backend/link';
 import { faultText } from '../faults';
 import { mascots } from '../mascot/registry.svelte';
 import type { MascotDefinition } from '../mascot/types';
@@ -102,16 +103,16 @@ class ExtensionHost {
     const l: Loaded = { id, stamp, module: null, cleanups: [] };
     this.loaded.set(id, l);
     this.setState(id, { state: 'loading' });
-    const url = link.packageUrl(id, 'main.mjs');
+    // 这一次加载的代号：入口模块与 api.assets.url 给出的地址都用它，扩展自己拼的相对地址也会带上它
+    const generation = newGeneration();
+    const url = link.packageUrl(id, 'main.mjs', generation);
     try {
       if (!url) throw new Error('main.mjs is missing');
-      // 地址上的查询串被包协议忽略，只用来让页面把它当成一个新模块
-      const sep = url.includes('?') ? '&' : '?';
-      const mod = (await import(/* @vite-ignore */ `${url}${url.startsWith('blob:') ? '' : `${sep}v=${encodeURIComponent(entry.manifest?.version ?? '')}&n=${++this.serial}`}`)) as ExtensionModule;
+      const mod = (await import(/* @vite-ignore */ url)) as ExtensionModule;
       if (this.loaded.get(id) !== l) return;
       if (typeof mod.activate !== 'function') throw new Error('main.mjs does not export activate(api)');
       l.module = mod;
-      await mod.activate(createApi(entry, this.registrar(l)));
+      await mod.activate(createApi(entry, this.registrar(l), generation));
       if (this.loaded.get(id) !== l) return;
       this.setState(id, { state: 'running' });
     } catch (err) {

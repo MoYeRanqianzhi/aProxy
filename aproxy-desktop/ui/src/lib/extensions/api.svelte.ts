@@ -218,7 +218,7 @@ function notYet(): Promise<never> {
   return Promise.reject(new Error('api.formats is not available in this version of aProxy'));
 }
 
-export function createApi(entry: PackageEntry, reg: Registrar): ExtensionApi {
+export function createApi(entry: PackageEntry, reg: Registrar, generation: string): ExtensionApi {
   const id = entry.id;
   const sub = (read: () => unknown, cb: () => void) => reg.track(watch(read, cb));
 
@@ -340,7 +340,7 @@ export function createApi(entry: PackageEntry, reg: Registrar): ExtensionApi {
     },
 
     assets: {
-      url: (path: string) => link.packageUrl(id, String(path).replace(/^\.?\//, '')),
+      url: (path: string) => link.packageUrl(id, String(path).replace(/^\.?\//, ''), generation),
     },
   } satisfies ExtensionApi);
 }

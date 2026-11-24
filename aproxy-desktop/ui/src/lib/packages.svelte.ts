@@ -14,7 +14,7 @@
  */
 import { link } from './backend';
 import type { GithubFacts, PackageCheck, PackageEntry, ReleaseFacts, RepoFacts, Text, Unreachable } from './backend/contract';
-import { toFailure, type Failure } from './backend/link';
+import { newGeneration, toFailure, type Failure } from './backend/link';
 import { t } from './i18n';
 import { overlays } from './overlays.svelte';
 import { ui } from './state.svelte';
@@ -263,7 +263,8 @@ class Packages {
         const key = entry ? `${entry.id}@${entry.manifest?.version}@${entry.installedAt}` : '';
         if (key === this.cssKey) return;
         this.cssKey = key;
-        applyThemeCss(entry ? link.packageUrl(entry.id, 'theme.css') : null);
+        // 每换一次都取新代号：升级后的样式表与它相对引用的图片、字体不会沿用页面缓存里的旧内容
+        applyThemeCss(entry ? link.packageUrl(entry.id, 'theme.css', newGeneration()) : null);
       });
     });
   }

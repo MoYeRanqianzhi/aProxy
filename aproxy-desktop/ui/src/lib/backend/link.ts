@@ -38,9 +38,23 @@ export interface Link {
 
   /**
    * 已装的包里一个文件的地址（主题的 theme.css、扩展的 main.mjs 与 assets/ 下的文件），没有这个文件时为 null。
-   * 桌面窗口里是 Rust 的 aproxy-pkg 协议：同一个包里的相对地址都能解析，查询串被忽略，可以拿来避开模块缓存。
+   * 桌面窗口里是 Rust 的 aproxy-pkg 协议：同一个包里的相对地址都能解析。
+   *
+   * generation 是这一次激活的代号（见 newGeneration），写进地址的第一段（`<id>~<代号>`）。页面按完整地址
+   * 缓存模块与样式表，查询串只管得住入口文件本身，相对引用的子模块、字体、图片会解析回旧地址、拿到旧内容；
+   * 代号在第一段，相对解析会把它带下去，换一次代号，整个包的每个地址都是新的。Rust 一侧只认 id，代号不影响取到的文件
    */
-  packageUrl(id: string, path: string): string | null;
+  packageUrl(id: string, path: string, generation?: string): string | null;
+}
+
+let generations = 0;
+
+/**
+ * 一个新的激活代号：每次加载扩展、每次换主题样式表都取一个。时间戳让页面重新加载之后也不会和上一次的代号撞上，
+ * 计数保证同一毫秒里取的也不同。只用 [0-9a-z-]，长度远小于 Rust 一侧的 64 字节上限
+ */
+export function newGeneration(): string {
+  return `${Date.now().toString(36)}-${(++generations).toString(36)}`;
 }
 
 /** 把任意的拒绝值整理成 Failure：形状不对的一律当作连接问题，原文不外传 */

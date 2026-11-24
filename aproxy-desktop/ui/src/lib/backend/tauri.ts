@@ -62,10 +62,12 @@ class TauriLink implements Link {
   /**
    * Tauri 把自定义协议在 Windows 上映射成 http://<协议名>.localhost/，别的平台是 <协议名>://localhost/；
    * convertFileSrc 知道这个窗口用的是哪一种。它会把整个参数编码掉（包括 /），所以只交给它 id，
-   * 包里的路径逐段编码后接在后面：/ 是分隔符，要原样留着
+   * 包里的路径逐段编码后接在后面：/ 是分隔符，要原样留着。有激活代号时第一段是 `<id>~<代号>`
+   * （convertFileSrc 把 ~ 原样留着或编成 %7E，Rust 一侧两种都认）
    */
-  packageUrl(id: string, path: string): string | null {
-    return `${convertFileSrc(id, 'aproxy-pkg')}/${path.split('/').map(encodeURIComponent).join('/')}`;
+  packageUrl(id: string, path: string, generation?: string): string | null {
+    const first = generation ? `${id}~${generation}` : id;
+    return `${convertFileSrc(first, 'aproxy-pkg')}/${path.split('/').map(encodeURIComponent).join('/')}`;
   }
 
   attach(handler: EventHandler): void {

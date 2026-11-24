@@ -732,10 +732,18 @@
   }
 
   /* ---------- 看护者与最近救回 ---------- */
+  /* 两列都写成 minmax(0, …)：列宽只按比例分，不被里面最长的一行撑开——
+     否则窄窗口下这一行会比页面宽，整页多出一条横向滚动条 */
   .lower {
     display: grid;
-    grid-template-columns: minmax(240px, 0.8fr) 1.6fr;
+    grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.6fr);
     gap: 16px;
+  }
+  /* 再窄（约 1100px 以下）看护者那一栏只剩两百来像素，挤着不好读，改成上下排，两块都占满宽度 */
+  @media (max-width: 1100px) {
+    .lower {
+      grid-template-columns: minmax(0, 1fr);
+    }
   }
   .panel h3 {
     margin: 0;
@@ -802,9 +810,11 @@
     margin: 0;
     padding: 0;
   }
+  /* 一行：结果标签、路径、模型、第几次成功、多久以前。宽度不够时只有路径和模型收窄（各自按原长度
+     成比例地收，末尾省略号），标签、次数与时间保持完整；不用网格是因为网格会先把弹性的路径列压到 0
+     才轮到模型列 */
   .rescues li button {
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto auto auto;
+    display: flex;
     align-items: center;
     gap: 12px;
     width: 100%;
@@ -819,11 +829,22 @@
   .rescues li button:hover {
     background: var(--hover);
   }
-  .rs-path {
+  .rescues li button > :global(*) {
+    flex: none;
+  }
+  .rs-path,
+  .rs-model {
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .rescues li button > .rs-path {
+    flex: 1 1 auto;
     color: var(--text);
+  }
+  .rescues li button > .rs-model {
+    flex: 0 1 auto;
   }
   .rs-model,
   .rs-when {

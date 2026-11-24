@@ -74,6 +74,12 @@ jobs:
             set -- $scene
             dbus-run-session -- python .github/screenshots/scene.py "${{ matrix.exe }}" "shots/${{ matrix.name }}-$1-$2" "$1" "$2" || true
           done
+      # Linux 的标题栏是页面画的（没有窗口管理器的装饰）：用 xdotool 实际拖动、双击、点按钮、改大小，读回结果
+      - name: Check the Linux title bar
+        if: matrix.name == 'linux'
+        run: |
+          export DISPLAY=:99
+          dbus-run-session -- python .github/screenshots/linux-titlebar.py "${{ matrix.exe }}" shots/linux-titlebar
       - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:

@@ -121,8 +121,11 @@
      （`437adeb6`）、两个 skill（`ebacde0b`）。
    - 审查 v25（只读）：19 条，裁定写进 Revision 2，在分支 `codex/t10d-review-fixes`（起点 master `ebacde0b`）续原会话修。
      其中一条改了设计：**新进程握手失败就什么都不替换**，条目按原样运行、`restartedAt` 不变（与 `aproxy restart` 预检
-     不过时旧实例照常运行一致）；界面与 skill 的说法已先改（`cf8531c4`，等修复合入再推）。保护范围按消息算：已发出的消息
+     不过时旧实例照常运行一致）；界面与 skill 的说法已先改（`cf8531c4`）。保护范围按消息算：已发出的消息
      在旧进程上收尾，同一请求后来的消息交给新进程。
+   - 续原会话时中转接口报 `session_account_lost`，一行没改；改派新会话 **t10d-review-fixes**（2026-11-24，任务书
+     `.agents/codex.local/t10d-review-fixes.md`，回执 `t10d-review-fixes.receipt.md`，分支 `codex/t10d-review-fixes`，
+     起点 master `945718cc`），任务就是 t10c 的 Revision 2。
 9a. **随 t10b 顺带**：`cargo update -p url`（到 ≥2.5.9）。RUSTSEC-2026-0592（`Url::origin()` 对嵌套
    `blob:` 递归、栈溢出），2026-11-22 起 main 的 Review 工作流（cargo-deny）因此失败；aproxy-format 的 convert/keys/route
    对配置与上游地址调用 `origin()`，都不是客户端给的输入，风险低。只动 Cargo.lock，验收是 cargo-deny 过、两个变体全量过。

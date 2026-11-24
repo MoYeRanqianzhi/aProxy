@@ -318,6 +318,27 @@ fn desktop_info(state: tauri::State<'_, Mutex<DesktopInfo>>) -> DesktopInfo {
     state.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// 截图与演示用的开关：设了 `APROXY_DESKTOP_DEMO`，页面改用内置的演示数据（与浏览器里预览时同一套），
+/// 窗口外壳照常是真的（标题栏、Mica、交通灯），标题栏照样常驻「演示数据」标签，不会被当成本机的实例。
+/// 值是逗号分隔的词，只认语言（`en`、`zh-CN`）与深浅色（`light`、`dark`），例如 `zh-CN,dark`；其余的词
+/// 忽略，所以拼进页面脚本的只有这几个固定字面量。没设时返回 None，窗口照常读本机数据。
+fn demo_script() -> Option<String> {
+    let value = std::env::var("APROXY_DESKTOP_DEMO").ok()?;
+    let (mut lang, mut mode) = ("system", "system");
+    for word in value.split(',').map(str::trim) {
+        match word {
+            "en" => lang = "en",
+            "zh-CN" => lang = "zh-CN",
+            "light" => mode = "light",
+            "dark" => mode = "dark",
+            _ => {}
+        }
+    }
+    Some(format!(
+        "window.__APROXY_DEMO__ = {{ lang: {lang:?}, mode: {mode:?} }};"
+    ))
+}
+
 /// 建主窗口并装上标题栏、判定 Mica。窗口始终 `visible: false`，由页面调用 `show()`。
 fn open_main_window(app: &tauri::App, data_dir: PathBuf) -> Result<(), Error> {
     let builder = WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::default())
@@ -348,6 +369,10 @@ fn open_main_window(app: &tauri::App, data_dir: PathBuf) -> Result<(), Error> {
             TRAFFIC_LIGHTS.0,
             TRAFFIC_LIGHTS.1,
         ));
+    let builder = match demo_script() {
+        Some(script) => builder.initialization_script(script),
+        None => builder,
+    };
     let window = builder.build().map_err(|e| Error::Startup(e.to_string()))?;
 
     fit_to_monitor(&window);

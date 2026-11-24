@@ -1,7 +1,10 @@
 //! 旧文件只在独立的迁移命令里改写。识别与改写共用键表，避免普通命令把拼写错误误报为旧配置。
 
 use crate::{config, settings};
-use aproxy_ipc::{diag::Diagnostic, i18n::Lang};
+use aproxy_ipc::{
+    diag::Diagnostic,
+    i18n::{Lang, diagnostic::Reason},
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -80,10 +83,18 @@ impl Kind {
         .filter(Diagnostic::is_error)
         .collect()
     }
-    fn legacy(self, d: &Diagnostic, watchdog_bool: bool) -> bool {
+    fn legacy(self, d: &Diagnostic, root: &Value) -> bool {
         let key = d.key.as_deref().unwrap_or("");
         if self == Self::Settings && key == "watchdog" {
-            return d.code == "config_type" && watchdog_bool;
+            return d.code == "config_type" && root["watchdog"].is_boolean();
+        }
+        // process 尚未从 mode 搬过来时解析器默认 spawn；只豁免确实被这次改名消除的约束。
+        if self == Self::Config && d.message == Reason::PersistentStage {
+            return format_key(key).is_some_and(|(i, field)| {
+                field == "process"
+                    && root["format"][i]["mode"] == "persistent"
+                    && root["format"][i].get("process").is_none()
+            });
         }
         if d.code != "config_unknown_key" {
             return false;
@@ -93,8 +104,10 @@ impl Kind {
             Self::Config => {
                 CONFIG.iter().any(|(old, _)| *old == key)
                     || MANUAL.contains(&key)
-                    || format_key(key).is_some_and(|(_, k)| {
-                        k == "extra" || FORMAT.iter().any(|(old, _)| *old == k)
+                    || format_key(key).is_some_and(|(i, k)| {
+                        root.get(key).is_none()
+                            && root["format"][i].get(k).is_some()
+                            && (k == "extra" || FORMAT.iter().any(|(old, _)| *old == k))
                     })
             }
         }
@@ -118,11 +131,16 @@ impl Kind {
     pub fn legacy_file(self, path: &Path) -> bool {
         std::fs::read_to_string(path).is_ok_and(|src| {
             let errors = self.errors(&src, path);
-            let boolean = self == Self::Settings
-                && serde_json::from_str::<Value>(&src)
+            if errors.is_empty() {
+                return false;
+            }
+            let root = match self {
+                Self::Settings => serde_json::from_str(&src)
                     .ok()
-                    .is_some_and(|v| v["watchdog"].is_boolean());
-            !errors.is_empty() && errors.iter().all(|d| self.legacy(d, boolean))
+                    .filter(|_| json_lines(&src).duplicates.is_empty()),
+                Self::Config => config::view::file_value(&src),
+            };
+            root.is_some_and(|v| errors.iter().all(|d| self.legacy(d, &v)))
         })
     }
 }
@@ -189,20 +207,19 @@ impl Plan {
 
 // serde_json 的值不保留位置。在已经通过语法检查的输入里沿结构扫描；用反序列化器读字符串，
 // 所以转义的键、密钥值里形似键的文字、同名的嵌套键都不会把行号指到别处。
-fn json_lines(src: &str) -> std::collections::HashMap<String, u32> {
+#[derive(Default)]
+struct JsonLines {
+    first: std::collections::HashMap<String, u32>,
+    duplicates: Vec<(String, u32)>,
+}
+fn json_lines(src: &str) -> JsonLines {
     use std::collections::HashMap;
     fn skip(s: &str, i: &mut usize) {
         while s.as_bytes().get(*i).is_some_and(u8::is_ascii_whitespace) {
             *i += 1
         }
     }
-    fn walk(
-        src: &str,
-        i: &mut usize,
-        path: &str,
-        lines: &mut HashMap<String, u32>,
-        breaks: &[usize],
-    ) {
+    fn walk(src: &str, i: &mut usize, path: &str, lines: &mut JsonLines, breaks: &[usize]) {
         skip(src, i);
         match src.as_bytes()[*i] {
             b'{' | b'[' => {
@@ -210,6 +227,7 @@ fn json_lines(src: &str) -> std::collections::HashMap<String, u32> {
                 *i += 1;
                 skip(src, i);
                 let mut index = 0;
+                let mut members = HashMap::new();
                 while !matches!(src.as_bytes()[*i], b'}' | b']') {
                     let offset = *i;
                     let child = if obj {
@@ -227,10 +245,22 @@ fn json_lines(src: &str) -> std::collections::HashMap<String, u32> {
                     } else {
                         format!("{path}[{index}]")
                     };
-                    lines.insert(
-                        child.clone(),
-                        1 + breaks.partition_point(|p| *p < offset) as u32,
-                    );
+                    let line = 1 + breaks.partition_point(|p| *p < offset) as u32;
+                    lines.first.entry(child.clone()).or_insert(line);
+                    if obj {
+                        use std::collections::hash_map::Entry;
+                        match members.entry(child.clone()) {
+                            Entry::Vacant(e) => {
+                                e.insert(Some(line));
+                            }
+                            Entry::Occupied(mut e) => {
+                                if let Some(first) = e.get_mut().take() {
+                                    lines.duplicates.push((child.clone(), first));
+                                }
+                                lines.duplicates.push((child.clone(), line));
+                            }
+                        }
+                    }
                     walk(src, i, &child, lines, breaks);
                     skip(src, i);
                     index += 1;
@@ -249,7 +279,7 @@ fn json_lines(src: &str) -> std::collections::HashMap<String, u32> {
             }
         }
     }
-    let mut lines = HashMap::new();
+    let mut lines = JsonLines::default();
     let breaks = src.match_indices('\n').map(|(i, _)| i).collect::<Vec<_>>();
     walk(src, &mut 0, "", &mut lines, &breaks);
     lines
@@ -274,9 +304,7 @@ fn plan(kind: Kind, src: &str, path: &Path, lang: Lang) -> Plan {
         issues: vec![],
     };
     let errors = kind.errors(src, path);
-    if errors.is_empty() {
-        return p;
-    }
+
     let root = match kind {
         Kind::Settings => serde_json::from_str(src).ok(),
         Kind::Config => config::view::file_value(src),
@@ -286,20 +314,41 @@ fn plan(kind: Kind, src: &str, path: &Path, lang: Lang) -> Plan {
     } else {
         Default::default()
     };
+    for (key, n) in &lines.duplicates {
+        p.issue(kind, key, Some(*n), text::duplicate(lang));
+    }
+    if errors.is_empty() {
+        return p;
+    }
     let line = |key: &str| match kind {
-        Kind::Settings => lines.get(key).copied(),
-        Kind::Config => config::file::locate(src, key).map(|p| p.0),
+        Kind::Settings => lines.first.get(key).copied(),
+        Kind::Config => {
+            if let Some(index) = key
+                .strip_prefix("bounded_retry_paths[")
+                .and_then(|s| s.strip_suffix(']'))
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                let doc = toml_edit::Document::parse(src).ok()?;
+                let span = doc
+                    .get("bounded_retry_paths")?
+                    .as_array()?
+                    .get(index)?
+                    .span()?;
+                return Some(1 + src[..span.start].bytes().filter(|&b| b == b'\n').count() as u32);
+            }
+            config::file::locate(src, key).map(|p| p.0)
+        }
     };
     let boolean = root.as_ref().is_some_and(|v| v["watchdog"].is_boolean());
     for d in &errors {
         let k = d.key.as_deref().unwrap_or("");
-        if kind.legacy(d, boolean) {
+        if kind.legacy(d, root.as_ref().unwrap_or(&Value::Null)) {
             if MANUAL.contains(&k) || format_key(k).is_some_and(|(_, f)| f == "extra") {
                 p.issue(kind, k, d.line.or_else(|| line(k)), text::manual(lang));
             }
         } else if kind == Kind::Settings
             && k == "defaults.base_url"
-            && d.code == "config_missing_key"
+            && d.message == Reason::DefaultsBase
         {
             let defaults = &root.as_ref().unwrap()["defaults"];
             if defaults.get("api_key").is_some() {
@@ -365,6 +414,13 @@ fn plan(kind: Kind, src: &str, path: &Path, lang: Lang) -> Plan {
                 }
             }
         }
+    }
+    // 以源文档的位置为准；稳定排序使同一个读取超时的两个目标仍然相邻。
+    if kind == Kind::Config {
+        moves.sort_by_cached_key(|(old, _, index, _)| {
+            let key = index.map_or_else(|| (*old).to_owned(), |i| format!("format[{i}].{old}"));
+            config::file::locate(src, &key)
+        });
     }
     for (old, new, index, v) in moves {
         let prefix = index.map(|i| format!("format[{i}].")).unwrap_or_default();
@@ -459,7 +515,8 @@ fn plan(kind: Kind, src: &str, path: &Path, lang: Lang) -> Plan {
                 {
                     for step in chain {
                         if let Some(url) = step["url"].as_str() {
-                            step["url"] = json!(aproxy_ipc::redact::url(url));
+                            // 未识别的扩展字段留在原文件，不进入给人或机器的报告。
+                            *step = json!({"url":aproxy_ipc::redact::url(url)});
                         }
                     }
                 }
@@ -501,10 +558,20 @@ fn check_candidate(
 ) {
     for d in ds {
         let dest = d.key.as_deref().unwrap_or("");
-        if dest == "defaults.base_url" && d.code == "config_missing_key" && kind == Kind::Settings {
+        if dest == "defaults.base_url"
+            && d.message == Reason::DefaultsBase
+            && kind == Kind::Settings
+        {
             continue;
         }
-        let key = source_key(&p.changes, dest).to_owned();
+        let old = source_key(&p.changes, dest);
+        let key = if old == "bounded_retry_paths" {
+            dest.split_once("rules[")
+                .and_then(|(_, s)| s.split_once(']'))
+                .map_or_else(|| old.to_owned(), |(index, _)| format!("{old}[{index}]"))
+        } else {
+            old.to_owned()
+        };
         if !p
             .issues
             .iter()
@@ -621,6 +688,38 @@ fn toml_move(table: &mut dyn TableLike, old: &str, new: &str, value: &Value) -> 
         table.remove(old);
     }
     let (target, key) = if let Some((parent, key)) = new.split_once('.') {
+        // 有注释的值不能原样塞进行内表（# 会吞掉右花括号）。只在需要时展开父表，
+        // 把原行的前后注释交给表头，子项的注释继续跟着子项。
+        if !secondary
+            && table.get(parent).is_some_and(Item::is_inline_table)
+            && (key_decor
+                .as_ref()
+                .and_then(|d| d.prefix())
+                .and_then(|s| s.as_str())
+                .is_some_and(|s| s.contains('#'))
+                || decor
+                    .as_ref()
+                    .and_then(|d| d.suffix())
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|s| s.contains('#'))
+                || item.is_array_of_tables())
+        {
+            let prefix = table
+                .key(parent)
+                .unwrap()
+                .leaf_decor()
+                .prefix()
+                .cloned()
+                .unwrap_or_default();
+            let slot = table.get_mut(parent).unwrap();
+            let inline = slot.as_inline_table().unwrap();
+            let suffix = inline.decor().suffix().cloned().unwrap_or_default();
+            let mut block = inline.clone().into_table();
+            block.decor_mut().set_prefix(prefix);
+            block.decor_mut().set_suffix(suffix);
+            *slot = Item::Table(block);
+            table.key_mut(parent).unwrap().leaf_decor_mut().clear();
+        }
         let parent = table.entry(parent).or_insert(Item::Table(Table::new()));
         let Some(t) = parent.as_table_like_mut() else {
             return false;
@@ -831,6 +930,98 @@ mod tests {
             assert_eq!(mapped(Kind::Config, src).pointer(new), Some(&to), "{src}");
         }
     }
+    #[test]
+    fn nested_download_fields_stay_on_disk_not_in_changes_or_issues() {
+        let src = r#"{"download_chain":[{"url":"https://user:secret@mirror.example/?key=secret","nested":[{"extra_headers":{"Authorization":"secret"}}]}]}"#;
+        let p = plan(Kind::Settings, src, Path::new("settings.json"), Lang::En);
+        assert!(p.next.unwrap().contains("secret"));
+        assert!(!json!([p.changes, p.issues]).to_string().contains("secret"));
+    }
+
+    #[test]
+    fn duplicate_members_and_invalid_patterns_report_original_lines() {
+        for (kind, src, keys) in [
+            (
+                Kind::Settings,
+                "{\n \"watchdog\":false,\n \"watchdog\":{},\n \"log_rotate_mb\":1}",
+                vec![("watchdog", 2), ("watchdog", 3)],
+            ),
+            (
+                Kind::Settings,
+                "{\n \"ui\":{\"x\":1,\n \"x\":2}}",
+                vec![("ui.x", 2), ("ui.x", 3)],
+            ),
+            (
+                Kind::Settings,
+                "{\n \"defaults\":{\n \"base_url\":\"\"}}",
+                vec![("defaults.base_url", 3)],
+            ),
+            (
+                Kind::Settings,
+                "{\n \"defaults\":{\n \"base_url\":\"\"},\"log_rotate_mb\":1}",
+                vec![("defaults.base_url", 3)],
+            ),
+            (
+                Kind::Config,
+                "bounded_retry_paths=[\n '[',\n '(',\n]",
+                vec![("bounded_retry_paths[0]", 2), ("bounded_retry_paths[1]", 3)],
+            ),
+            (
+                Kind::Settings,
+                "{\"bounded_retry_paths\":[\n \"[\",\n \"(\"]}",
+                vec![("bounded_retry_paths[0]", 2), ("bounded_retry_paths[1]", 3)],
+            ),
+        ] {
+            let p = plan(kind, src, Path::new("sample"), Lang::En);
+            assert!(p.next.is_none() && p.changes.is_empty());
+            for (key, line) in keys {
+                assert!(
+                    p.issues
+                        .iter()
+                        .any(|i| i.key.as_deref() == Some(key) && i.line == Some(line)),
+                    "{}",
+                    json!(p.issues)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_real_format_entries_explain_a_legacy_stage_conflict() {
+        for (src, legacy) in [
+            (
+                "[[format]]\ncommand='tool'\nstages=['stream']\nmode='persistent'",
+                true,
+            ),
+            (
+                "[[format]]\ncommand='tool'\nstages=['stream']\nmode='spawn'",
+                false,
+            ),
+            ("'format[0].mode'='spawn'", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("client.toml");
+            std::fs::write(&path, src).unwrap();
+            assert_eq!(Kind::Config.legacy_file(&path), legacy, "{src}");
+            let p = plan(Kind::Config, src, &path, Lang::En);
+            assert_eq!(p.next.is_some(), legacy, "{}", json!(p.issues));
+        }
+    }
+
+    #[test]
+    fn moved_comments_and_keys_keep_source_order_in_an_inline_destination() {
+        let src = "read_timeout_secs=4 # read limit\nconnect_timeout_secs=5 # dial limit\n# parent\ntimeouts={} # all\n";
+        let p = plan(Kind::Config, src, Path::new("sample"), Lang::En);
+        let next = p.next.expect("valid TOML with both comments");
+        let mut rest = next.as_str();
+        for k in ["first_byte_secs", "read_idle_secs", "connect_secs"] {
+            rest = rest.split_once(k).unwrap().1;
+        }
+        for comment in ["# read limit", "# dial limit", "# parent", "# all"] {
+            assert_eq!(next.matches(comment).count(), 1, "{next}");
+        }
+    }
+
     #[test]
     fn formatted_values_keep_their_place_and_comments() {
         let src = "base_url='http://localhost'\n# body cap\nmax_body_mb = 0x10 # cap\ndisk_cache=true\nread_timeout_secs=9 # both waits\nbounded_retry_paths=[\n # first pattern\n '/a',\n # second pattern\n '/b',\n]\n";

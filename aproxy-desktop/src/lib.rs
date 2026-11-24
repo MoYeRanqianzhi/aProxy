@@ -322,6 +322,9 @@ fn desktop_info(state: tauri::State<'_, Mutex<DesktopInfo>>) -> DesktopInfo {
 /// 窗口外壳照常是真的（标题栏、Mica、交通灯），标题栏照样常驻「演示数据」标签，不会被当成本机的实例。
 /// 值是逗号分隔的词，只认语言（`en`、`zh-CN`）与深浅色（`light`、`dark`），例如 `zh-CN,dark`；其余的词
 /// 忽略，所以拼进页面脚本的只有这几个固定字面量。没设时返回 None，窗口照常读本机数据。
+/// 只编进 debug 构建：发布的二进制里没有这个开关，用户的窗口不会因为一个环境变量显示假数据。
+/// 页面那一侧只认这里注入的标记（ui/src/lib/backend/index.ts），所以 release 里开关是关死的。
+#[cfg(debug_assertions)]
 fn demo_script() -> Option<String> {
     let value = std::env::var("APROXY_DESKTOP_DEMO").ok()?;
     let (mut lang, mut mode) = ("system", "system");
@@ -369,6 +372,7 @@ fn open_main_window(app: &tauri::App, data_dir: PathBuf) -> Result<(), Error> {
             TRAFFIC_LIGHTS.0,
             TRAFFIC_LIGHTS.1,
         ));
+    #[cfg(debug_assertions)]
     let builder = match demo_script() {
         Some(script) => builder.initialization_script(script),
         None => builder,

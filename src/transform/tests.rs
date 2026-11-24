@@ -627,7 +627,7 @@ async fn shutdown_reaps_a_checked_out_worker_before_returning() {
         p.ids.lock().unwrap().is_empty(),
         "shutdown returned before the child exited"
     );
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     assert_eq!(crate::process::process_exited(pid), Some(true));
     assert!(matches!(p.turn(false).await, Err(Fault::Died)));
     drop(held);

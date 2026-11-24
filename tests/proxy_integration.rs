@@ -5231,7 +5231,7 @@ fn daemon_lifecycle_start_status_stop() {
 
     // 身份判定：守护登记的启动标记必须与现算的一致（看门狗收养/选举/
     // 处决关卡与 stop --force 的全部前置；pid + 启动标记，与二进制名无关）
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     {
         let rec = aproxy::daemon::read_instance_file_in(&run_dir, &port.to_string())
             .expect("守护应已写注册表");

@@ -470,8 +470,8 @@ async fn lock_install(home: &Path) -> Result<super::InstallLock, InstallFailure>
 }
 
 /// 被拉起的接手者进程。unix 留着 Child：它是本进程的子进程，没接手就退出时会
-/// 变成僵尸，按 pid 查进程态认不出（macOS 上更是查不了），try_wait 判活并顺带
-/// 收割。Windows 经 spawn_detached 拉起：不继承句柄，接手者不会捏着本进程的
+/// 变成僵尸，父进程用 try_wait 同时确认退出并收割。
+/// Windows 经 spawn_detached 拉起：不继承句柄，接手者不会捏着本进程的
 /// stdout 管道，让调用 install 的人等它退出才读到 EOF；判活查退出码。
 struct Successor {
     pid: u32,
@@ -524,9 +524,7 @@ impl Successor {
         }
     }
 
-    /// 已接手：本进程不再管它，但 unix 上还得收割——它退出后若一直是僵尸，
-    /// 等结局时按 pid 判活会把它当成还活着，「接手者已死而安装未终结」要拖到
-    /// 等待超时才报出来（见 commands/install.rs 的 await_handover）。
+    /// 已接手：不用再等它完成，但 unix 上仍须异步 wait，以免它退出后占着僵尸表项。
     fn detach(self) {
         #[cfg(unix)]
         {

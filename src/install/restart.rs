@@ -159,8 +159,8 @@ fn restore_spec(run_dir: &Path, port: &str) -> Result<InstanceSpec, Cause> {
 /// 两段确认，缺一不可：
 /// 1. IPC 消失（管道/ socket 没了 = 服务停止）——**不等于进程终止**：守护
 ///    的 shutdown 流程先关 IPC 再做清理最后进程退出，中间有窗口；
-/// 2. 进程终止（stop 前从注册表取 pid 锚点，轮询 process_start_time 变
-///    None）——Windows 镜像锁随终止释放，cleaning 删让位的旧二进制（= 被停实例
+/// 2. 进程终止（stop 前从注册表取 pid 锚点，轮询 process_exited 确认
+///    退出）——Windows 镜像锁随终止释放，cleaning 删让位的旧二进制（= 被停实例
 ///    的运行镜像）依赖此确认，否则删除被锁失败残留。
 ///
 /// 超时 = Err（调用方决定处置，绝不强杀——绝对避免服务中断原则贯穿

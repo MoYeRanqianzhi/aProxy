@@ -473,8 +473,8 @@ fn only_verified_ledger_processes_are_stopped() {
         assert!(!entry.exists(), "{} 应已删除", entry.display());
     }
     assert!(garbage.exists(), "解析不了的文件不归强制安装处理");
-    // 枚举进程、查镜像路径只在 Windows 与 Linux 上做得到
-    if cfg!(any(windows, target_os = "linux")) {
+    // 能枚举进程并读取镜像路径的平台必须报告这个 pid，但不能结束它
+    if cfg!(any(windows, target_os = "linux", target_os = "macos")) {
         assert!(
             output.contains(&stray.id().to_string()) && output.contains("不在台账里"),
             "{output}"

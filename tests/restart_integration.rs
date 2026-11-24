@@ -585,7 +585,7 @@ fn release_asset_named_instance_is_adopted_respawned_and_force_stoppable() {
         "重拉应沿用看护者自身镜像（资产名）: {}",
         image.display()
     );
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     assert!(
         !live.instance.start.is_empty(),
         "新实例应登记启动标记（身份锚点）"

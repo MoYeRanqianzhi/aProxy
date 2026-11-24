@@ -4,7 +4,7 @@
 //! 身份有两种锚点，都只用于相等比较：
 //! - **启动标记**（字符串，见 [`aproxy_ipc::ledger::start_marker`]）：实例记录、看护者记录
 //!   与台账里登记的都是它，[`record_identity`] 与 [`terminate_marked_process`] 按它核验；
-//! - **创建时间**（数字；Windows 为 FILETIME，unix 为 /proc/<pid>/stat 的 starttime）：只给
+//! - **创建时间**（数字；Windows 为 FILETIME，Linux 为开机滴答，macOS 为 Unix 纪元以来的微秒）：只给
 //!   「刚拉起、还没写下任何记录的子进程」与安装状态用。
 
 pub use aproxy_ipc::registry::{RecordIdentity, process_exited, record_identity};
@@ -38,7 +38,7 @@ impl TerminationError {
     }
 }
 
-/// 查询进程创建时间（FILETIME/滴答）；进程不存在返回 None。
+/// 查询进程创建时间（单位见模块说明）；进程不存在或无权限查询时返回 None。
 /// 供 spawn 前登记与收养时建立身份基线。
 pub fn process_start_time(pid: u32) -> Option<u64> {
     imp_process::process_start_time(pid)
@@ -92,7 +92,7 @@ pub fn terminate_marked_process(pid: u32, expected_start: &str) -> Result<(), Te
 /// - Windows：在**同一个进程句柄**上先 GetProcessTimes 核验、后
 ///   TerminateProcess。句柄打开后即钉住该进程对象（其 pid 在句柄关闭前不会
 ///   被复用），核验与终止之间不存在 pid 复用窗口。
-/// - unix：读 /proc/<pid>/stat 的 starttime 核验后 kill(pid, SIGKILL)。核验与
+/// - unix：读内核的创建时间核验后 kill(pid, SIGKILL)。核验与
 ///   kill 之间仍有理论窗口（无 pidfd 时的平台固有边界），需要进程恰在这
 ///   微秒级窗口内退出、且 pid 恰被回收再分配才会误中。
 ///
@@ -211,7 +211,7 @@ mod imp {
     ///
     /// 不能只用 kill(pid,0)：它对 zombie（已死未收割）也返回成功——守护的
     /// 父进程（start/测试/看护者自己）不 wait 之前死亡事件永远不触发。
-    /// 须读 /proc 的进程态排除 Z。无 /proc 的平台（macOS）回退 kill(pid,0)。
+    /// Linux 从 procfs、macOS 从 libproc 读取进程态，无需自己是它的父进程。
     pub fn wait_blocking(handle: isize) {
         let pid = handle as i32;
         loop {
@@ -222,11 +222,14 @@ mod imp {
         }
     }
 
-    /// 死亡等待的存在性探测：/proc 可用（Linux）时 zombie 视为死亡；
-    /// 无 /proc（macOS）回退 kill(pid,0)（EPERM 视为存活，其余错误为死亡）。
-    /// 已知退化：回退分支对 zombie 失效——kill(pid,0) 对已死未收割的进程
-    /// 也返回成功，死亡事件会延迟到 health_scan 兜底。macOS 属未实测平台，
-    /// 接受此退化；若未来需要，可改 waitid(WNOHANG) 或进程状态查询。
+    /// 无法读取进程态时继续等，权限不足不是触发重拉的依据。
+    #[cfg(target_os = "macos")]
+    fn process_alive_for_wait(pid: i32) -> bool {
+        super::process_exited(pid as u32) != Some(true)
+    }
+
+    /// procfs 可读时排除僵尸，否则用信号 0 查询存在性（EPERM 也说明进程存在）。
+    #[cfg(not(target_os = "macos"))]
     fn process_alive_for_wait(pid: i32) -> bool {
         if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             // stat 形如 "pid (comm) S ..."，comm 可含空格/括号，取 ')' 之后首字段
@@ -240,7 +243,7 @@ mod imp {
         if r == 0 {
             return true;
         }
-        std::io::Error::last_os_error().raw_os_error() == Some(1)
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 
     /// SIGKILL 处决（挂死判定后调用）：unix 直接以句柄中保存的 pid 杀进程。
@@ -251,10 +254,10 @@ mod imp {
         }
     }
     pub fn close_handle(_handle: isize) {}
-    /// 核验后终止（语义见 super::terminate_verified_process）：/proc 的
-    /// starttime 比对通过、且进程未退出（非 zombie）才 SIGKILL。unix 无可
+    /// 核验后终止（语义见 super::terminate_verified_process）：内核创建时间
+    /// 比对通过、且进程未退出（非 zombie）才 SIGKILL。unix 无可
     /// 钉住进程的句柄对象，核验与 kill 之间的微秒级窗口是平台固有边界。
-    /// 无 /proc 的平台读不到创建时间，一律按「已退出/不可核验」拒绝。
+    /// 读不到创建时间时，一律按「已退出/不可核验」拒绝。
     pub fn terminate_verified(pid: u32, expected_start: u64) -> Result<(), String> {
         match super::imp_process::process_start_time(pid) {
             None => {
@@ -358,7 +361,7 @@ mod imp_process {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 mod imp_process {
     /// /proc/<pid>/stat 的 starttime（字段 22，时钟滴答）。
     pub fn process_start_time(pid: u32) -> Option<u64> {
@@ -378,8 +381,52 @@ mod imp_process {
     }
 }
 
+/// macOS 的进程快照只用于清点；读取某个 pid 的镜像时，进程可能已经退出。
+#[cfg(target_os = "macos")]
+pub(crate) use imp_process::process_ids;
+
+#[cfg(target_os = "macos")]
+mod imp_process {
+    pub use aproxy_ipc::registry::process_start_time;
+
+    /// proc_listallpids 的缓冲区大小用字节，返回值却是 pid 个数。快照刚好填满时
+    /// 可能有进程没列出来，扩大缓冲区再取；枚举失败不据此推断任何进程已退出。
+    pub(crate) fn process_ids() -> Vec<u32> {
+        let mut pids = vec![0u32; 256];
+        loop {
+            let Ok(bytes) = i32::try_from(std::mem::size_of_val(&pids[..])) else {
+                return Vec::new();
+            };
+            let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+            if count <= 0 {
+                return Vec::new();
+            }
+            if (count as usize) < pids.len() {
+                pids.truncate(count as usize);
+                pids.retain(|&pid| pid > 0);
+                return pids;
+            }
+            pids.resize(pids.len() * 2, 0);
+        }
+    }
+
+    /// proc_pidpath 返回路径字节数（不含 NUL）；进程刚退出或无权限读取时返回 0。
+    /// 保留原始字节，路径只用来判断安装位置，不用来认定进程身份。
+    pub fn process_image_path(pid: u32) -> Option<std::path::PathBuf> {
+        use std::os::unix::ffi::OsStringExt;
+        let pid = i32::try_from(pid).ok().filter(|&pid| pid > 0)?;
+        let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let len = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+        if len <= 0 {
+            return None;
+        }
+        path.truncate(len as usize);
+        Some(std::ffi::OsString::from_vec(path).into())
+    }
+}
+
 // 测试辅助函数给 watchdog、daemon 的测试共用（被测对象同样是名字与 aProxy 无关的子进程）
-#[cfg(all(test, any(windows, target_os = "linux")))]
+#[cfg(all(test, any(windows, target_os = "linux", target_os = "macos")))]
 pub(crate) mod tests {
     use super::*;
     use std::time::Duration;
@@ -389,8 +436,7 @@ pub(crate) mod tests {
     // 下列测试用一个**名字与 aProxy 毫无关系**的子进程（Windows 的 PING.EXE /
     // unix 的 sleep）当被测对象：旧的名称判定会一律拒绝它，新判定只看
     // 「pid + 创建时间」——测试通过即证明身份判定已与名称解耦。子进程均由
-    // 测试自己 spawn 并持有句柄，结束前自行回收。macOS 无 /proc 读不到创建
-    // 时间（不在本轮支持范围），相关测试只在 Windows/Linux 编译运行。
+    // 测试自己 spawn 并持有句柄，结束前自行回收。
 
     /// 拉起一个长时间存活、无副作用、名字与 aProxy 无关的子进程
     pub(crate) fn spawn_unrelated_child() -> std::process::Child {
@@ -400,7 +446,7 @@ pub(crate) mod tests {
             c.args(["-n", "60", "127.0.0.1"]);
             c
         };
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         let mut cmd = {
             let mut c = std::process::Command::new("sleep");
             c.arg("60");
@@ -423,6 +469,28 @@ pub(crate) mod tests {
         false
     }
 
+    /// 数字锚点和台账字符串必须标识同一次启动；小数点后的微秒不补零。
+    /// 枚举只是安装后的报告依据，不代替 pid 和创建时间的身份核验。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_process_queries_agree_with_ledger_and_executable() {
+        let pid = std::process::id();
+        let micros = process_start_time(pid).unwrap();
+        assert_eq!(
+            aproxy_ipc::ledger::start_marker(pid).unwrap(),
+            format!("m:{}.{}", micros / 1_000_000, micros % 1_000_000)
+        );
+        assert_eq!(
+            process_image_path(pid).unwrap().canonicalize().unwrap(),
+            std::env::current_exe().unwrap().canonicalize().unwrap()
+        );
+        assert!(process_ids().contains(&pid));
+        assert_eq!(process_exited(0), None);
+        assert_eq!(process_exited(u32::MAX), Some(true));
+        assert_eq!(process_start_time(u32::MAX), None);
+        assert_eq!(process_image_path(u32::MAX), None);
+    }
+
     #[test]
     fn record_identity_classifies_alive_reused_legacy_gone() {
         let mut child = spawn_unrelated_child();
@@ -437,9 +505,10 @@ pub(crate) mod tests {
         // 空的登记值证明不了身份：即便 pid 在世也不算 Alive
         assert_eq!(record_identity(pid, ""), RecordIdentity::Gone);
         // 已退出但未回收（unix zombie / Windows 被 Child 句柄维持的对象）：
-        // 标记仍算得出且一致，但必须判 Gone——死进程不得计入存活集合
+        // 不论系统还能否读到标记，都必须判 Gone——死进程不得计入存活集合
         child.kill().unwrap();
         std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(process_exited(pid), Some(true));
         assert_eq!(record_identity(pid, &start), RecordIdentity::Gone);
         child.wait().unwrap();
         // 不存在的 pid

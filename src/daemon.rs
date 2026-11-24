@@ -2016,19 +2016,18 @@ mod tests {
 
     // ---------------- 进程身份（pid + 创建时间，与二进制名称无关） ----------------
     //
-    // 被测对象是名字与 aProxy 无关的子进程（Windows PING.EXE / Linux sleep），
+    // 被测对象是名字与 aProxy 无关的子进程（Windows PING.EXE / unix sleep），
     // 由测试自己 spawn 并回收：旧的镜像名关卡会一律拒绝它，新判定只看 pid +
-    // 创建时间。macOS 读不到创建时间（不在本轮支持范围），只在 Windows/Linux
-    // 编译运行。端口用 597xx 段：没有其他测试在用，避免与「端点必须无人应答」
+    // 创建时间。端口用 597xx 段：没有其他测试在用，避免与「端点必须无人应答」
     // 的测试（59xxx）互相干扰。
 
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     use crate::process::tests::{spawn_unrelated_child, wait_child_exit};
 
     /// stop --force 的身份策略：登记时间不符（pid 复用）拒绝；无时间戳的旧
     /// 记录且端点无人应答（归属无从证明）拒绝；身份一致即终止——被杀的进程
     /// 名字与 aProxy 无关，证明判定不看名称
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn force_terminate_checks_identity_not_name() {
         let mut child = spawn_unrelated_child();
@@ -2071,7 +2070,7 @@ mod tests {
     /// 重拉/恢复落到新端口后退役旧端口记录：同端口不动；旧端口记录属于已死
     /// 进程 → 期望状态记录与实例记录一并删除；旧端口已被另一个在世实例接手（身份
     /// 核验通过，或旧版本记录 pid 在世无从核验）→ 记录归它，不动
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn port_move_does_not_remove_a_new_desire_published_during_startup() {
         let dir = tempfile::tempdir().unwrap();
@@ -2099,7 +2098,7 @@ mod tests {
         ));
     }
 
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn retire_moved_port_records_only_touches_dead_owner() {
         let dir = tempfile::tempdir().unwrap();
@@ -3859,7 +3858,7 @@ mod tests {
     }
 
     /// 保护期内谁都能读；超过保护期则按创建标记区分写者与占用同一 pid 的其他进程。
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn expired_startup_result_distinguishes_reused_and_live_writers() {
         let home = tempfile::tempdir().unwrap();

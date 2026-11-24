@@ -39,7 +39,7 @@
 //!    是否拉回只按台账判断：被结束实例的端口上出现了新的、版本等于目标版本的 instance
 //!    条目才算；没回来的按端口与配置文件（条目的 `config`）列出怎样启动 → 12。
 //! 7. 报告不在台账里、却从 `<home>/bin/` 运行的进程（例如 0.1.x 留下的，但不一定是），
-//!    只报告、不结束。macOS 上查不到别的进程的镜像路径，这一步不做。
+//!    只报告、不结束。
 //!
 //! 强制安装不更新 skill 文档，结束时提示怎样更新。
 
@@ -1087,8 +1087,8 @@ fn restore_and_check(
 /// 从 `dir` 里（或其下）的文件运行的进程（pid，镜像路径）：枚举全部进程（见
 /// [`process_ids`]），逐个查镜像路径（`process::process_image_path`），用
 /// [`super::file_is_within`] 比较所在目录——镜像路径保留启动时的写法（例如 8.3 短名），
-/// 要解析成真实路径再比。查不到镜像路径的进程（别的用户的、刚退出的）跳过；macOS 上
-/// 镜像路径查不到，结果恒为空。只供第 7 步报告，不参与结束任何进程——结束只认台账。
+/// 要解析成真实路径再比。查不到镜像路径的进程（别的用户的、刚退出的）跳过。
+/// 只供第 7 步报告，不参与结束任何进程——结束只认台账。
 pub fn processes_running_from(dir: &Path) -> Vec<(u32, PathBuf)> {
     process_ids()
         .into_iter()
@@ -1140,16 +1140,19 @@ fn process_ids() -> Vec<u32> {
         .collect()
 }
 
+#[cfg(target_os = "macos")]
+use crate::process::process_ids;
+
 /// 全部进程的 pid。其余平台不枚举（`process::process_image_path` 在这些平台上也查不到
 /// 镜像路径），第 7 步的报告因此为空。
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn process_ids() -> Vec<u32> {
     Vec::new()
 }
 
 /// 第 7 步：报告不在台账里、却从 `<home>/bin/` 运行的进程。它们可能是 0.1.x 留下的（0.1.x
 /// 不写台账），也可能是放在 bin 里的别的程序，所以措辞不下结论。只报告，不结束：结束
-/// 进程只认台账里核验过的条目。macOS 上查不到别的进程的镜像路径，结果恒为空。
+/// 进程只认台账里核验过的条目。
 fn report_strays(home: &Path) {
     let me = std::process::id();
     let known: Vec<u32> = ledger::read_all_in(home)

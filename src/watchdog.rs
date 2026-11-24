@@ -1534,7 +1534,7 @@ mod imp_heart {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     use crate::process::tests::{spawn_unrelated_child, wait_child_exit};
 
     /// 给 `port` 写一份期望状态记录；规格指向一个不存在的配置文件（这些测试都不会
@@ -1766,7 +1766,7 @@ mod tests {
 
     /// 比本版本旧的看护者被实例启动时退役；同版本、更新版本、版本说不清的不动，别的角色
     /// 不动。找它们靠台账，被测进程的名字与 aProxy 无关——身份只认 pid + 启动标记
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn instance_startup_retires_only_older_watchdogs() {
         use aproxy_ipc::ledger;
@@ -1889,7 +1889,7 @@ mod tests {
     /// 收养按「pid + 登记的启动标记」核验：名字与 aProxy 无关的进程只要记录里的
     /// 标记一致即被收养（改名二进制的单元级等价物）；标记不符（pid 复用）
     /// 与未登记标记的一律不收养；收养后死亡 watcher 挂在正确的进程上
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn adopt_scan_uses_start_time_identity_not_name() {
         let dir = tempfile::tempdir().unwrap();
@@ -1929,7 +1929,7 @@ mod tests {
 
     /// 处决关卡按收编时的启动标记：不符（pid 已被复用）不杀，一致即杀——
     /// 被测进程名字与 aProxy 无关，旧名称关卡会一律跳过处决
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn health_scan_execution_guard_uses_start_time() {
         let dir = tempfile::tempdir().unwrap();

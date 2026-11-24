@@ -88,7 +88,7 @@ mod tests {
 
     /// 没有任何实例应答的 home：挂死的、等恢复的、死进程留下的、读不懂的各占一个端口，
     /// 清点把它们分清，并且不删任何文件。
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn silent_ports_are_told_apart_and_nothing_is_deleted() {
         let home = tempfile::tempdir().unwrap();

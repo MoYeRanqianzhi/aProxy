@@ -244,7 +244,7 @@ pub enum RecordIdentity {
 
 /// 核验记录身份：`recorded_start` 为记录登记的启动标记。
 /// 「已退出但进程对象仍在」（unix zombie、Windows 被句柄维持的已退出对象）
-/// 一律算 Gone——它们的标记仍算得出且与登记一致，但进程已死，不能计入
+/// 一律算 Gone——即便标记仍算得出且与登记一致，进程也已死，不能计入
 /// 选举的存活集合，也不该被收养或处决。
 ///
 /// 空的登记值不是可比对的锚点（平台算不出标记时登记的就是空串）：这样的
@@ -279,6 +279,9 @@ pub fn process_exited(pid: u32) -> Option<bool> {
     process_platform::process_exited(pid)
 }
 
+#[cfg(target_os = "macos")]
+pub use process_platform::process_start_time;
+
 mod process_platform {
     #[cfg(windows)]
     /// 进程是否已退出：用零超时等待进程句柄，不把合法退出码 259 当成存活。即使进程
@@ -308,8 +311,7 @@ mod process_platform {
         }
     }
     /// 进程是否已退出：/proc/<pid>/stat 的进程态——'Z'（zombie，已退出未
-    /// 收割）与文件不存在（已收割）都算已退出。macOS 无 /proc 回退
-    /// kill(pid,0)：ESRCH = 已退出；EPERM = 活着（权限拒绝但存在）。
+    /// 收割）与文件不存在（已收割）都算已退出。
     #[cfg(all(unix, not(target_os = "macos")))]
     pub fn process_exited(pid: u32) -> Option<bool> {
         match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
@@ -324,24 +326,52 @@ mod process_platform {
         }
     }
 
-    /// macOS 没有 procfs；信号 0 只查询正 pid 的存在性。这里只认 ESRCH 为已退出，
-    /// EPERM 说明进程仍在；未收割的僵尸要等父进程收割之后才能观察到退出。
+    /// PROC_PIDTBSDINFO 的非零参数让内核也查未收割的进程；否则僵尸与不存在的 pid
+    /// 都返回 ESRCH。只接受完整结构，权限不足等失败不是进程已结束的证据。
+    #[cfg(target_os = "macos")]
+    fn bsd_info(pid: u32) -> std::io::Result<libc::proc_bsdinfo> {
+        use std::io::Error;
+        let pid = i32::try_from(pid).map_err(|_| Error::from_raw_os_error(libc::ESRCH))?;
+        if pid == 0 {
+            return Err(Error::from_raw_os_error(libc::EINVAL));
+        }
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                1,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if written == size {
+            Ok(unsafe { info.assume_init() })
+        } else if written <= 0 {
+            Err(Error::last_os_error())
+        } else {
+            Err(Error::from(std::io::ErrorKind::UnexpectedEof))
+        }
+    }
+
+    /// macOS 在世进程的创建时刻，以 Unix 纪元以来的微秒表示。与台账 `m:秒.微秒`
+    /// 取自同一对内核字段；小数点后是不补零的整数，不能按十进制小数解析。
+    /// 进程已退出、系统不允许查询（例如跨用户）时都没有可核验的数字锚点。
+    #[cfg(target_os = "macos")]
+    pub fn process_start_time(pid: u32) -> Option<u64> {
+        let info = bsd_info(pid).ok()?;
+        (info.pbi_status != libc::SZOMB)
+            .then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+    }
+
+    /// macOS 在父进程 wait 之前也按进程态判死；只有 ESRCH 能证明 pid 已不在。
     #[cfg(target_os = "macos")]
     pub fn process_exited(pid: u32) -> Option<bool> {
-        // 超出 pid_t 表示范围的一定不是进程。不得截断再调用 kill：负值会查询进程组。
-        let Ok(pid) = i32::try_from(pid) else {
-            return Some(true);
-        };
-        if pid == 0 {
-            return None;
-        }
-        if unsafe { libc::kill(pid, 0) } == 0 {
-            return Some(false);
-        }
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) => Some(true),
-            Some(libc::EPERM) => Some(false),
-            _ => None,
+        match bsd_info(pid) {
+            Ok(info) => Some(info.pbi_status == libc::SZOMB),
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Some(true),
+            Err(_) => None,
         }
     }
 }

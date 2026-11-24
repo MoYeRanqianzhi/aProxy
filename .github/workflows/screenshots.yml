@@ -65,7 +65,7 @@ jobs:
           brew install displayplacer
           displayplacer list
           id=$(displayplacer list | awk '/^Persistent screen id:/ {print $4; exit}')
-          mode=$(displayplacer list | grep -m1 'res:1920x1080' | sed -E 's/^ *mode ([0-9]+):.*//')
+          mode=$(displayplacer list | grep -m1 'res:1920x1080' | sed -E 's/^ *mode ([0-9]+):.*/\1/')
           displayplacer "id:$id mode:$mode"
           sleep 2
           displayplacer list | grep -i 'resolution:'

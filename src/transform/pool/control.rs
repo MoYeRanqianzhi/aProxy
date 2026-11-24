@@ -20,6 +20,14 @@ impl Default for Lane {
         }
     }
 }
+/// 握手和业务回信使用各自的字节预算，但越界在控制端点是同一种故障。
+fn reply_issue(fault: Fault) -> ControlIssue {
+    match fault {
+        Fault::TooLarge => ControlIssue::TooLarge,
+        Fault::Timeout => ControlIssue::Timeout,
+        _ => ControlIssue::Protocol,
+    }
+}
 impl Pool {
     /// 排空或换代时立即关闭空闲会话；正在交换帧则由持有管道的任务收走进程。
     pub(super) fn stop_control(&self) {
@@ -54,6 +62,10 @@ impl Pool {
         let mut slot = tokio::time::timeout_at(deadline, self.control.worker.lock())
             .await
             .map_err(|_| ControlIssue::Timeout)?;
+        // timeout_at 先轮询锁；锁与期限同时就绪时，不得取走健康会话或取消它的空闲计时。
+        if Instant::now() >= deadline {
+            return Err(ControlIssue::Timeout);
+        }
         if let Some(timer) = self.control.idle_timer.lock().unwrap().take() {
             timer.abort()
         }
@@ -64,18 +76,25 @@ impl Pool {
         {
             self.retire(slot.take().unwrap())
         }
+        // 已归还后才写出的帧可能恰好带着下一条调用的序号；不能等读回信后才检查。
+        if slot
+            .as_mut()
+            .is_some_and(|w| w.exited.is_finished() || !matches!(w.reusable(), Ok(true)))
+        {
+            drop(slot.take());
+        }
         let exchange = async {
             // 先取走再 await：取消、崩溃或半帧时 Drop 只强退此进程，不能把错位的管道交给下一人。
             let mut w = match slot.take() {
-                Some(w) if !w.exited.is_finished() => w,
-                _ => {
+                Some(w) => w,
+                None => {
                     let (mut w, id) = self
                         .start_process(&offer.control.as_ref().unwrap().args, None, None)
                         .await
                         .map_err(|_| ControlIssue::Spawn)?;
                     self.handshake(&mut w, id, None, true)
                         .await
-                        .map_err(|_| ControlIssue::Protocol)?;
+                        .map_err(reply_issue)?;
                     w
                 }
             };
@@ -84,6 +103,9 @@ impl Pool {
             )
             .unwrap();
             line.push(b'\n');
+            if Instant::now() >= deadline {
+                return Err(ControlIssue::Timeout);
+            }
             w.stdin
                 .as_mut()
                 .unwrap()
@@ -92,13 +114,7 @@ impl Pool {
                 .map_err(|_| ControlIssue::Protocol)?;
             let line = read_reply(&mut w.stdout, FRAME_OVERHEAD)
                 .await
-                .map_err(|e| {
-                    if matches!(e, Fault::Invalid) {
-                        ControlIssue::TooLarge
-                    } else {
-                        ControlIssue::Protocol
-                    }
-                })?;
+                .map_err(reply_issue)?;
             let mut frame: serde_json::Map<String, Value> =
                 serde_json::from_slice(&line).map_err(|_| ControlIssue::Protocol)?;
             if frame.get("v").and_then(Value::as_u64) != Some(1)

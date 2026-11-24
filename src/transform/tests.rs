@@ -377,7 +377,7 @@ async fn reply_limit_is_enforced_before_newline_or_eof() {
     let mut endless = BufReader::with_capacity(7, tokio::io::repeat(b'x'));
     assert!(matches!(
         read_reply(&mut endless, 31).await,
-        Err(Fault::Invalid)
+        Err(Fault::TooLarge)
     ));
     for (input, ok) in [(b"abc\n".as_slice(), true), (b"abcd\n", false)] {
         let mut r = BufReader::with_capacity(2, input);
@@ -1171,6 +1171,10 @@ async fn control_waiting_capacity_is_independent() {
             .insert("ECHO_OBSERVE".into(), log.display().to_string());
     });
     p.probe().await.unwrap();
+    // 外部进程用真实管道；阻塞任务存活时 Tokio 不会因为运行队列暂时为空而自动快进。
+    tokio::time::pause();
+    let (release_clock, clock) = std::sync::mpsc::channel::<()>();
+    let watchdog = tokio::task::spawn_blocking(move || clock.recv_timeout(Duration::from_secs(30)));
     let mut held = std::pin::pin!(p.control_call("hold", json!(gate)));
     tokio::select! {_=&mut held=>panic!("early reply"),_=wait_observed(&log,"control",1)=>{}}
     let mut queue = Vec::new();
@@ -1194,5 +1198,71 @@ async fn control_waiting_capacity_is_independent() {
     for r in futures_util::future::join_all(queue).await {
         r.unwrap();
     }
+    release_clock.send(()).unwrap();
+    watchdog.await.unwrap().unwrap();
+    tokio::time::resume();
+    p.shutdown().await;
+}
+
+/// 迟到的合法序号不是下一调用的回信；真正的下一条必须由干净进程处理。
+#[tokio::test]
+async fn idle_control_stray_with_expected_sequence_is_discarded() {
+    use serde_json::{Value, json};
+    let d = tempfile::tempdir().unwrap();
+    let log = d.path().join("events");
+    let gate = d.path().join("release");
+    let p = pool(Process::Persistent, "control-role", |e| {
+        e.env
+            .insert("ECHO_OBSERVE".into(), log.display().to_string());
+    });
+    p.probe().await.unwrap();
+    let first = p.control_call("pid", Value::Null).await.unwrap();
+    p.control_call("unsolicited", json!(gate)).await.unwrap();
+    std::fs::write(&gate, b"").unwrap();
+    wait_observed(&log, "stray-written", 1).await;
+    let next = p.control_call("pid", Value::Null).await.unwrap();
+    assert_ne!(first, next);
+    assert!(serde_json::to_value(next).unwrap()["result"].is_u64());
+    p.shutdown().await;
+}
+/// 排队者在交接时已过期：既不写控制帧，也不丢弃刚归还的健康进程。
+#[tokio::test]
+async fn expired_control_handoff_keeps_idle_session() {
+    use aproxy_ipc::wire::ControlIssue;
+    use serde_json::Value;
+    let d = tempfile::tempdir().unwrap();
+    let log = d.path().join("events");
+    let gate = d.path().join("release");
+    let p = pool(Process::Persistent, "control-role", |e| {
+        e.env
+            .insert("ECHO_OBSERVE".into(), log.display().to_string());
+    });
+    p.probe().await.unwrap();
+    let pid = p.control_call("pid", Value::Null).await.unwrap();
+    let mut held = std::pin::pin!(p.control_call("hold", serde_json::json!(gate)));
+    tokio::select! {_=&mut held=>panic!("early reply"),_=wait_observed(&log,"control",2)=>{}}
+    let mut late = std::pin::pin!(p.control_call("crash", Value::Null));
+    assert!(futures_util::poll!(&mut late).is_pending());
+    std::fs::write(gate, b"").unwrap();
+    held.await.unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert_eq!(late.await, Err(ControlIssue::Timeout));
+    tokio::time::resume();
+    assert_eq!(p.control_call("pid", Value::Null).await.unwrap(), pid);
+    p.shutdown().await;
+}
+/// 控制 hello 超过自身的 64 KiB 限制，与超大控制回信一样报 too-large。
+#[tokio::test]
+async fn oversized_control_hello_reports_size() {
+    let p = pool(Process::Persistent, "control-role", |e| {
+        e.env
+            .insert("ECHO_OVERSIZE_CONTROL_HELLO".into(), "1".into());
+    });
+    p.probe().await.unwrap();
+    assert_eq!(
+        p.control_call("pid", serde_json::Value::Null).await,
+        Err(aproxy_ipc::wire::ControlIssue::TooLarge)
+    );
     p.shutdown().await;
 }

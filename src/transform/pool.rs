@@ -103,7 +103,7 @@ async fn read_reply<R: tokio::io::AsyncBufRead + Unpin>(
             return Ok(line);
         }
         if visible.len() == remaining {
-            return Err(Fault::Invalid);
+            return Err(Fault::TooLarge);
         }
         let n = visible.len();
         line.extend_from_slice(visible);
@@ -234,6 +234,8 @@ pub(crate) enum Fault {
     Timeout,
     /// 版本、帧边界或序号不相符。
     Protocol,
+    /// 换行不在当前阶段的字节预算内；业务面仍归类为 invalid_output。
+    TooLarge,
     /// 收到匹配的帧，但它的内容不合法。
     Invalid,
     /// 握手成功但程序未声明这些配置阶段。
@@ -250,7 +252,7 @@ impl Fault {
             Self::Died => "died",
             Self::Timeout => "timeout",
             Self::Protocol | Self::Stages(_) => "protocol",
-            Self::Invalid => "invalid_output",
+            Self::Invalid | Self::TooLarge => "invalid_output",
             Self::Open { .. } => "open",
         }
     }
@@ -269,7 +271,7 @@ impl Fault {
             Self::Died => super::fault_text::died(lang),
             Self::Timeout => super::fault_text::timeout(lang),
             Self::Protocol => super::fault_text::protocol(lang),
-            Self::Invalid => super::fault_text::invalid(lang),
+            Self::Invalid | Self::TooLarge => super::fault_text::invalid(lang),
             Self::Stages(_) => super::fault_text::stages(lang),
         }
     }

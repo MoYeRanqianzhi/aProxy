@@ -241,6 +241,10 @@ fn main() {
                 r["control"] = json!({"args":["control-peer"]});
             }
             if mode == "control-peer" {
+                if std::env::var_os("ECHO_OVERSIZE_CONTROL_HELLO").is_some() {
+                    unfinished_frame(65536);
+                    return;
+                }
                 assert_eq!(m["process"], "persistent");
                 assert_eq!(m["stages"], json!(["control"]));
                 assert_eq!(m["worker_id"], u32::MAX);
@@ -629,6 +633,12 @@ fn main() {
         out.flush().unwrap();
         if stage == "heartbeat" && mode == "race-beat" {
             observe("reply-flushed", Some(seq));
+        }
+        if mode == "control-peer" && m["method"] == "unsolicited" {
+            wait_gate(std::path::Path::new(m["params"].as_str().unwrap()));
+            writeln!(out, "{}", json!({"v":1,"seq":seq+1,"result":"unsolicited"})).unwrap();
+            out.flush().unwrap();
+            observe("stray-written", Some(seq + 1));
         }
         if count != 0 && mode == "late-stray" {
             let dir = std::path::Path::new(arg);

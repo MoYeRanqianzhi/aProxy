@@ -587,11 +587,12 @@ supported on macOS.
   milliseconds). The watchdog rewrites it every scan; it counts as active while its process is alive
   and `last_scan_at` is within three scan periods (never less than 90 s). `aproxy start` launches
   one if none is active, and every instance checks every 5 minutes
-  and launches a replacement if needed, logging `看护者缺席，已由守护补种（选举胜出者）` ("watchdog absent;
-  relaunched by an instance"). With no instances left and no respawn pending for `watchdog.idle_exit_secs`,
+  and launches a replacement if needed, logging "Watchdog was absent; this instance won the election and
+  started it" in the instance's log. With no instances left and no respawn pending for `watchdog.idle_exit_secs`,
   it exits; an instance still waiting for its 300 s slow retry keeps it running.
-- `aproxy status` does not show the watchdog. To check it, read `watchdog.json` (is `last_scan_at`
-  recent, is the PID alive) and `<home>/logs/watchdog.log`, where the watchdog writes in English
+- `aproxy status` ends with a `Watchdog:` line: its PID, version and the time since its last scan, or
+  "no scan for ..." when it may be stuck; no line means no watchdog is recorded. For details, read
+  `run/watchdog.json` and `<home>/logs/watchdog.log`, where the watchdog writes in English
   what it did and why: instances it terminated as hung, every respawn and its result, the switch to
   slow retries, instances it stopped watching, takeovers and its own exit.
 - Limits: a respawn does not save requests in flight when the process died; their clients see a reset

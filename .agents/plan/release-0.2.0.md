@@ -467,6 +467,19 @@
 - 现状（2026-11-24）：0.2.0 的进程登记表已有 macOS 实现（`aproxy-ipc/src/ledger.rs` 用 `proc_pidinfo`），
   2026-09 记下的 3 个 lib 测试在 macOS 上已通过；`src/process.rs` 的 `imp_process`（创建时间、镜像路径）
   仍只读 `/proc`。CI 的 macos job 跑 `cargo test` 不带 `--no-fail-fast`，此前只看得到第一个失败的测试文件。
+- 2026-11-24 排查结果：macOS 上 34 个测试失败（12 个测试文件），根因归成五类（进程创建时间、僵尸判定、镜像路径
+  读不到；测试把「绑定未监听」当连不上、绑 127.0.0.2），清单与分组写在任务书 `.agents/codex.local/t15-macos.md`，
+  交 Codex（t15，分支 `codex/t15-macos`，worktree `.worktrees/macos-fix`）。真机已过：启动、状态、转发、doctor、
+  停止、看护者拉起被杀实例与被实例补种、restart、`install --from` 与同版本滚动升级、`install --force` 的确认；
+  已复现的缺陷：管辖检查在 macOS 上被跳过。
+- 界面（用户 2026-11-24：渲染正确只认截图；标题栏要自定义，不用系统原生的）：macOS 改成 Overlay 标题栏
+  （`37035d17`），交通灯 y=24.5 是截图量出来的（tao 的 y 不是按钮顶边，见 `aproxy-desktop/src/lib.rs` 的
+  TRAFFIC_LIGHTS）；浅色、深色、拖动、双击缩放、⌘K、各页面都在 runner 上截图核对过。截图做法：交互工作流
+  `macos-shell.yml` 的等待步骤代为 `screencapture`（经 SSH 起的进程没有屏幕录制权限），鼠标用 `cliclick`。
+  同一轮修了最小宽度下三处各平台共有的问题（`cc752669`、`77224738`）。
+- 还没做：macOS 菜单栏的应用名显示为小写的 `aproxy`（裸二进制取进程名，打成 .app 才有 CFBundleName）；
+  配置页显示的路径会被规范化成 `/private/tmp/...`，与实例页的 `/tmp/...` 不一致（家目录下的配置不受影响）；
+  t15 合入后在 runner 上再截一轮，并在 Windows 上确认标题栏没有变化。
 
 ### W7 发布
 - 版本 0.2.0（是否先发预发布版待定）、CHANGELOG、README / docs / skill 同步、skill references 是否留存

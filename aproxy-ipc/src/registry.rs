@@ -337,6 +337,8 @@ mod process_platform {
         }
         let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        // SAFETY: PROC_PIDTBSDINFO 的输出布局就是 proc_bsdinfo；指针按该结构对齐，
+        // 指向的独占可写空间恰有 size 字节，调用期间一直有效。
         let written = unsafe {
             libc::proc_pidinfo(
                 pid,
@@ -347,6 +349,7 @@ mod process_platform {
             )
         };
         if written == size {
+            // SAFETY: 该 flavor 成功写满一个完整结构才初始化了所有字段，短写不能读取。
             Ok(unsafe { info.assume_init() })
         } else if written <= 0 {
             Err(Error::last_os_error())

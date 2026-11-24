@@ -199,8 +199,8 @@ pub fn install_dir_in(home: &Path) -> PathBuf {
 /// 文件 `file` 是否在目录 `dir` 里或其下。安装的管辖检查（实例的二进制是否在
 /// `<home>/bin/` 下）与强制安装第 7 步的报告（哪些进程从 bin 运行）都用它判断。
 ///
-/// 比较的是解析后的真实路径：两边都先 canonicalize，再按 settings::path_match_key 归一
-/// （去 `\\?\` 前缀；Windows 上统一分隔符并转小写）。同一个目录可以有好几种写法——
+/// 比较真实路径的原生分量，不拿显示字符串当身份键：两个非 Unicode 目录名可能显示成同样的字。
+/// 同一个目录也可以有好几种写法——
 /// Windows 的 8.3 短名（`C:\Users\RUNNER~1\…` 与 `C:\Users\runneradmin\…`）、符号链接与
 /// junction、`\\?\` 前缀。进程的镜像路径（QueryFullProcessImageNameW）保留的是启动时
 /// 用的写法，经短名启动的进程报出来就带着短名（本机实测）；`<home>` 可能来自展开成长名
@@ -208,21 +208,29 @@ pub fn install_dir_in(home: &Path) -> PathBuf {
 /// bin 里的实例当成管辖外而拒绝安装，第 7 步漏报。
 ///
 /// 解析的是 `file` 所在的目录而不是文件本身：镜像文件可能已被改名或删除（交换时让位、
-/// unix 上被 rename 覆盖），它所在的目录还在。解析不了的（已不存在、没有权限）退回原样。
+/// unix 上被 rename 覆盖），它所在的目录还在。目录不存在时尽量解析还在的祖先，
+/// 剩余分量保留原样；不能解析的 `..` 可能跨过符号链接，不凭它认定管辖权。
 pub fn file_is_within(file: &Path, dir: &Path) -> bool {
-    let Some(parent) = file.parent() else {
-        return false;
-    };
-    let key = |p: &Path| {
-        let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-        let mut key = crate::settings::path_match_key(&real.display().to_string());
-        // 以分隔符收尾再比前缀：`…\bin2` 不能算在 `…\bin` 下
-        if !key.ends_with(std::path::MAIN_SEPARATOR) {
-            key.push(std::path::MAIN_SEPARATOR);
+    fn resolved(path: &Path) -> Option<PathBuf> {
+        let path = std::path::absolute(path).ok()?;
+        for ancestor in path.ancestors() {
+            if let Ok(real) = ancestor.canonicalize() {
+                let tail = path.strip_prefix(ancestor).ok()?;
+                if tail
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+                {
+                    return None;
+                }
+                return Some(real.join(tail));
+            }
         }
-        key
-    };
-    key(parent).starts_with(&key(dir))
+        None
+    }
+    file.parent()
+        .and_then(resolved)
+        .zip(resolved(dir))
+        .is_some_and(|(parent, dir)| parent.starts_with(dir))
 }
 
 /// 安装锁的文件名：`<home>/install/lock`。
@@ -506,6 +514,26 @@ mod tests {
         // 目录不存在时按原样比较
         let gone = home.path().join("gone");
         assert!(file_is_within(&gone.join("x"), &gone));
+    }
+
+    /// 可显示成同一字符串的两个目录不属于同一管辖范围；APFS 拒绝非 UTF-8 名字时也测未解析的尾段。
+    #[cfg(unix)]
+    #[test]
+    fn file_is_within_keeps_native_path_components_distinct() {
+        use std::os::unix::ffi::OsStrExt;
+        let home = tempfile::tempdir().unwrap();
+        let managed = home.path().join("h�").join("bin");
+        let foreign = home
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"h\xff"))
+            .join("bin");
+        std::fs::create_dir_all(&managed).unwrap();
+        if let Err(e) = std::fs::create_dir_all(&foreign) {
+            assert_eq!(e.raw_os_error(), Some(libc::EILSEQ));
+        }
+        assert!(file_is_within(&managed.join("aproxy"), &managed));
+        assert!(!file_is_within(&foreign.join("aproxy"), &managed));
+        assert!(!file_is_within(&managed.join("aproxy"), &foreign));
     }
 
     /// Windows 的 8.3 短名：同一个目录的短名写法与长名写法必须判成同一个目录（CI 的临时

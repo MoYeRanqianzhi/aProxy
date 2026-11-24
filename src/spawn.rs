@@ -46,9 +46,8 @@ pub enum SpawnError {
         report: Option<Box<startup::LaunchReport>>,
     },
     /// 时限内没有就绪。`start` 是 spawn 之后立刻读到的进程创建时间（身份锚点）：回收卡住的
-    /// 子进程时按「pid + 创建时间」核验再终止，等待期间 pid 若已被系统复用给别的进程，届时
-    /// 现读的创建时间必然对不上，绝不误杀；None = 没读到（进程瞬间退出或平台不支持），此时
-    /// 不要终止它。`alive` = 时限到时它确认仍在运行
+    /// 子进程时，Windows 在同一句柄上核验并终止；没有锚点就不按 pid 终止。unix 的拉起者
+    /// 持有自己的 Child，不必由 pid 重新定位。`alive` = 时限到时它确认仍在运行
     TimedOut {
         pid: u32,
         start: Option<u64>,
@@ -250,10 +249,29 @@ pub async fn spawn_from_spec(
     spec: &InstanceSpec,
     timeout: Duration,
 ) -> Result<InstanceStatus, SpawnError> {
+    spawn_from_spec_with_timeout_action(home, exe, spec, timeout, OnReadyTimeout::LeaveRunning)
+        .await
+}
+
+/// 普通启动超时不剥夺实例随后就绪的机会；只有准备回退时才清走占着端口的子进程。
+#[derive(Clone, Copy)]
+pub(crate) enum OnReadyTimeout {
+    LeaveRunning,
+    StopBeforeRollback,
+}
+
+/// 只对自己拉起的进程执行超时策略；旁观者不持有子进程，也不经过此路径。
+pub(crate) async fn spawn_from_spec_with_timeout_action(
+    home: &Path,
+    exe: &Path,
+    spec: &InstanceSpec,
+    timeout: Duration,
+    on_timeout: OnReadyTimeout,
+) -> Result<InstanceStatus, SpawnError> {
     let run_dir = home.join("run");
     let mark = startup_log_len(home);
     let spec_path = spec::write_spec_file(&run_dir, spec).map_err(SpawnError::Spawn)?;
-    let result = launch_and_wait(home, exe, spec, &spec_path, mark, timeout).await;
+    let result = launch_and_wait(home, exe, spec, &spec_path, mark, timeout, on_timeout).await;
     let _ = std::fs::remove_file(&spec_path);
     result
 }
@@ -265,6 +283,7 @@ async fn launch_and_wait(
     spec_path: &Path,
     mark: u64,
     timeout: Duration,
+    on_timeout: OnReadyTimeout,
 ) -> Result<InstanceStatus, SpawnError> {
     let args = [
         "__serve".to_string(),
@@ -287,8 +306,62 @@ async fn launch_and_wait(
         env: &env,
         cwd: Some(home),
     };
+    #[cfg(unix)]
+    let mut child = tokio::process::Command::from(daemon::detached_command(exe, &args, &launch))
+        .spawn()
+        .map_err(SpawnError::Spawn)?;
+    #[cfg(unix)]
+    let pid = child.id().expect("刚拉起、尚未收割的子进程有 pid");
+    #[cfg(windows)]
     let pid = daemon::spawn_detached_with(exe, &args, &launch).map_err(SpawnError::Spawn)?;
-    wait_ready(home, pid, spec_path, None, mark, timeout).await
+    let result = wait_ready(home, pid, spec_path, None, mark, timeout).await;
+    if matches!(on_timeout, OnReadyTimeout::StopBeforeRollback)
+        && matches!(result, Err(SpawnError::TimedOut { .. }))
+    {
+        // unix 上保留 Child 直到决策结束：尚未 wait 的子进程即使已经退出，pid 也不会复用。
+        // kill 同时 wait；其余路径只丢弃句柄，不杀进程，Tokio 负责后续收割。
+        #[cfg(unix)]
+        match tokio::time::timeout(Duration::from_secs(5), child.kill()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(pid, error = %e, "Could not terminate the unready process; attempting rollback")
+            }
+            Err(_) => tracing::warn!(
+                pid,
+                "Could not confirm the unready process exited; attempting rollback"
+            ),
+        }
+        #[cfg(windows)]
+        if let Err(SpawnError::TimedOut {
+            alive: true, start, ..
+        }) = &result
+        {
+            reap_unready_child(pid, *start).await;
+        }
+    }
+    result
+}
+
+/// Windows 的分离启动不保留句柄；只能在同一句柄上核验最初的创建时间并终止。
+#[cfg(windows)]
+async fn reap_unready_child(pid: u32, start: Option<u64>) {
+    let Some(start) = start else {
+        tracing::warn!(
+            pid,
+            "Cannot verify the unready process creation time; leaving it running and attempting rollback"
+        );
+        return;
+    };
+    if let Err(e) = crate::process::terminate_verified_process(pid, start) {
+        tracing::warn!(pid, error = %e, "Could not terminate the unready process; attempting rollback");
+        return;
+    }
+    for _ in 0..50 {
+        if crate::process::process_exited(pid) == Some(true) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// 旁观者只能看到本次运行的已脱敏错误，不能接触原始启动规格。文件名只含两个数字；
@@ -391,5 +464,42 @@ async fn wait_ready(
             });
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(all(unix, test))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// 模拟迟迟不登记的二进制；回退开始前必须已收割，而不只是按 pid 发过信号。
+    #[tokio::test]
+    async fn rollback_timeout_reaps_its_own_child() {
+        let home = tempfile::tempdir().unwrap();
+        let exe = home.path().join("unready");
+        std::fs::write(&exe, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let spec = spec::capture(None, Default::default(), &home.path().join("test.log"));
+        let err = spawn_from_spec_with_timeout_action(
+            home.path(),
+            &exe,
+            &spec,
+            Duration::ZERO,
+            OnReadyTimeout::StopBeforeRollback,
+        )
+        .await
+        .unwrap_err();
+        let SpawnError::TimedOut { pid, .. } = err else {
+            panic!("{err:?}")
+        };
+        // WNOHANG 不等进程退出；已收割时内核返回 ECHILD，而非正在运行或尚有退出码可取。
+        assert_eq!(
+            unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 }

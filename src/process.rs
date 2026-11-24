@@ -92,9 +92,8 @@ pub fn terminate_marked_process(pid: u32, expected_start: &str) -> Result<(), Te
 /// - Windows：在**同一个进程句柄**上先 GetProcessTimes 核验、后
 ///   TerminateProcess。句柄打开后即钉住该进程对象（其 pid 在句柄关闭前不会
 ///   被复用），核验与终止之间不存在 pid 复用窗口。
-/// - unix：读内核的创建时间核验后 kill(pid, SIGKILL)。核验与
-///   kill 之间仍有理论窗口（无 pidfd 时的平台固有边界），需要进程恰在这
-///   微秒级窗口内退出、且 pid 恰被回收再分配才会误中。
+/// - unix：按数字 pid 发信号。macOS 上最后一次读创建时间与 kill 不是同一个系统调用；
+///   若不是自己仍持有的未收割子进程，两者之间退出、收割并复用 pid 的窗口无法消除。
 ///
 /// `expected_start == 0` 不是可比对的锚点，直接拒绝。不符/已退出/终止失败
 /// 均返回 Err（信息已含原因）——宁可漏杀不误杀。
@@ -255,26 +254,33 @@ mod imp {
     }
     pub fn close_handle(_handle: isize) {}
     /// 核验后终止（语义见 super::terminate_verified_process）：内核创建时间
-    /// 比对通过、且进程未退出（非 zombie）才 SIGKILL。unix 无可
-    /// 钉住进程的句柄对象，核验与 kill 之间的微秒级窗口是平台固有边界。
+    /// 比对通过、且进程未退出（非 zombie）才 SIGKILL。退出探测也按 pid 查询，
+    /// 可能看到另一代进程，所以发信号前最后一个系统查询必须再次核对创建时间。
     /// 读不到创建时间时，一律按「已退出/不可核验」拒绝。
     pub fn terminate_verified(pid: u32, expected_start: u64) -> Result<(), String> {
-        match super::imp_process::process_start_time(pid) {
-            None => {
-                return Err(format!(
-                    "pid {pid} has exited or its creation time cannot be read"
-                ));
-            }
-            Some(actual) if actual != expected_start => {
-                return Err(format!(
-                    "the creation time of pid {pid} differs from the record; refusing to terminate a reused pid"
-                ));
-            }
-            Some(_) => {}
-        }
+        terminate_with_start_query(pid, expected_start, super::imp_process::process_start_time)
+    }
+
+    /// 两次取样共用同一条终止路径，使进程恰在退出探测期间换代也能单独验证。
+    pub(super) fn terminate_with_start_query(
+        pid: u32,
+        expected_start: u64,
+        mut read_start: impl FnMut(u32) -> Option<u64>,
+    ) -> Result<(), String> {
+        let mut verify = || match read_start(pid) {
+            None => Err(format!(
+                "pid {pid} has exited or its creation time cannot be read"
+            )),
+            Some(actual) if actual != expected_start => Err(format!(
+                "the creation time of pid {pid} differs from the record; refusing to terminate a reused pid"
+            )),
+            Some(_) => Ok(()),
+        };
+        verify()?;
         if super::process_exited(pid) == Some(true) {
             return Err(format!("pid {pid} has exited"));
         }
+        verify()?;
         let r = unsafe { kill(pid as i32, 9) };
         if r == 0 {
             Ok(())
@@ -354,7 +360,8 @@ mod imp_process {
             if ok == 0 {
                 return None;
             }
-            Some(std::path::PathBuf::from(String::from_utf16_lossy(
+            use std::os::windows::ffi::OsStringExt;
+            Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(
                 &buf[..len as usize],
             )))
         }
@@ -392,11 +399,18 @@ mod imp_process {
     /// proc_listallpids 的缓冲区大小用字节，返回值却是 pid 个数。快照刚好填满时
     /// 可能有进程没列出来，扩大缓冲区再取；枚举失败不据此推断任何进程已退出。
     pub(crate) fn process_ids() -> Vec<u32> {
-        let mut pids = vec![0u32; 256];
+        process_ids_with_capacity(256)
+    }
+
+    /// 以给定容量开始采样；改变首轮容量可以验证填满缓冲区后的重试，而不依赖机器上的进程数。
+    pub(super) fn process_ids_with_capacity(capacity: usize) -> Vec<u32> {
+        let mut pids = vec![0u32; capacity];
         loop {
             let Ok(bytes) = i32::try_from(std::mem::size_of_val(&pids[..])) else {
                 return Vec::new();
             };
+            // SAFETY: libproc 写 pid_t 数组（Darwin 上为 32 位整数）；切片已初始化、对齐，
+            // bytes 是整块可写空间的字节数。只消费本次返回的 pid，不读缓冲区余量。
             let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
             if count <= 0 {
                 return Vec::new();
@@ -416,6 +430,7 @@ mod imp_process {
         use std::os::unix::ffi::OsStringExt;
         let pid = i32::try_from(pid).ok().filter(|&pid| pid > 0)?;
         let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: 可写字节数组已初始化，长度是 libproc 接受的最大路径容量；只取返回的路径字节。
         let len = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
         if len <= 0 {
             return None;
@@ -467,6 +482,18 @@ pub(crate) mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         false
+    }
+
+    /// 初始缓冲区放不下两个不同的活 pid；两者都在结果里，至少一个必然来自重试。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_pid_list_keeps_pids_beyond_the_first_buffer() {
+        let mut child = spawn_unrelated_child();
+        let pid = child.id();
+        let pids = imp_process::process_ids_with_capacity(1);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(pids.contains(&std::process::id()) && pids.contains(&pid));
     }
 
     /// 数字锚点和台账字符串必须标识同一次启动；小数点后的微秒不补零。
@@ -543,6 +570,13 @@ pub(crate) mod tests {
         assert!(terminate_verified_process(pid, start.wrapping_add(1)).is_err());
         // 无锚点（0）→ 拒绝
         assert!(terminate_verified_process(pid, 0).is_err());
+        // 第一次核验仍匹配，但退出探测期间 pid 换了代；最后一查必须拦住信号。
+        #[cfg(unix)]
+        {
+            let mut starts = [start, start.wrapping_add(1)].into_iter();
+            assert!(imp::terminate_with_start_query(pid, start, |_| starts.next()).is_err());
+            assert_eq!(starts.len(), 0);
+        }
         std::thread::sleep(Duration::from_millis(200));
         assert!(
             child.try_wait().unwrap().is_none(),

@@ -1317,9 +1317,20 @@
   waiter and installer distinguish a dead-but-unreaped process from a live one. Installation jurisdiction and
   force-install stray reporting can read native executable paths; the frozen ledger and the rule that strays
   are never killed are unchanged. See [Darwin exit evidence](../memory/darwin-exit-evidence.md).
-  - **Verified on arm64 macOS:** both workspace variants passed (1,312 passed, 0 failed, 12 ignored each),
+  - **Verified on arm64 macOS:** both workspace variants passed (1,317 passed, 0 failed, 12 ignored each),
     as did both all-target Clippy gates. `--adopt` moved an outside instance into `bin/`, force-install restored
     two instances and left an unregistered executable alive, and a mismatched marker protected a suspended process.
-  - **Other platforms:** both Windows suites passed (1,313 passed, 0 failed, 11 ignored each), as did desktop
-    and headless Clippy and the Linux cross-check. The unchanged force-install contract was also run on native Linux.
+  - **Other platforms:** both Windows suites passed (1,314 passed, 0 failed, 11 ignored each), as did desktop
+    and headless Clippy and the Linux cross-check. Native Linux also passed the force contract, raw-byte directory
+    containment and owned-child rollback tests.
+  - **Exit and identity:** closing IPC is not proof that an instance has released its port. A rolling stop waits
+    for positive exit evidence; an aged handoff file is kept on an unknown writer status unless a `.result`
+    marker proves PID reuse. Rollback can kill and reap its own Unix child. For a non-child on macOS, the
+    last start-time comparison and `kill(pid)` are separate calls; PID reuse between them is still possible.
+  - **Frozen force-install boundaries:** each home belongs to one OS user. Pre-confirmation cleanup treats an
+    unreadable creation time as an exited installer. In an unsupported writable home shared by users, one
+    installer could therefore delete another live user's `install/force/<pid>/` and its staged binary.
+    The final stray report also applies Linux's ` (deleted)` suffix normalization on macOS: a literal suffix
+    is omitted. Its lossy input can conflate non-Unicode directory names on filesystems that permit them;
+    this affects reporting, not which processes are killed. Ordinary install compares native path components.
   - **Boundary:** workflow changes are proposals, not evidence of a hosted CI gate or an interactive desktop test.

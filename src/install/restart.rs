@@ -159,22 +159,20 @@ fn restore_spec(run_dir: &Path, port: &str) -> Result<InstanceSpec, Cause> {
 /// 两段确认，缺一不可：
 /// 1. IPC 消失（管道/ socket 没了 = 服务停止）——**不等于进程终止**：守护
 ///    的 shutdown 流程先关 IPC 再做清理最后进程退出，中间有窗口；
-/// 2. 进程终止（stop 前从注册表取 pid 锚点，轮询 process_exited 确认
+/// 2. 进程终止（从 shutdown 应答取实际接到请求的 pid，轮询 process_exited 确认
 ///    退出）——Windows 镜像锁随终止释放，cleaning 删让位的旧二进制（= 被停实例
 ///    的运行镜像）依赖此确认，否则删除被锁失败残留。
 ///
 /// 超时 = Err（调用方决定处置，绝不强杀——绝对避免服务中断原则贯穿
 /// install 全流程）。
 pub async fn stop_and_wait(run_dir: &Path, port: &str, timeout: Duration) -> Result<(), Cause> {
-    // 停止前取 pid 锚点（注册表由守护 bind 时写入，停止后即删）
-    let pid = crate::daemon::list_instances_in(run_dir)
-        .await
-        .iter()
-        .find(|i| crate::daemon::port_of(&i.instance.listen_addr) == port)
-        .map(|i| i.instance.pid);
-    crate::daemon::ipc_request_in(run_dir, port, crate::daemon::IpcOp::STOP_KEEPING_RESTORE)
-        .await
-        .map_err(|e| Cause::Control(Box::new(e)))?;
+    // 以接受停止的实例为准；不依赖它的注册表记录何时删除，也不为缺失的 pid 放行。
+    let pid =
+        crate::daemon::ipc_request_in(run_dir, port, crate::daemon::IpcOp::STOP_KEEPING_RESTORE)
+            .await
+            .map_err(|e| Cause::Control(Box::new(e)))?
+            .instance
+            .pid;
     let deadline = std::time::Instant::now() + timeout;
     loop {
         // 只有端点消失才算退出：挂死的实例端点还在、只是不应答
@@ -191,109 +189,57 @@ pub async fn stop_and_wait(run_dir: &Path, port: &str, timeout: Duration) -> Res
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    if let Some(pid) = pid {
-        loop {
-            match crate::process::process_exited(pid) {
-                Some(true) => break,
-                Some(false) => {}
-                None => break, // 不可判（权限等）——保守放行，后续步骤自会暴露
+    wait_for_exit(port, pid, deadline, crate::process::process_exited).await
+}
+
+/// IPC 消失只证明不再接单；查不到状态也不能证明进程已经释放了端口与镜像。
+async fn wait_for_exit(
+    port: &str,
+    pid: u32,
+    deadline: std::time::Instant,
+    mut exited: impl FnMut(u32) -> Option<bool>,
+) -> Result<(), Cause> {
+    while exited(pid) != Some(true) {
+        if std::time::Instant::now() >= deadline {
+            return Err(FlowIssue::ExitTimeout {
+                port: port.to_string(),
+                pid,
             }
-            if std::time::Instant::now() >= deadline {
-                return Err(FlowIssue::ExitTimeout {
-                    port: port.to_string(),
-                    pid,
-                }
-                .into());
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            .into());
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Ok(())
 }
 
-/// spawn 未就绪的细分：回滚前要知道「子进程是否还活着」——活着就可能
-/// 占着端口，必须先清掉它，回退二进制才 bind 得上。
-struct SpawnFailure {
-    /// spawn 成功时的子进程 pid（spawn 本身失败为 None）
-    pid: Option<u32>,
-    /// spawn 返回后立刻读到的子进程创建时间（身份锚点，见 process::record_identity）：
-    /// 回收时按「pid + 创建时间」核验再终止——等待就绪期间子进程若已退出、pid 被系统
-    /// 复用给别的进程，届时现读的创建时间必然不符，绝不误杀。None = 读不到（进程瞬间
-    /// 退出或平台不支持），此时不终止。
-    start: Option<u64>,
-    /// 截止时子进程仍存活（启动中但未写注册表 / 挂死）
-    alive: bool,
-    cause: Box<Cause>,
-}
-
-/// 用 `exe` 在 `home` 里按 `spec` 拉起实例并等它就绪（见 crate::spawn：按新 pid 在注册表里
-/// 定位、ping 确认；子进程提前退出即刻判失败，不空等到时限）。返回新 pid。
+/// 按新 pid 等待就绪，保留只有 spawn 本身失败时才显示的二进制路径。
 async fn spawn_and_wait_ready(
     home: &Path,
     exe: &Path,
     spec: &InstanceSpec,
-) -> Result<u32, SpawnFailure> {
-    use crate::spawn::SpawnError;
-    match crate::spawn::spawn_from_spec(home, exe, spec, crate::spawn::READY_TIMEOUT).await {
-        Ok(live) => Ok(live.instance.pid),
-        Err(e) => {
-            let launch = Cause::Launch(Box::new(e.evidence()));
-            Err(match e {
-                SpawnError::Spawn(_) => SpawnFailure {
-                    pid: None,
-                    start: None,
-                    alive: false,
-                    cause: Box::new(
-                        FlowIssue::AtPath {
-                            message: Box::new(launch),
-                            path: exe.display().to_string(),
-                        }
-                        .into(),
-                    ),
-                },
-                SpawnError::Exited { pid, .. } => SpawnFailure {
-                    pid: Some(pid),
-                    start: None,
-                    alive: false,
-                    cause: Box::new(launch),
-                },
-                SpawnError::TimedOut {
-                    pid, start, alive, ..
-                } => SpawnFailure {
-                    pid: Some(pid),
-                    start,
-                    alive,
-                    cause: Box::new(launch),
-                },
-            })
-        }
-    }
-}
-
-/// 清掉时限内没就绪、仍存活的子进程（本函数刚 spawn 的、从未写注册表的
-/// 进程——它不承载任何已知流量；不清掉它，回退二进制可能因端口被占而
-/// bind 失败）。身份锚点是 spawn 时读到的「pid + 创建时间」：
-/// `terminate_verified_process` 在同一进程句柄上先核对创建时间再终止，pid 已被
-/// 复用时必然拒绝；读不到创建时间就不终止（宁可回退因端口被占而失败，也不误杀）。
-/// 终止失败只记录，回退照常尝试（失败会如实上报为 Down）。
-async fn reap_unready_child(pid: u32, start: Option<u64>) {
-    let Some(start) = start else {
-        tracing::warn!(
-            pid,
-            "Cannot verify the unready process creation time; leaving it running and attempting rollback"
-        );
-        return;
-    };
-    if let Err(e) = crate::process::terminate_verified_process(pid, start) {
-        tracing::warn!(pid, error = %e, "Could not terminate the unready process; attempting rollback");
-        return;
-    }
-    for _ in 0..50 {
-        if crate::process::process_exited(pid) != Some(false) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    on_timeout: crate::spawn::OnReadyTimeout,
+) -> Result<u32, Box<Cause>> {
+    crate::spawn::spawn_from_spec_with_timeout_action(
+        home,
+        exe,
+        spec,
+        crate::spawn::READY_TIMEOUT,
+        on_timeout,
+    )
+    .await
+    .map(|live| live.instance.pid)
+    .map_err(|e| {
+        let launch = Cause::Launch(Box::new(e.evidence()));
+        Box::new(if matches!(e, crate::spawn::SpawnError::Spawn(_)) {
+            FlowIssue::AtPath {
+                message: Box::new(launch),
+                path: exe.display().to_string(),
+            }
+            .into()
+        } else {
+            launch
+        })
+    })
 }
 
 /// 一步到位：读拉起规格 → 优雅停止（等进程终止，期望状态记录留着）→ 用 `exe` 按同一份
@@ -341,16 +287,18 @@ pub async fn restart_instance(
     };
     ensure_restore();
 
-    let failure = match spawn_and_wait_ready(home, exe, &spec).await {
+    let failure = match spawn_and_wait_ready(
+        home,
+        exe,
+        &spec,
+        crate::spawn::OnReadyTimeout::StopBeforeRollback,
+    )
+    .await
+    {
         Ok(pid) => return Ok(pid),
         Err(f) => f,
     };
-    tracing::error!(port = %port, error = %failure.cause.render(Lang::En), "The new binary failed to start the instance; rolling back");
-    if failure.alive
-        && let Some(pid) = failure.pid
-    {
-        reap_unready_child(pid, failure.start).await;
-    }
+    tracing::error!(port = %port, error = %failure.render(Lang::En), "The new binary failed to start the instance; rolling back");
     ensure_restore();
 
     // 端口上已有可用实例（看护者按期望状态记录抢先重拉 / 未就绪的子进程最终
@@ -364,14 +312,21 @@ pub async fn restart_instance(
     let fallback = fallback.map(Path::to_path_buf).or(image);
     let result = match fallback.filter(|p| p.is_file()) {
         None => Err(RestartError::Down {
-            reason: failure.cause,
+            reason: failure,
             fallback_error: Box::new(FlowIssue::NoFallback.into()),
         }),
-        Some(old) => match spawn_and_wait_ready(home, &old, &spec).await {
+        Some(old) => match spawn_and_wait_ready(
+            home,
+            &old,
+            &spec,
+            crate::spawn::OnReadyTimeout::LeaveRunning,
+        )
+        .await
+        {
             Ok(pid) => {
                 tracing::warn!(port = %port, pid, old = %old.display(), "The old binary restored the instance");
                 Err(RestartError::RolledBack {
-                    reason: failure.cause,
+                    reason: failure,
                     pid,
                     fallback: old,
                 })
@@ -379,12 +334,43 @@ pub async fn restart_instance(
             Err(f2) => {
                 ensure_restore();
                 Err(RestartError::Down {
-                    reason: failure.cause,
-                    fallback_error: f2.cause,
+                    reason: failure,
+                    fallback_error: f2,
                 })
             }
         },
     };
     let _ = super::state::write_in(home, state);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn rolling_stop_waits_for_positive_exit_evidence() {
+        let pid = std::process::id();
+        let mut answers = [None, Some(false), Some(true)].into_iter();
+        wait_for_exit(
+            "0",
+            pid,
+            std::time::Instant::now() + Duration::from_secs(20),
+            |_| answers.next().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(answers.len(), 0);
+        let err = wait_for_exit("0", pid, std::time::Instant::now(), |_| None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.render(Lang::En),
+            Cause::from(FlowIssue::ExitTimeout {
+                port: "0".into(),
+                pid
+            })
+            .render(Lang::En)
+        );
+    }
 }

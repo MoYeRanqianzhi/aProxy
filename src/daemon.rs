@@ -723,34 +723,44 @@ pub fn spawn_detached_with(
     }
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
-        use std::process::{Command, Stdio};
-        let mut cmd = Command::new(exe);
-        cmd.args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        for (name, value) in launch.env {
-            match value {
-                Some(value) => cmd.env(name, value),
-                None => cmd.env_remove(name),
-            };
-        }
-        if let Some(dir) = launch.cwd {
-            cmd.current_dir(dir);
-        }
-        // SAFETY: 闭包在 fork 之后、exec 之前的子进程里运行，只调用 setsid 这一个
-        // async-signal-safe 的系统调用，不分配内存、不碰锁
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        Ok(cmd.spawn()?.id())
+        Ok(detached_command(exe, args, launch).spawn()?.id())
     }
+}
+
+/// 准备独立会话与标准流；需要管理子进程的启动者从同一份命令取得自己的 Child。
+#[cfg(unix)]
+pub(crate) fn detached_command(
+    exe: &std::path::Path,
+    args: &[String],
+    launch: &Launch<'_>,
+) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (name, value) in launch.env {
+        match value {
+            Some(value) => cmd.env(name, value),
+            None => cmd.env_remove(name),
+        };
+    }
+    if let Some(dir) = launch.cwd {
+        cmd.current_dir(dir);
+    }
+    // SAFETY: 闭包在 fork 之后、exec 之前的子进程里运行，只调用 setsid 这一个
+    // async-signal-safe 的系统调用，不分配内存、不碰锁
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd
 }
 
 /// 在当前进程的环境上套用 `changes`，写成 CreateProcessW 要的环境块：UTF-16 的
@@ -901,7 +911,7 @@ pub fn collect_garbage_in(run_dir: &std::path::Path, logs_dir: &std::path::Path)
             hearts.push((port.to_string(), path));
         } else if let Some(writer) = leftover_writer_pid(&name)
             && older_than(&path, GC_MIN_AGE_SECS)
-            && (crate::process::process_exited(writer) != Some(false)
+            && (crate::process::process_exited(writer) == Some(true)
                 || (name.ends_with(".result") && startup_writer_reused(&path, writer)))
             && std::fs::remove_file(&path).is_ok()
         {
@@ -3893,6 +3903,27 @@ mod tests {
             age(&file, GC_MIN_AGE_SECS + 60);
             collect_garbage_in(&run, &logs);
             assert_eq!(file.exists(), keep);
+        }
+    }
+
+    /// Darwin 拒绝查询 pid 0，得到的是未知而非 ESRCH；即使超过保护期也不能据此删文件。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn garbage_collection_keeps_handoffs_with_unknown_writer_state() {
+        let home = tempfile::tempdir().unwrap();
+        let run = home.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        assert_eq!(crate::process::process_exited(0), None);
+        for name in [
+            "100-0.spec.json",
+            "settings.json.tmp-0-100",
+            "startup-100-0.result",
+        ] {
+            let file = run.join(name);
+            std::fs::write(&file, b"{}").unwrap();
+            age(&file, GC_MIN_AGE_SECS + 60);
+            collect_garbage_in(&run, &home.path().join("logs"));
+            assert!(file.is_file(), "{name}");
         }
     }
 

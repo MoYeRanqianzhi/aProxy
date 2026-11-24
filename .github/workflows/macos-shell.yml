@@ -1,0 +1,102 @@
+# 只在 probe/macos-shell 分支上存在的排查用工作流：在 GitHub 的 macOS runner 上预先编好两种变体，
+# 然后开一个只认维护者登录公钥的 sshd，经中继服务器的 SSH 反向转发让维护者交互式地登录这台 runner，
+# 在真机上验证 aProxy 的行为。中继账号的公钥在服务器上被限制为只能在回环地址的一个端口上开反向转发
+# （不能登录、不能执行命令）；runner 上的 sshd 只监听回环地址。不发布、不写仓库，查完删除分支与 secret。
+#
+# 结束方式：在 runner 上 `touch ~/probe-done`，或者在 GitHub 上取消这次运行；最长挂 180 分钟。
+name: macOS shell
+
+on:
+  push:
+    branches: [probe/macos-shell]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-shell
+  cancel-in-progress: true
+
+jobs:
+  shell:
+    runs-on: macos-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: aproxy-desktop/ui/package-lock.json
+      - name: Build the desktop front end
+        working-directory: aproxy-desktop/ui
+        run: |
+          npm ci
+          npm run build
+      # 预先编好，登录后直接用：带界面的放 target/desktop，无界面的放 target/headless
+      - name: Build both variants
+        continue-on-error: true
+        run: |
+          cargo build --locked --bins
+          mkdir -p target/desktop && cp target/debug/aproxy target/desktop/
+          cargo build --locked --no-default-features --bins
+          mkdir -p target/headless && cp target/debug/aproxy target/headless/
+      - name: Open the relay
+        env:
+          RELAY_HOST: ${{ secrets.PROBE_RELAY_HOST }}
+          RELAY_KNOWN_HOSTS: ${{ secrets.PROBE_RELAY_KNOWN_HOSTS }}
+          RELAY_KEY: ${{ secrets.PROBE_RELAY_KEY }}
+          LOGIN_PUBKEY: ${{ secrets.PROBE_LOGIN_PUBKEY }}
+        run: |
+          set -eu
+          probe="$HOME/.probe-ssh"; mkdir -p "$probe"; chmod 700 "$probe"
+          umask 077
+          printf '%s\n' "$RELAY_KEY" > "$probe/relay"
+          printf '%s\n' "$RELAY_KNOWN_HOSTS" > "$probe/known_hosts"
+          printf '%s\n' "$LOGIN_PUBKEY" > "$probe/authorized_keys"
+          ssh-keygen -q -t ed25519 -N "" -f "$probe/host_key"
+          cat > "$probe/sshd_config" <<EOF
+          Port 2222
+          ListenAddress 127.0.0.1
+          HostKey $probe/host_key
+          AuthorizedKeysFile $probe/authorized_keys
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PubkeyAuthentication yes
+          UsePAM no
+          StrictModes no
+          AllowUsers $USER
+          PidFile $probe/sshd.pid
+          SetEnv PROBE_WORKSPACE=$GITHUB_WORKSPACE
+          EOF
+          /usr/sbin/sshd -f "$probe/sshd_config" -E "$probe/sshd.log"
+          sleep 1
+          nc -z 127.0.0.1 2222 && echo "sshd listening on 127.0.0.1:2222"
+          echo "workspace: $GITHUB_WORKSPACE"
+          # 中继断了就重连，直到 ~/probe-done 出现
+          (
+            while [ ! -e "$HOME/probe-done" ]; do
+              ssh -i "$probe/relay" -o IdentitiesOnly=yes -o UserKnownHostsFile="$probe/known_hosts" \
+                -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+                -o ServerAliveCountMax=3 -N -R 127.0.0.1:22022:127.0.0.1:2222 "root@$RELAY_HOST" \
+                >>"$probe/relay.log" 2>&1 || true
+              sleep 5
+            done
+          ) &
+          echo "relay loop started"
+      - name: Wait for the maintainer
+        run: |
+          end=$(( $(date +%s) + 180 * 60 ))
+          while [ ! -e "$HOME/probe-done" ] && [ "$(date +%s)" -lt "$end" ]; do sleep 30; done
+          echo "finished"
+      - name: Close the relay
+        if: always()
+        run: |
+          touch "$HOME/probe-done"
+          [ -f "$HOME/.probe-ssh/sshd.pid" ] && kill "$(cat "$HOME/.probe-ssh/sshd.pid")" || true
+          pkill -f "127.0.0.1:22022:127.0.0.1:2222" || true
+          rm -rf "$HOME/.probe-ssh"

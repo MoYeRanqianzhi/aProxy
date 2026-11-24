@@ -54,9 +54,15 @@ fn check_grants() {
         "core:window:allow-set-effects".into(),
         "core:window:allow-set-theme".into(),
         // macOS 的 Overlay 标题栏靠 data-tauri-drag-region 拖动与双击缩放（Tauri 的 drag.js 调这两个命令）；
-        // 别的平台页面不加这个属性，两条授权用不上
+        // Linux 的标题栏由页面拖动（startDragging）。Windows 上拖动由系统处理，这两条用不上
         "core:window:allow-start-dragging".into(),
         "core:window:allow-internal-toggle-maximize".into(),
+        // Linux 没有窗口管理器的装饰，页面自己画最小化、最大化/还原、关闭三个按钮，按钮图标要知道
+        // 窗口是否最大化。Windows 与 macOS 用系统的按钮，这四条用不上
+        "core:window:allow-minimize".into(),
+        "core:window:allow-toggle-maximize".into(),
+        "core:window:allow-is-maximized".into(),
+        "core:window:allow-close".into(),
     ]);
     for name in COMMANDS {
         let id = name.replace('_', "-");

@@ -286,12 +286,15 @@ pub fn message_box(text: &str, error: bool) {
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopInfo {
-    /// Windows 自定义标题栏装上了（原生按钮留在右上角，页面画其余部分）。两个都为假（Linux，
-    /// 或 Windows 上 install 失败降级）时页面的标题栏只是原生标题栏下面的一行工具栏。
+    /// Windows 自定义标题栏装上了（原生按钮留在右上角，页面画其余部分）。三个都为假（Windows 上
+    /// install 失败降级）时页面的标题栏只是原生标题栏下面的一行工具栏。
     custom_titlebar: bool,
     /// macOS 的 Overlay 标题栏：页面画整条标题栏，左上角让给系统的交通灯，拖动走
-    /// data-tauri-drag-region。与 custom_titlebar 互斥（那个只在 Windows 上为真）。
+    /// data-tauri-drag-region。三个字段至多一个为真，各对应一个平台。
     traffic_lights: bool,
+    /// Linux 没有窗口管理器的装饰（`decorations(false)`）：页面画整条标题栏和右上角的三个窗口按钮，
+    /// 拖动、双击最大化也由页面发起。
+    own_controls: bool,
     mica: MicaSupport,
     /// Windows 的系统版本号（build），设置页说明 Mica 为什么不可用时要用；非 Windows 为 None
     windows_build: Option<u32>,
@@ -372,6 +375,13 @@ fn open_main_window(app: &tauri::App, data_dir: PathBuf) -> Result<(), Error> {
             TRAFFIC_LIGHTS.0,
             TRAFFIC_LIGHTS.1,
         ));
+    // Linux 的自定义标题栏：不要窗口管理器的装饰，页面画整条标题栏和右上角的最小化、最大化、关闭
+    // 三个按钮，拖动与双击最大化由页面经 Tauri 的窗口命令完成（titlebar.js 的 enableDragRegion，
+    // 见 Titlebar.svelte）。改大小靠 Tauri 在 webview 四边留的 5px 拖拽区，最大化时不能改。
+    // 窗口管理器的阴影、系统菜单随装饰一起没有了（tauri-custom-titlebar skill 在 X11 + openbox 上
+    // 实测过这几项）。
+    #[cfg(target_os = "linux")]
+    let builder = builder.decorations(false);
     #[cfg(debug_assertions)]
     let builder = match demo_script() {
         Some(script) => builder.initialization_script(script),
@@ -395,6 +405,7 @@ fn open_main_window(app: &tauri::App, data_dir: PathBuf) -> Result<(), Error> {
         DesktopInfo {
             custom_titlebar,
             traffic_lights: false,
+            own_controls: false,
             mica,
             windows_build,
         }
@@ -402,6 +413,7 @@ fn open_main_window(app: &tauri::App, data_dir: PathBuf) -> Result<(), Error> {
     #[cfg(not(windows))]
     let info = DesktopInfo {
         traffic_lights: cfg!(target_os = "macos"),
+        own_controls: cfg!(target_os = "linux"),
         ..DesktopInfo::default()
     };
     *app.state::<Mutex<DesktopInfo>>()

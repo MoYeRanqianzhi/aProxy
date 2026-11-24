@@ -23,6 +23,10 @@ const zh = {
   'nav.main': '主导航',
 
   'search.placeholder': '搜索请求、实例或命令',
+  'win.minimize': '最小化',
+  'win.maximize': '最大化',
+  'win.restore': '还原',
+  'win.close': '关闭窗口',
 
   'status.active': '活跃',
   'status.idle': '闲置',
@@ -1006,6 +1010,10 @@ const en: Record<keyof typeof zh, string> = {
   'nav.main': 'Main navigation',
 
   'search.placeholder': 'Search requests, instances, commands',
+  'win.minimize': 'Minimize',
+  'win.maximize': 'Maximize',
+  'win.restore': 'Restore',
+  'win.close': 'Close window',
 
   'status.active': 'Active',
   'status.idle': 'Idle',

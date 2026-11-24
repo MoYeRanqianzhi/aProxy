@@ -37,6 +37,10 @@ time.sleep(14)
 full = os.path.join(OUT, "full.png")
 rect = None  # 屏幕像素 (left, top, right, bottom)
 if SYSTEM == "Darwin":
+    # 先把窗口切到前台再截：不在前台的窗口，交通灯是灰的
+    subprocess.run(["osascript", "-e", f'tell application "System Events" to set frontmost of '
+                    f'(first process whose unix id is {desk.pid}) to true'], capture_output=True)
+    time.sleep(1)
     subprocess.run(["screencapture", "-x", full], check=True)
     q = subprocess.run(["osascript", "-e",
         f'tell application "System Events" to get {{position, size}} of window 1 of '

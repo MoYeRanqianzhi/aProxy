@@ -21,7 +21,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: windows-latest, name: windows, exe: target/debug/aproxy.exe }
+          # Windows 11 的外观（圆角、Win11 的标题栏按钮、Mica）只有客户端系统有；windows-latest 是 Server 2025，
+          # 窗口是 Windows 10 的样子。公开仓库可以用 Arm64 的 Windows 11 托管 runner
+          - { os: windows-11-arm, name: windows, exe: target/debug/aproxy.exe }
           - { os: macos-latest, name: macos, exe: target/debug/aproxy }
           - { os: ubuntu-24.04, name: linux, exe: target/debug/aproxy }
     runs-on: ${{ matrix.os }}
@@ -47,6 +49,9 @@ jobs:
         run: |
           npm ci
           npm run build
+      - name: Windows screen resolution
+        if: matrix.name == 'windows'
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .github/screenshots/resolution.ps1
       - run: cargo build --locked --bins
       - run: python -m pip install --quiet pillow
       - name: Shoot (Windows, macOS)

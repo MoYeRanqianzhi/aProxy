@@ -58,6 +58,7 @@ public static class W {
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int a, out RECT r, int s);
+  [DllImport("dwmapi.dll", EntryPoint = "DwmGetWindowAttribute")] public static extern int DwmGetInt(IntPtr h, int a, out int v, int s);
   public struct RECT { public int L, T, R, B; }
 }
 "@
@@ -74,6 +75,11 @@ $p = Get-Process aproxy | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Ob
 $r = New-Object W+RECT
 # DWMWA_EXTENDED_FRAME_BOUNDS = 9：不含不可见的缩放边
 [W]::DwmGetWindowAttribute($p.MainWindowHandle, 9, [ref]$r, 16) | Out-Null
+# 页面经 set_caption_color 交给 DWM 的按钮底色（DWMWA_CAPTION_COLOR = 35，COLORREF 0x00BBGGRR），
+# 用来核对深色场景下按钮区有没有跟着页面变深
+$c = 0
+$hr = [W]::DwmGetInt($p.MainWindowHandle, 35, [ref]$c, 4)
+"caption color: hr=$hr colorref=0x{0:x8}" -f $c
 "$($r.L),$($r.T),$($r.R),$($r.B)"
 """
     script = os.path.join(OUT, "shot.ps1")

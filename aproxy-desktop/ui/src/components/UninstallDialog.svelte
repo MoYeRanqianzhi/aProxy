@@ -90,7 +90,8 @@
 <style>
   .scrim {
     position: fixed;
-    inset: 0;
+    /* 从标题栏下沿往下铺，标题栏不盖（见 app.css 的 --titlebar-bottom） */
+    inset: var(--titlebar-bottom) 0 0 0;
     z-index: 80;
     background: var(--scrim);
   }

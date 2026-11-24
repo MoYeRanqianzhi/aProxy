@@ -245,7 +245,15 @@ async function bringUp(inst: Instance): Promise<Run> {
 
 let watchdogEnabled = true;
 let registration: Registration = { enabled: false, issue: null };
-let preferences: Preferences = { lang: 'system', mode: 'system', palette: 'standard', mica: false, mascot: 'tumbler', theme: 'builtin' };
+// 截图用的窗口（APROXY_DESKTOP_DEMO）预设了语言与深浅色，见 ../index.ts
+let preferences: Preferences = {
+  lang: window.__APROXY_DEMO__?.lang ?? 'system',
+  mode: window.__APROXY_DEMO__?.mode ?? 'system',
+  palette: 'standard',
+  mica: false,
+  mascot: 'tumbler',
+  theme: 'builtin',
+};
 /** 演示 desktop.toml 被手改出语法错误：读到的偏好为 null，写入被拒绝（审核工具条上切换） */
 let tomlBroken = false;
 const TOML_ISSUE = { kind: 'syntax', line: 7, column: 12, key: null } as const;

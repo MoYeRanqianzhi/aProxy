@@ -452,10 +452,21 @@
   - crates.io：默认 feature 含 UI，`cargo install aproxy` 需要包里带构建好的前端，Linux 还要 GTK 开发库；
     无 UI 用 `--no-default-features`。
   - 前端技术栈（体积会编进二进制）、UI 偏好（Mica 开关、主题）存哪里（倾向 settings.json 的 `ui` 段，随 W2 定）、
-    发版矩阵与体积、macOS（不在 0.2.0 范围）。
+    发版矩阵与体积、macOS（2026-11-24 起进 0.2.0 范围，见 W8）。
 
 ### W6 审查发现的修复与重构
 - 待审查报告。
+
+### W8 macOS 支持（用户 2026-11-24：「本次需要确保macOS端在0.2.0也能正常运行」）
+- 取代 2026-10-04「0.1.0 不处理 macOS」的定调；验收照 [macOS 支持](../memory/2026-09-12-macos-support-required.md)
+  的标准：CI macos job 全绿，加 macOS 上的行为实测（看护者、进程身份、install 宣告与滚动升级、桌面窗口）。
+- 做法：分支 `probe/macos`（worktree `.worktrees/macos-probe`）上的排查工作流 `macos-probe.yml` 在 GitHub 的
+  macOS runner 上跑全部测试、不在第一个失败处停下，给出完整的失败清单；修复交 Codex，每轮推到该分支验证。
+  需要交互式验证时，用户提议经服务器 SSH 反向通道连到 runner（方案待用户确认）。排查分支不并入 main，
+  修复以正常提交进 master。
+- 现状（2026-11-24）：0.2.0 的进程登记表已有 macOS 实现（`aproxy-ipc/src/ledger.rs` 用 `proc_pidinfo`），
+  2026-09 记下的 3 个 lib 测试在 macOS 上已通过；`src/process.rs` 的 `imp_process`（创建时间、镜像路径）
+  仍只读 `/proc`。CI 的 macos job 跑 `cargo test` 不带 `--no-fail-fast`，此前只看得到第一个失败的测试文件。
 
 ### W7 发布
 - 版本 0.2.0（是否先发预发布版待定）、CHANGELOG、README / docs / skill 同步、skill references 是否留存

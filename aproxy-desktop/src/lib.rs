@@ -344,7 +344,10 @@ fn open_main_window(app: &tauri::App, data_dir: PathBuf) -> Result<(), Error> {
     let builder = builder
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true)
-        .traffic_light_position(tauri::LogicalPosition::new(TRAFFIC_LIGHTS.0, TRAFFIC_LIGHTS.1));
+        .traffic_light_position(tauri::LogicalPosition::new(
+            TRAFFIC_LIGHTS.0,
+            TRAFFIC_LIGHTS.1,
+        ));
     let window = builder.build().map_err(|e| Error::Startup(e.to_string()))?;
 
     fit_to_monitor(&window);

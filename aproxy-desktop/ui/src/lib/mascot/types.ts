@@ -6,10 +6,9 @@
  * 所以契约里刻意不出现任何界面内部的东西：
  *   - 颜色由宿主解析成具体的 CSS 颜色值放进 palette，吉祥物不读界面的 CSS 变量（变量名会随界面改版变化）；
  *   - 减少动效、深浅主题也由宿主传进来，吉祥物不去查 <html> 上的属性或媒体查询；
- *   - 渲染结果放在吉祥物独占的地方：内置的放进 shadow root，用户装的自定义吉祥物连代码带画面整个跑在
- *     沙箱 iframe 里（不透明源，见 MascotFrame 与 public/mascot-sandbox.js）。吉祥物的样式影响不到界面，反之亦然。
- * 吉祥物隔离运行的理由是稳定：一个画错、抛异常或卡死的吉祥物不能拖垮界面。它拿到的只有状态数据，本来也没有可泄露的东西。
- * 自定义吉祥物以一个 ES 模块交付，默认导出下面的 MascotDefinition。
+ *   - 渲染结果放在吉祥物独占的 shadow root 里（MascotShadow），内置的与扩展加的都一样：吉祥物的样式影响不到界面，
+ *     反之亦然；render 抛出的异常被接住，一个画错的吉祥物只是不显示，不会拖垮界面。这不是安全边界：
+ *     自定义吉祥物由扩展在 activate 里经 api.ui.registerMascot 交给宿主，扩展本来就在窗口里运行。
  *
  * 宿主只在状态真正变化时重新调用 render 并替换标记（标记文本不变就不动 DOM），
  * 所以「状态变化的那一刻」对吉祥物来说就是一次全新的挂载：一次性的动画（被撞歪、撒星星）放在挂载时播即可。
@@ -94,11 +93,11 @@ export interface MascotDefinition {
   name: { en: string; [lang: string]: string };
   /** 一句话描述，显示在设置里的吉祥物选择处 */
   description?: { en: string; [lang: string]: string };
-  /** 吉祥物自己的样式表（多半是动画），宿主放进它独占的 shadow root 或沙箱页；类名随便起，不会和界面冲突 */
+  /** 吉祥物自己的样式表（多半是动画），宿主放进它独占的 shadow root；类名随便起，不会和界面冲突 */
   css?: string;
   /**
    * 按状态返回一段 <svg>…</svg>。必须是纯函数：同样的状态返回同样的标记。
-   * 标记里不要写 style 属性、<style> 或 <script>：界面的 CSP 禁止内联样式与脚本，样式一律放进 css。
+   * 标记经 innerHTML 放进 shadow root，里面的 <script> 不会执行；动画与样式放进 css，它只作用于这个吉祥物。
    */
   render(state: MascotState): string;
   /** 静态图标：软件图标与托盘图标。不含动画，返回带 xmlns 的完整 <svg>，可以直接存成文件 */

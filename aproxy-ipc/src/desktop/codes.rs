@@ -87,6 +87,8 @@ pub enum DiagCode {
     ConfigInvalidValue,
     /// A required key is missing.
     ConfigMissingKey,
+    /// The file uses the 0.1.x configuration shape; its migration can be previewed.
+    ConfigLegacyShape,
     /// A key that is not recognized.
     ConfigUnknownKey,
     /// A form whose shape is defined but which is not implemented yet.

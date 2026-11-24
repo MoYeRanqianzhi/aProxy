@@ -98,7 +98,13 @@ else:
             vals = {k.strip(): v.strip() for k, v in (l.split(":", 1) for l in info.splitlines() if ":" in l)}
             x, y = int(vals["Absolute upper-left X"]), int(vals["Absolute upper-left Y"])
             w, h = int(vals["Width"]), int(vals["Height"])
-            rect = (x, y, x + w, y + h)
+            # 窗口管理器画的边框（标题栏、边）不在内容区的几何里：按 _NET_FRAME_EXTENTS（左、右、上、下）向外扩
+            ext = subprocess.run(["xprop", "-id", wid[-1], "_NET_FRAME_EXTENTS"], capture_output=True, text=True).stdout
+            print(ext, flush=True)
+            fl, fr, ft, fb = 0, 0, 0, 0
+            if "=" in ext:
+                fl, fr, ft, fb = [int(v) for v in ext.split("=", 1)[1].split(",")]
+            rect = (x - fl, y - ft, x + w + fr, y + h + fb)
         except Exception as e:
             print("no rect:", e)
 

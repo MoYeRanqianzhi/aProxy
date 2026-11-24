@@ -299,6 +299,7 @@ find: --aliased --unaliased --port --json -h --help
 help:
 install: --from --adopt --abort --force --yes --variant --cpu --allow-downgrade --pre --download-proxy --no-skills --check --json -h --help
 logs: -n --lines -f --follow -h --help
+migrate: --dry-run --json -h --help
 restart: --idle-threshold-secs --format --force --json -h --help
 restore: --json -h --help
 restore-at-login: --home -h --help
@@ -459,6 +460,7 @@ fn cli_logs_stay_off_stdout() {
         &["find", "--json"],
         &["settings", "show", "--json"],
         &["doctor", "--json"],
+        &["migrate", "--dry-run", "--json"],
         &["stop", &port_arg, "--json"],
     ] {
         let out = with_logs(args);
@@ -561,6 +563,7 @@ fn json_commands_finish_with_one_document_even_without_stderr() {
         (&["restart"], "config_invalid"),
         (&["restore"], "config_invalid"),
         (&["doctor"], "files"),
+        (&["migrate", "--dry-run"], "migration"),
         (&["find"], "config_invalid"),
         (&["alias", "list"], "config_invalid"),
         (&["config", "show"], "config_invalid"),
@@ -630,7 +633,9 @@ fn json_commands_finish_with_one_document_even_without_stderr() {
                     // 断开的诊断管道只影响 stderr；doctor 自己在 stdout 的报告里列出全部诊断。
                     assert_eq!(
                         out.stderr.is_empty(),
-                        broken || (!relative && args == ["doctor"]),
+                        broken
+                            || (!relative
+                                && (args == ["doctor"] || args.starts_with(&["migrate"]))),
                         "{args:?}: {}",
                         text(&out.stderr)
                     );
@@ -669,6 +674,7 @@ fn expected_machine_output(
     let syntax = "JSON syntax error: EOF while parsing an object at line 1 column 1";
     let diag = json!({"code":"config_syntax","severity":"error","file":settings,"line":1,"column":1,"message":syntax,"details":{}});
     match code {
+        "migration"=>(3,json!({"schema":1,"files":[{"path":std::fs::canonicalize(&settings).unwrap(),"outcome":"needs-review","changes":[],"issues":[{"key":null,"line":1,"message":"This value or file is not valid in the target format.","section":"compatibility.md#settingsjson-keys-renamed-in-020"}]}],"summary":{"dry_run":true,"current":0,"migrated":0,"needs_review":1,"failed":0,"running_instances":"Running instances keep the configuration they loaded."}})),
         "instances"=>(0,json!({"schema":1,"instances":[],"unreadable":[],"watchdog":null,"processes":[]})),
         "files"=>(3,json!({"schema":1,"files":[{"file":settings,"kind":"settings","diagnostics":[diag]},{"file":home.path(),"kind":"home","diagnostics":[]}],"summary":{"errors":1,"warnings":0}})),
         "absent"=>(4,json!({"schema":1,"state":"not_installed","skills":[],"next":"aproxy skill install"})),

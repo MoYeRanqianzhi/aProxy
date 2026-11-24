@@ -106,7 +106,23 @@ pub async fn run(settings_path: &Path) -> Report {
         &loaded.settings,
         loaded.diagnostics,
     )];
-    files.extend(config_reports(&home, &loaded.settings, &defaults));
+    // 严格读取不让无效设置进入运行时；体检仍应能找到旧文件引用的配置。
+    let inventory = if files[0]
+        .diagnostics
+        .iter()
+        .any(|d| d.code == "config_legacy_shape")
+    {
+        std::fs::read_to_string(settings_path)
+            .ok()
+            .map(|s| settings::file::parse(&s, settings_path).0)
+    } else {
+        None
+    };
+    files.extend(config_reports(
+        &home,
+        inventory.as_ref().unwrap_or(&loaded.settings),
+        &defaults,
+    ));
     files.push(home_report(&home));
 
     let found = enumerate::enumerate_in(&home).await;
@@ -143,6 +159,7 @@ fn settings_report(
         kind: "settings",
         diagnostics,
     };
+    crate::migrate::Kind::Settings.append_hint(path, &mut file.diagnostics);
     for (table, headers) in [
         ("extra_headers", &settings.defaults.extra_headers),
         ("override_headers", &settings.defaults.override_headers),
@@ -298,6 +315,7 @@ fn config_reports(home: &Path, settings: &Settings, defaults: &Defaults) -> Vec<
             }
             Ok(resolved) => {
                 file.diagnostics = resolved.diagnostics;
+                crate::migrate::Kind::Config.append_hint(&path, &mut file.diagnostics);
                 if !has_errors(&file.diagnostics) {
                     let cfg = resolved.config;
                     if cfg.forward_only_enabled() {

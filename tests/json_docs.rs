@@ -881,3 +881,211 @@ fn restart_formats_json_document() {
         assert_eq!(doc["error"]["details"]["reason"], "format_selection");
     }
 }
+
+/// 别名、显式默认与目录扫描可以撞上同一目标；备份、报告和重跑都以实际文件为单位。
+#[test]
+fn migrate_preview_apply_and_repeat_in_a_mixed_home() {
+    let h = TestHome::new();
+    let home = h.path();
+    let unscanned = home.join("aliases-only");
+    let configs = home.join("extra-dir");
+    fs::create_dir(&unscanned).unwrap();
+    fs::create_dir(&configs).unwrap();
+    let alias = unscanned.join("legacy.cfg");
+    let extra = configs.join("other.toml");
+    let current = home.join("current.toml");
+    let manual = home.join("manual.toml");
+    let sp = home.join("settings.json");
+    let settings=json!({"aliases":{"demo":alias},"default_config":alias,"config_dirs":[configs],"forward_only":false,"watchdog":false,"download_proxy":"http://username:private-value@proxy.example"}).to_string();
+    h.settings(&settings);
+    let orig = "base_url = 'http://127.0.0.1'\nlisten_addr = '127.0.0.1:0'\n# keep the cap\nmax_body_mb = 17 # important\nread_timeout_secs = 44\n";
+    let other = "base_url='http://127.0.0.1'\nbounded_retry_paths=['/count']\n";
+    let unchanged = "base_url = 'http://127.0.0.1' # leave alone\n";
+    let transform = "max_body_mb=3\n[request_transform]\ncommand='tool'\n";
+    for (p, s) in [
+        (&alias, orig),
+        (&extra, other),
+        (&current, unchanged),
+        (&manual, transform),
+    ] {
+        fs::write(p, s).unwrap();
+    }
+    let all = [
+        (&sp, settings.as_str()),
+        (&alias, orig),
+        (&extra, other),
+        (&current, unchanged),
+        (&manual, transform),
+    ];
+    let backup = |p: &std::path::Path| {
+        let mut n = p.as_os_str().to_owned();
+        n.push(".0.1.bak");
+        std::path::PathBuf::from(n)
+    };
+    let check = |dry| {
+        let args = if dry {
+            vec!["migrate", "--json", "--dry-run"]
+        } else {
+            vec!["migrate", "--json"]
+        };
+        let (doc, stderr) = failed_document(&h, &args, 5);
+        assert!(stderr.is_empty(), "{stderr}");
+        assert!(!doc.to_string().contains("private-value"));
+        assert_keys(&doc, &["schema", "files", "summary"]);
+        assert_eq!(doc["summary"]["dry_run"], dry);
+        assert_eq!(doc["summary"]["migrated"], 3);
+        assert_eq!(doc["summary"]["current"], 1);
+        assert_eq!(doc["summary"]["needs_review"], 1);
+        let files = doc["files"].as_array().unwrap();
+        assert_eq!(files.len(), all.len());
+        for (p, _) in all {
+            let actual = fs::canonicalize(p).unwrap();
+            let row = files
+                .iter()
+                .find(|r| fs::canonicalize(r["path"].as_str().unwrap()).unwrap() == actual)
+                .unwrap();
+            assert_keys(row, &["path", "outcome", "changes", "issues"]);
+            if *p == manual {
+                assert_eq!(row["outcome"], "needs-review");
+                assert_eq!(row["issues"][0]["key"], "request_transform");
+                assert_eq!(row["issues"][0]["line"], 2);
+            } else if *p == current {
+                assert_eq!(row["outcome"], "current");
+            } else {
+                assert_eq!(row["outcome"], "migrated");
+                assert!(!row["changes"].as_array().unwrap().is_empty());
+            }
+        }
+        doc["files"].clone()
+    };
+    let preview = check(true);
+    assert!(!home.join("run").exists());
+    for (p, s) in all {
+        assert_eq!(fs::read(p).unwrap(), s.as_bytes());
+        assert!(!backup(p).exists());
+    }
+    assert_eq!(check(false), preview);
+    for (p, s) in all {
+        if *p == current || *p == manual {
+            assert_eq!(fs::read(p).unwrap(), s.as_bytes());
+            assert!(!backup(p).exists());
+        } else {
+            assert_eq!(fs::read(backup(p)).unwrap(), s.as_bytes());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    fs::metadata(backup(p)).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            #[cfg(windows)]
+            {
+                assert!(
+                    aproxy::fsx::dacl_sddl(&backup(p))
+                        .unwrap()
+                        .starts_with("D:P")
+                );
+            }
+        }
+    }
+    let toml = fs::read_to_string(&alias).unwrap();
+    assert!(toml.contains("# keep the cap") && toml.contains("# important"));
+    assert!(!toml.contains("read_timeout_secs"));
+    assert!(
+        fs::read_to_string(&extra)
+            .unwrap()
+            .contains("[[retry.rules]]")
+    );
+    let files = all.map(|(p, _)| fs::read(p).unwrap());
+    let started = document(&run(&h, &["start", "demo", "--json"]));
+    let port = h.track_started_port(&started);
+    run(&h, &["stop", &port.to_string()]);
+    let (second, _) = failed_document(&h, &["migrate", "--json"], 3);
+    assert_eq!(second["summary"]["current"], 4);
+    assert_eq!(second["summary"]["migrated"], 0);
+    for ((p, s), bytes) in all.into_iter().zip(files) {
+        assert_eq!(fs::read(p).unwrap(), bytes);
+        if *p != current && *p != manual {
+            assert_eq!(fs::read(backup(p)).unwrap(), s.as_bytes());
+        }
+    }
+}
+
+/// 已有不同备份时预演和实际运行都应拒绝；相同备份可用来恢复中断的写入。
+#[test]
+fn migrate_never_overwrites_a_different_backup() {
+    let h = TestHome::new();
+    let backup = h.path().join("settings.json.0.1.bak");
+    let old = r#"{"watchdog":false}"#;
+    h.settings(old);
+    fs::write(&backup, "original").unwrap();
+    for args in [
+        &["migrate", "--dry-run", "--json"][..],
+        &["migrate", "--json"],
+    ] {
+        let (doc, _) = failed_document(&h, args, 3);
+        assert!(
+            doc["files"][0]["issues"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains(".0.1.bak")
+        );
+        assert_eq!(fs::read(&backup).unwrap(), b"original");
+        assert_eq!(
+            fs::read(h.path().join("settings.json")).unwrap(),
+            old.as_bytes()
+        );
+    }
+    fs::write(&backup, old).unwrap();
+    assert_eq!(
+        document(&run(&h, &["migrate", "--json"]))["summary"]["migrated"],
+        1
+    );
+    let missing = TestHome::unborn();
+    let doc = document(&run(&missing, &["migrate", "--dry-run", "--json"]));
+    assert_eq!(doc["files"], json!([]));
+    assert!(!missing.path().exists());
+    h.settings(&json!({"aliases":{"missing":h.path().join("gone.cfg")}}).to_string());
+    let (doc, _) = failed_document(&h, &["migrate", "--json"], 1);
+    assert_eq!(doc["summary"]["failed"], 1);
+}
+
+/// 同一份严格解析既给体检定专用码，也决定何时能建议迁移而不是手工修复。
+#[test]
+fn migrate_suggestions_are_specific_to_legacy_files() {
+    let h = TestHome::new();
+    let c = h.path().join("sample.toml");
+    for (settings, toml, legacy) in [
+        (r#"{"watchdog":false}"#, "base_url='http://localhost'", true),
+        (
+            r#"{"watchdog":"wrong"}"#,
+            "base_url='http://localhost'",
+            false,
+        ),
+        ("{}", "max_body_mb=1", true),
+        ("{}", "max_body_mb=1\nunrelated=2", false),
+    ] {
+        h.settings(settings);
+        fs::write(&c, toml).unwrap();
+        let (_, stderr) = failed_document(&h, &["start", c.to_str().unwrap(), "--json"], 3);
+        assert_eq!(
+            stderr
+                .trim_end()
+                .lines()
+                .last()
+                .unwrap()
+                .contains("aproxy migrate --dry-run"),
+            legacy,
+            "{stderr}"
+        );
+        let (doc, _) = failed_document(&h, &["doctor", "--json"], 3);
+        assert_eq!(doc.to_string().contains("config_legacy_shape"), legacy);
+        assert_eq!(doc.to_string().contains("aproxy migrate --dry-run"), legacy);
+        assert_eq!(fs::read(&c).unwrap(), toml.as_bytes());
+        assert_eq!(
+            fs::read(h.path().join("settings.json")).unwrap(),
+            settings.as_bytes()
+        );
+    }
+}

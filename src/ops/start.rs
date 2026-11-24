@@ -112,13 +112,15 @@ pub fn resolve_runtime_config_in(
     let settings_path = settings::settings_path_in(home);
     let loaded = settings::read(&settings_path);
     if !loaded.is_valid() {
+        let mut diagnostics = loaded
+            .diagnostics
+            .into_iter()
+            .filter(|d| d.is_error())
+            .collect();
+        crate::migrate::Kind::Settings.append_hint(&settings_path, &mut diagnostics);
         return Err(ConfigError::Settings {
             file: settings_path,
-            diagnostics: loaded
-                .diagnostics
-                .into_iter()
-                .filter(|d| d.is_error())
-                .collect(),
+            diagnostics,
         });
     }
     let resolved =
@@ -148,9 +150,13 @@ pub fn resolve_runtime_config_in(
     if resolved.is_valid() {
         return Ok(resolved.config);
     }
+    let mut diagnostics = resolved.errors().cloned().collect();
+    if let Some(path) = cfg_path {
+        crate::migrate::Kind::Config.append_hint(path, &mut diagnostics);
+    }
     Err(ConfigError::Invalid {
         file: cfg_path.map(Path::to_path_buf),
-        diagnostics: resolved.errors().cloned().collect(),
+        diagnostics,
     })
 }
 

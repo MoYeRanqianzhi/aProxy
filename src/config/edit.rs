@@ -318,7 +318,8 @@ fn unset(document: &mut DocumentMut, path: &[KeySegment]) {
 }
 
 /// 拿写锁，最多等 [`LOCK_WAIT`]。
-fn lock(home: &Path) -> Result<crate::install::InstallLock, EditError> {
+/// 在同一主目录内串行化配置和设置的写入，包括写前备份和写后复查。
+pub(crate) fn lock(home: &Path) -> Result<crate::install::InstallLock, EditError> {
     let path = lock_path_in(home);
     let deadline = Instant::now() + LOCK_WAIT;
     loop {

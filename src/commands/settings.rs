@@ -101,7 +101,7 @@ fn exit_if_invalid(path: &Path, loaded: &settings::Loaded) {
     eprintln!();
     eprintln!("{}", boot::settings_errors(current()));
     print_errors(&loaded.diagnostics);
-    print_repair_hints(path);
+    print_repair_hints(path, loaded);
     crate::util::exit(EXIT_CONFIG as i32)
 }
 
@@ -113,8 +113,7 @@ fn print_errors(diagnostics: &[Diagnostic]) {
 }
 
 /// 怎样修：每个出问题的键给一条删除它的命令，外加整个删掉文件这条退路。
-pub(crate) fn print_repair_hints(path: &std::path::Path) {
-    let loaded = settings::read(path);
+pub(crate) fn print_repair_hints(path: &std::path::Path, loaded: &settings::Loaded) -> bool {
     let mut keys: Vec<&str> = loaded
         .diagnostics
         .iter()
@@ -132,6 +131,14 @@ pub(crate) fn print_repair_hints(path: &std::path::Path) {
         }
     }
     eprintln!("{}", boot::remove_settings(current(), path.display()));
+    if aproxy::migrate::Kind::Settings.legacy_file(path) {
+        eprintln!(
+            "{}",
+            aproxy_ipc::i18n::diagnostic::Reason::LegacyConfig.render(current())
+        );
+        return true;
+    }
+    false
 }
 
 /// 写一个键。`--json` 文档里的 `value` 取写完之后这个键的生效值：删掉一个键之后露出来的

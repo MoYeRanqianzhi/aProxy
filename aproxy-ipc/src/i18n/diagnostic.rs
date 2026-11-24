@@ -69,6 +69,9 @@ crate::message!(forward_default_unguarded(), en: "The default delivery is forwar
 crate::message!(forward_response_buffered(), en: "The default delivery is forward and the chain has a response program; that layer gathers each response, so those responses are not streamed. Declare stream instead where the program supports it.", zh: "默认投递方式为 forward，且处理链含有 response 程序；该层会收集完整响应，因此这些响应不会流式传送。如果程序支持，请改为声明 stream。");
 
 reasons! {
+    LegacyConfig,
+        en: "Preview the 0.1.x changes with `aproxy migrate --dry-run`, then run `aproxy migrate`.",
+        zh: "运行 `aproxy migrate --dry-run` 预览 0.1.x 文件的改动，确认后运行 `aproxy migrate`。";
     AlwaysTrigger,
         en: "keepalive.trigger = \"always\" cannot be set in the config file: it would break non-streaming clients. Only a format can ask for it, per request",
         zh: "配置文件不能设置 keepalive.trigger = \"always\"，否则非流式客户端无法工作。只有 format 才能按请求指定此值";

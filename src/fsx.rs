@@ -549,7 +549,7 @@ unsafe fn wide_to_string(text: *const u16) -> String {
 /// - unix：恒为 0600；
 /// - Windows：`private` 时带只让属主访问的 DACL（见 [`Descriptor::owner_only`]），否则继承
 ///   所在目录的权限。
-fn create_new_private(path: &Path, private: bool) -> std::io::Result<std::fs::File> {
+pub(crate) fn create_new_private(path: &Path, private: bool) -> std::io::Result<std::fs::File> {
     #[cfg(windows)]
     if private {
         use std::os::windows::io::FromRawHandle;

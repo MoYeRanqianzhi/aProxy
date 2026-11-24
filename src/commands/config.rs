@@ -205,7 +205,12 @@ fn show(path: &Path, explicit: bool, effective: bool, json: bool) {
             .filter(|d| d.code == "config_unknown_key")
             .filter_map(|d| d.key.as_deref())
             .collect();
-        if !unknown.is_empty() {
+        if aproxy::migrate::Kind::Config.legacy_file(path) {
+            eprintln!(
+                "{}",
+                aproxy_ipc::i18n::diagnostic::Reason::LegacyConfig.render(current())
+            );
+        } else if !unknown.is_empty() {
             eprintln!();
             eprintln!("{}", text::unknown_keys(current()));
             for key in unknown {

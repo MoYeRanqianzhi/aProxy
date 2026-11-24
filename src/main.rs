@@ -203,6 +203,11 @@ async fn run(cli: Cli) -> u8 {
         util::exit(0);
     }
 
+    // 迁移必须见到磁盘原文，不能在旧设置上提前退出或触发安装续作。
+    if let Some(Commands::Migrate { dry_run, json }) = cli.command {
+        return commands::migrate::run(&home, dry_run, json);
+    }
+
     // settings.json 的检查，每次运行都做。文件无效时（不认识的键、类型不对、schema 更高……）：
     // - `settings` 的各个子命令与 doctor 照常运行：它们就是用来查看与修复它的，自己会报告；
     // - stop、status、install 照常运行、用内置默认，把错误作为告警打印：任何时候都要能停
@@ -245,9 +250,16 @@ async fn run(cli: Cli) -> u8 {
                 boot::using_defaults(current())
             );
         } else {
-            commands::settings::print_repair_hints(&settings_path);
+            let legacy = commands::settings::print_repair_hints(&settings_path, &loaded);
             if let Some(mode) = output {
-                commands::print_doc(mode.error_document(serde_json::json!({"code":"config_invalid","message":boot::settings_errors(Lang::En),"details":{"diagnostics":loaded.diagnostics}})));
+                let mut message = boot::settings_errors(Lang::En).to_owned();
+                if legacy {
+                    message.push('\n');
+                    message.push_str(
+                        &aproxy_ipc::i18n::diagnostic::Reason::LegacyConfig.render(Lang::En),
+                    );
+                }
+                commands::print_doc(mode.error_document(serde_json::json!({"code":"config_invalid","message":message,"details":{"diagnostics":loaded.diagnostics}})));
             }
             return aproxy_ipc::code::EXIT_CONFIG;
         }
@@ -318,6 +330,9 @@ async fn run(cli: Cli) -> u8 {
             return commands::restore::handle_restore_cmd(&home, false).await;
         }
         Some(Commands::Alias { cmd }) => commands::alias::handle_alias_cmd(cmd),
+        Some(Commands::Migrate { .. }) => {
+            unreachable!("migration handled before settings preflight")
+        }
         Some(Commands::Doctor { json }) => commands::doctor::handle_doctor_cmd(json).await,
         Some(Commands::Find {
             aliased,
@@ -400,6 +415,7 @@ fn resumes_install(command: &Commands) -> bool {
         },
         Commands::Status { .. }
         | Commands::Logs { .. }
+        | Commands::Migrate { .. }
         | Commands::Find { .. }
         | Commands::Doctor { .. }
         | Commands::Install(_)

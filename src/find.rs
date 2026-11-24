@@ -53,38 +53,61 @@ pub fn discover_in(settings: &Settings, home: &std::path::Path) -> Vec<Discovere
         settings,
         &crate::settings::settings_path_in(home),
     );
-    for dir in settings::effective_config_dirs_in(settings, home) {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-                continue;
-            }
-            let key = settings::path_match_key(&path.display().to_string());
-            if !seen.insert(key.clone()) {
-                continue;
-            }
-            let aliases = alias_map.get(&key).cloned().unwrap_or_default();
-            let is_default = default_keys.contains(&key);
-            let config = crate::doctor::parse_config_file(&path);
-            // 展示和端口过滤仍读取文件本身；只有诊断需要合并全局默认，才能反映启动时的错误。
-            let errors =
-                crate::config::resolve(&path, &crate::config::Overrides::default(), &defaults)
-                    .map(|resolved| resolved.errors().cloned().collect())
-                    .unwrap_or_default();
-            out.push(DiscoveredConfig {
-                path,
-                config,
-                errors,
-                aliases,
-                is_default,
-            });
+    scan(settings, home, |path, result| {
+        if result.is_err() {
+            return;
         }
-    }
+        let key = settings::path_match_key(&path.display().to_string());
+        if !seen.insert(key.clone()) {
+            return;
+        }
+        let aliases = alias_map.get(&key).cloned().unwrap_or_default();
+        let is_default = default_keys.contains(&key);
+        let config = crate::doctor::parse_config_file(&path);
+        // 展示和端口过滤仍读取文件本身；只有诊断需要合并全局默认，才能反映启动时的错误。
+        let errors = crate::config::resolve(&path, &crate::config::Overrides::default(), &defaults)
+            .map(|resolved| resolved.errors().cloned().collect())
+            .unwrap_or_default();
+        out.push(DiscoveredConfig {
+            path,
+            config,
+            errors,
+            aliases,
+            is_default,
+        });
+    });
     out.sort_by_key(|a| a.path.display().to_string());
     out
+}
+
+/// 枚举与 find 相同的非递归 TOML 集合。观察命令忽略无法扫描的目录；写者必须报告，
+/// 否则它的“全部完成”会掩盖没有检查的文件。内置的可选目录尚未创建不算错误。
+pub(crate) fn scan(
+    settings: &Settings,
+    home: &std::path::Path,
+    mut visit: impl FnMut(PathBuf, std::io::Result<()>),
+) {
+    for dir in settings::effective_config_dirs_in(settings, home) {
+        match std::fs::read_dir(&dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    match entry {
+                        Ok(e) if e.path().extension().is_some_and(|x| x == "toml") => {
+                            visit(e.path(), Ok(()))
+                        }
+                        Ok(_) => (),
+                        Err(e) => visit(dir.clone(), Err(e)),
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && settings::default_config_dirs_in(home)
+                        .iter()
+                        .any(|p| std::path::Path::new(p) == dir) => {}
+            Err(e) => visit(dir, Err(e)),
+        }
+    }
 }
 
 /// 过滤：别名归属（Some(true)=仅已配别名、Some(false)=仅未配别名、None=全部）

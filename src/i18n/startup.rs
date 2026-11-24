@@ -122,7 +122,7 @@ impl LaunchReason {
                 error,
             } => return control(lang, endpoint, port, error),
         };
-        for d in issues {
+        for d in issues.iter().filter(|d| d.code != "config_legacy_shape") {
             lines.push_str("\n  ");
             lines.push_str(&crate::ops::start::render_diagnostic_fields(
                 &d.file,
@@ -133,7 +133,12 @@ impl LaunchReason {
                 &d.code,
             ));
         }
-        lines.push_str(&hint);
+        if issues.iter().any(|d| d.code == "config_legacy_shape") {
+            lines.push('\n');
+            lines.push_str(&Reason::LegacyConfig.render(lang));
+        } else {
+            lines.push_str(&hint);
+        }
         lines
     }
     fn code(&self) -> &'static str {

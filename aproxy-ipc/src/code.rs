@@ -705,6 +705,12 @@ pub const TABLE: &[Code] = &[
         &[],
     ),
     diagnostic(
+        "config_legacy_shape",
+        Severity::Info,
+        "A file uses the 0.1.x configuration shape; preview its migration before writing.",
+        &[],
+    ),
+    diagnostic(
         "config_unknown_key",
         Severity::Error,
         "A key that is not recognized.",

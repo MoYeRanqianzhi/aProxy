@@ -54,6 +54,10 @@ pub(crate) async fn handle_doctor_cmd(json: bool) {
                     aproxy::ops::start::render_diagnostic(d, current())
                 );
                 if d.code == "config_unknown_key"
+                    && !file
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.code == "config_legacy_shape")
                     && let Some(key) = &d.key
                 {
                     let key = quoted(key);

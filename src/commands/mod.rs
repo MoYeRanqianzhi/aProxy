@@ -12,6 +12,7 @@ pub(crate) mod doctor;
 pub(crate) mod find;
 pub(crate) mod install;
 pub(crate) mod logs;
+pub(crate) mod migrate;
 pub(crate) mod restart;
 pub(crate) mod restore;
 pub(crate) mod settings;
@@ -59,6 +60,7 @@ impl JsonOutput {
             Commands::Stop { json, .. }
             | Commands::Restart { json, .. }
             | Commands::Restore { json }
+            | Commands::Migrate { json, .. }
             | Commands::Doctor { json }
             | Commands::Status { json, .. }
             | Commands::Find { json, .. }

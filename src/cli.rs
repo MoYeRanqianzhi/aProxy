@@ -163,6 +163,14 @@ pub enum Commands {
         cmd: AliasCmd,
     },
 
+    #[command(about = help::migrate(current()))]
+    Migrate {
+        #[arg(long, help = help::migrate_preview(current()))]
+        dry_run: bool,
+        #[arg(long, help = help::json(current()))]
+        json: bool,
+    },
+
     #[command(about = help::doctor(current()))]
     Doctor {
         #[arg(help = help::json(current()))]

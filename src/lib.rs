@@ -8,6 +8,8 @@ pub mod find;
 pub mod fsx;
 pub mod history;
 pub mod install;
+/// 显式迁移旧的配置文件，不影响普通读者的严格解析。
+pub mod migrate;
 pub mod ops;
 pub mod process;
 pub mod proxy;

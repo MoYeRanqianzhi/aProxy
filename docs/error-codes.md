@@ -102,6 +102,7 @@ Problems found in config.toml and settings.json. Each diagnostic is an object wi
 | `config_type` | error | A value has the wrong type. | — |
 | `config_invalid_value` | error | A value is not allowed. | `reason` (string) |
 | `config_missing_key` | error | A required key is missing. | — |
+| `config_legacy_shape` | info | A file uses the 0.1.x configuration shape; preview its migration before writing. | — |
 | `config_unknown_key` | error | A key that is not recognized. | — |
 | `config_not_supported` | error | A form whose shape is defined but which is not implemented yet. | — |
 | `format_name_reserved` | error | The format name is reserved for selecting all entries. | `name` (string) |

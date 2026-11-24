@@ -1,14 +1,15 @@
 //! aProxy 的桌面界面：Tauri 2 外壳 + 嵌入的前端。
 //!
 //! 由 aproxy 的 `desktop` 特性引入，`aproxy desktop` 在主线程上调用 [`run`]。本包不依赖
-//! aproxy（aproxy 依赖本包，反过来会成环），home、tokio 运行时这些由调用方经 [`Options`]
-//! 交进来；以后要改配置、拉起实例这类需要核心逻辑的操作，由本包定义接口、aproxy 实现后
-//! 注入，读数据则经将来的 IPC 客户端。
+//! aproxy（aproxy 依赖本包，反过来会成环），home、tokio 运行时，以及读实例、改配置、装包
+//! 这些需要核心逻辑的操作，都由调用方经 [`Options`] 交进来：接口定义在 `aproxy_ipc::desktop`，
+//! 实现在 aproxy 的 `src/desktop/`。
 //!
 //! 前端在 `ui/`（Vite + Svelte 5 + TS），构建产物 `dist/` 由 `generate_context!` 在编译期
-//! 嵌进二进制（dist 缺失时 build.rs 报错，见那里）。这一版界面里全是演示数据（前端的 mock
-//! 后端），本包只管窗口：建窗口、自定义标题栏、Mica 支持与否、页面的 CSP 与导航限制。以后
-//! 真实数据接进来时，前端换一个 Backend 实现，这里加对应的命令。
+//! 嵌进二进制（dist 缺失时 build.rs 报错，见那里）。本包管窗口（建窗口、自定义标题栏、Mica
+//! 支持与否、页面的 CSP 与导航限制）与传输：`bridge` 里的命令把页面的请求交给注入的
+//! 实现，事件经通道逐帧送回页面；包里的文件经 `aproxy-pkg` 协议提供。命令表在
+//! `command_list.rs`，构建脚本据它核对权限文件。
 //!
 //! tauri.conf.json 写不了注释，其中的取舍记在这里：
 //! - `build.windows.staticVCRuntime: false`：默认的 true 让 tauri-build 往自己的 OUT_DIR 写一个

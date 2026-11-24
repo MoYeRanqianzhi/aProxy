@@ -400,6 +400,15 @@ forward 的请求，链上有程序要请求体或摘要、或有程序声明了
 响应，那一层会先攒齐。默认保持 retry、由判断类程序把安全的请求改成 forward，是有意的：判断
 程序坏了，退路是无限重试而不是不重试。
 
+**单独重启与 control。** `aproxy restart <目标> --format all|<name>`（窗口的实例页也能做）只换
+某些条目的进程，不换实例、不重读 config.toml：新进程先握手，通过之后才接手；已经发出的消息在
+旧进程上收尾，同一请求之后的消息交给新进程（所以按请求的事实要放进 `state`）。握手不过就什么
+都不替换，与 `restart` 预检不过时旧实例照常运行是同一个道理。程序可以在 hello 回复里提供
+`control`：第一次有调用时，aproxy 用它给的参数另起一个同一程序的进程，只收 `stage:"control"`
+的调用，方法与含义由作者定；这个进程不占请求的 worker，也不碰熔断器。每个条目同时只办一个
+调用、最多 16 个排队，连排队与启动在内以 5 秒为限。扩展经 `api.formats` 调用它，做与某个
+format 配对的界面。
+
 官方角色与这些阶段的对应（`convert`、`keys`、`route`、`policy`、`adaptive`、`rewrite`、
 `heartbeat`）见 aproxy-format skill；配置键见 aproxy-cli skill 的 `config-toml.md`。
 
@@ -798,8 +807,9 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
 ## 桌面界面（aproxy-desktop）
 
 `aproxy desktop` 打开的窗口：Tauri 2 外壳加嵌入的前端（`aproxy-desktop/ui/`，Vite + Svelte 5 +
-TypeScript）。0.2.0 各 alpha 版的界面是预览版，数据全部来自前端的 mock 后端，界面顶部常驻
-「预览版 · 演示数据」标签。
+TypeScript）。窗口显示的是这个 home 下真实的实例、请求历史与配置：数据由 aproxy 本体读取
+（`src/desktop/`），经 Tauri 命令交给页面。在浏览器里打开开发服务器时没有 Tauri，页面换用演示
+后端，顶部常驻「演示数据」标签，免得把假的实例当成这台电脑上正在跑的。
 
 **两种变体。** 根包的 `desktop` 特性（默认开）就是对 aproxy-desktop 的可选依赖；
 `--no-default-features` 出无界面的 headless 版本，依赖树里没有任何界面 crate（CI 用
@@ -849,13 +859,33 @@ Layouts 留在右上角，页面画标题栏的其余部分；`src/titlebar.rs` 
 切换；支持与否由 Rust 判定（build ≥ 22523，且 window-vibrancy 在隐藏的窗口上试用成功），
 系统的「透明效果」关着时设置页标明 Mica 会显示为纯色。
 
-**不联网、权限最小。** CSP 只放行嵌入的资源与 IPC，吉祥物的沙箱页单独加 `script-src
-blob:`；窗口只许停在嵌入的页面上，按平台精确比对源（Windows 只认 `http://tauri.localhost`，
-其余平台只认 `tauri://localhost`，带端口的都不认：Linux 与 macOS 上
-`http(s)://tauri.localhost` 是真实的回环地址），CSP 不管顶层导航，这一条就是闸门；权限
-（`capabilities/main.json`）只授权页面用到的窗口接口与本包的三个命令，自定义命令经 app
-manifest 纳入权限检查。各项取舍写在
-`aproxy-desktop/src/lib.rs` 的开头（`tauri.conf.json` 写不了注释）。
+**数据怎样到页面。** 页面与 Rust 之间的约定在 `aproxy-ipc/src/desktop/`（DTO、错误码、事件帧），
+与窗口一同发版，不是给第三方的稳定协议；页面一侧对应的类型在 `ui/src/lib/backend/contract.ts`。
+aproxy-desktop 只做传输：`bridge.rs` 的命令自己解码请求体，把结果交回页面；读写的逻辑在
+aproxy 的 `src/desktop/`，经 `Options` 注入。实例的读取与操作走实例 IPC，与命令行用同一条控制
+通道；有副作用的操作带着页面当时看到的运行标识，端口换了主人就拒绝，不会落到别的实例上。
+页面接上一个事件通道（`attach`），逐帧确认；缺帧或积压时 Rust 先发 `resync`，页面从快照重来。
+错误只给码与固定的细节，句子都在页面的字典里；密钥在 Rust 一侧打码之后才离开。
+
+**主题与扩展。** 主题包（`theme.json` 的颜色，可选的 `theme.css`）与扩展包（一个 ES module）装在
+`<home>/desktop/extensions/`。安装只接受本地的 ZIP 或解开的目录（文件选择或拖进窗口）：Rust 先
+完整读一遍，校验清单、路径与各项上限，再由页面把适用的风险逐条讲清（闭源、与 GitHub release
+的摘要对不上、仓库星数少、核对不了），每条单独确认之后才落盘。不做沙箱：启用的扩展在主页面里
+运行，能做页面能做的一切，风险由安装前的提醒负责（用户 2026-11-23 定）。包里的文件经自定义协议
+`aproxy-pkg` 提供，地址的第一段带这次激活的代号（`<id>~<代号>`），升级之后相对引用的模块、
+图片与字体不会沿用页面缓存里的旧内容。窗口偏好、启用列表与扩展的设置在
+`<home>/desktop/desktop.toml`，扩展的数据在 `<home>/desktop/extension-data/<id>/`。
+
+**联网与权限。** 窗口自己只在两处联网：检查与下载更新，以及安装包时可选地匿名查询 GitHub
+（仓库信息与 release 的摘要）；扩展联网是扩展的事，安装前已经提醒。CSP 放行嵌入的资源、IPC、
+`aproxy-pkg` 与 HTTPS（扩展可以加载远程的模块与资源），`object-src`、`base-uri`、`form-action`
+一律禁止；Tauri 对 CSP 的补写只关掉 style-src 这一项（加了 nonce，浏览器就会忽略
+`'unsafe-inline'`，动态样式随之失效）。窗口只许停在嵌入的页面上，按平台精确比对源（Windows
+只认 `http://tauri.localhost`，其余平台只认 `tauri://localhost`，带端口的都不认：Linux 与 macOS
+上 `http(s)://tauri.localhost` 是真实的回环地址），新窗口与下载一律拒绝；CSP 不管顶层导航，
+这一条就是闸门。权限（`capabilities/main.json`）只授权页面用到的窗口接口、事件监听与本包的
+命令，不含 `core:default`；命令表在 `command_list.rs`，构建脚本核对它与权限文件两个方向一致。
+各项取舍写在 `aproxy-desktop/src/lib.rs` 的开头（`tauri.conf.json` 写不了注释）。
 
 **前端产物。** `generate_context!` 在编译期把 `aproxy-desktop/dist/` 嵌进二进制。dist 不进
 git，缺失时 build.rs 报错并给出构建步骤，不拿占位页面凑数——凑出来的二进制看起来正常、
@@ -866,9 +896,9 @@ tauri-build 每次构建都在包根写 `gen/schemas/`，包里没有这些文�
 构建一次本包，校验构建写出的内容逐字节相同，就不算改动（2026-10-12 在 Windows 上实测，做法
 见 `aproxy-desktop/Cargo.toml` 的 include 说明）。
 
-**接缝。** 界面组件只经 Backend 接口（`ui/src/lib/backend/types.ts`）取数据、发命令，预览版
-用的是 mock 实现；接真实数据时换成 IPC 实现，aproxy-desktop 里加相应的命令。aproxy-desktop
-需要的 home 与运行时由 bin 经 `Options` 交进去。浏览器开发模式（`npm run dev`）里另有原型件
+**接缝。** 界面组件只经 `Link` 接口（`ui/src/lib/backend/link.ts`）发命令、收事件：窗口里是
+Tauri 实现（`tauri.ts`），浏览器里是演示实现（`demo/`），两者的命令表、事件与错误完全相同。
+aproxy-desktop 需要的 home 与运行时由 bin 经 `Options` 交进去。浏览器开发模式（`npm run dev`）里另有原型件
 （`ui/src/proto/`：审核工具条、模拟的窗口按钮与 Mica、吉祥物预览页），只在开发服务器里动态
 加载，生产构建不含它们；它们的文案与吉祥物预览页的 `#/mascots` 路由也只在开发构建里。
 

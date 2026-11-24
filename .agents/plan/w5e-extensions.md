@@ -403,7 +403,7 @@ This is an instance interface, separate from package installation. Use `[[format
 
 ### Format program: a separate control process
 
-A protocol-1 worker's hello reply can include `"control":{"args":["control-mode"]}`. Omit it if the program offers no control. The list may be empty; at most 32 strings, each at most 4096 UTF-8 bytes. A malformed offer invalidates the hello. The first call starts the same executable in the workers' directory and environment, **substituting** these arguments for the configured ones. Its hello has `seq:0`, `process:"persistent"`, `stages:["control"]`, `worker_id:4294967295`; the reply must list `control` in `stages`. Ordinary spawn workers still see ID 0. Neither the control process nor a pinned stream consumes a request worker slot.
+A protocol-1 worker's hello reply can include `"control":{"args":["control-mode"]}`. Omit it or send `"control":null` if the program offers no control. The list may be empty; at most 32 strings, each at most 4096 UTF-8 bytes. A malformed offer invalidates the hello. The first call starts the same executable in the workers' directory and environment, **substituting** these arguments for the configured ones. Its hello has `seq:0`, `process:"persistent"`, `stages:["control"]`, `worker_id:4294967295`; the reply must list `control` in `stages`. Ordinary spawn workers still see ID 0. Neither the control process nor a pinned stream consumes a request worker slot.
 
 Exchange one UTF-8 JSON object per line. After hello, `seq` starts at 1 and advances once per valid reply. For example, the request and two alternative replies are:
 
@@ -415,11 +415,11 @@ Exchange one UTF-8 JSON object per line. After hello, `seq` starts at 1 and adva
 
 `method` matches `[A-Za-z0-9._-]{1,64}`. `params` is required, may be any JSON value (including null), and is limited to 65,536 bytes of compact serialized JSON. It is passed unchanged. Reply limits include the newline: 64 KiB for hello and `limits.control` (1 MiB) for the call. A valid `fail` does not end the session. Before returning either alternative, the instance replaces known secrets in string values, object keys, and both strings of a `fail`; a collision of redacted keys is a protocol fault, not permission to discard data.
 
-One call runs and at most 16 wait **per entry**; the next is refused. The five-second deadline includes waiting, launch, hello and exchange. A caller that expires in the queue does not kill the active caller's process. Timeout during the exchange, wrong sequence, malformed/oversized reply or process death discards that process; the next call starts a fresh one. The idle process receives EOF after five minutes. A restart or shutdown retires it too. None of this opens the request breaker or occupies a request worker.
+One call runs and at most 16 wait **per entry**; the next is refused. The five-second deadline includes waiting, launch, hello and exchange. The host checks the absolute deadline at checkout and before writing. An expired waiter sends no call and does not take the healthy idle session. Before reuse, the host discards an idle process with unsolicited stdout, even if a buffered reply carries the expected next sequence. Timeout during the exchange, wrong sequence, malformed/oversized reply or process death discards that process; the next call starts a fresh one. The idle process receives EOF after five minutes. A successful cutover or instance shutdown retires it too; a failed replacement leaves it alone. None of this opens the request breaker or occupies a request worker.
 
 ### Instance IPC (v1)
 
-Read `ping.result.ops` first. Only send a mutating op to the verified instance that advertised it, not a new occupant of the same port. Use the ordinary success or error envelope; example request lines and replies (each is a separate line):
+Read `ping.result.ops` first. Only send a mutating op to the verified instance that advertised it, not a new occupant of the same port. On `format_control`, the entire raw IPC request line, **including its newline**, must fit in 131,072 bytes. Without a newline within that limit the instance returns `bad_request` with `details.reason:"incomplete_line"`, even if escape sequences would decode to parameters below the separate 65,536-byte compact JSON limit. IPC readers ignore unknown reply fields but require exactly one of `result` or `fail` in a successful control payload. Use the ordinary success or error envelope; example request lines and replies (each is a separate line):
 
 ```jsonl
 {"v":1,"op":"restart_formats","args":{"names":["keys"]}}
@@ -432,9 +432,13 @@ Read `ping.result.ops` first. Only send a mutating op to the verified instance t
 {"v":1,"ok":false,"error":{"code":"format_control_error","message":"format control failed: no-control","details":{"reason":"no-control"}}}
 ```
 
-`names:null` means every configured entry, possibly none. A non-empty list selects names case-sensitively; `"all"` is not an entry name. Missing `names` is not authorization to restart all. Resolve the whole selection before changing anything. Return each selected entry once in configuration order. Each replacement probes from the instance's existing configuration; the publication of that replacement is the cutover. Old messages and streams finish on their original processes. A successful restart starts with a closed breaker and zero failures. On handshake failure the instance remains up: optional entries can be bypassed, required entries follow the existing unavailable/open-breaker behavior, notify-only entries use their own breaker, and a disabled breaker still permits later attempts. `reason` is the format fault kind (e.g. `spawn`, `io`, `died`, `timeout`, `protocol`, `invalid_output`), not localized prose.
+`names:null` means every configured entry, possibly none. A non-empty list selects names case-sensitively; `"all"` is not an entry name. Missing `names` is not authorization to restart all. For both restart and control, a selector must equal the configured name or its redacted display name and match **exactly one entry**. Unknown and ambiguous names both return `unknown_format`. Resolve the entire selection before reserving any entries. If any selected entry is already restarting, refuse the whole selection immediately with `invalid_state` and `details.reason:"restart-in-progress"`; restarts do not queue. Once admitted, probe the selected entries concurrently, each with the usual ten-second hello deadline, and return each once in configuration order. Mutations are refused during startup or drain, whether shutdown came from IPC or an OS signal.
 
-`ping.result.formats` and the live `status --json` entry snapshot expose `program` and `version` once negotiated, `control` (false without an offer), and `restarted_at` (null until an explicit restart; the epoch-millisecond timestamp is set even on a failed attempt). The enumerated `status.formats` array is omitted when empty. Do not use program names as unique row keys or expose command arguments through the page view.
+A successful probe publishes the replacement, resets its breaker and failure count, and sets `restarted_at`. Protection is **per message**, not per request: a sent message and an already-open stream finish on their original processes; a later message of the same request goes to the generation current at dispatch. A failed probe (including stray stdout after hello) publishes nothing. The previous workers, control session, hello facts, breaker, failure count and restart time stay as they were. The `handshake-failed` outcome gives the format fault kind (e.g. `spawn`, `io`, `died`, `timeout`, `protocol`, `invalid_output`), not localized prose. A failure for one selected entry does not roll back another entry's successful probe.
+
+When `notify` is configured, the host hashes every fully observed upload, even if the current hello did not ask for the digest. A later generation requesting `notify:digest` can therefore receive it; null denotes an incomplete upload. The notify breaker and queue belong to the generation, but `notify_dropped_total` counts losses across the entry's lifetime, including notifications discarded at cutover.
+
+`ping.result.formats` and the live `status --json` entry snapshot expose `program` and `version` once negotiated, `control` (false without an offer), and `restarted_at` (null until the first successful explicit restart; epoch milliseconds thereafter). The enumerated `status.formats` array is omitted when empty. Do not use program names as unique row keys or expose command arguments through the page view.
 
 ### CLI
 
@@ -443,13 +447,14 @@ Read `ping.result.ops` first. Only send a mutating op to the verified instance t
 | Notice | English | Chinese |
 |---|---|---|
 | Restarted | `Port {port}: restarted format {name} ({program} {version}).` | `端口 {port}：已重启 format {name}（{program} {version}）。` |
-| Handshake failure | `Port {port}: format {name} handshake failed: {reason}.` | `端口 {port}：format {name} 握手失败：{reason}。` |
+| Handshake failure | `Port {port}: format {name} failed its handshake: {reason}; nothing was replaced.` | `端口 {port}：format {name} 握手失败：{reason}；没有替换，仍按原样运行。` |
 | Older instance | `Port {port}: this instance does not support restarting formats.` | `端口 {port}：此实例不支持单独重启 format。` |
 | Other refusal | `Port {port}: could not restart formats: {message}` | `端口 {port}：无法重启 format：{message}` |
 | Selection error | `Use --format all alone, or specify one or more format names.` | `请单独使用 --format all，或指定一个或多个 format 条目名。` |
+| Flag conflict | `Do not combine --format with --force or --idle-threshold-secs.` | `--format 不能与 --force 或 --idle-threshold-secs 同用。` |
 | Configuration notice | `config.toml was not reloaded; restart the instance to change a [[format]] entry.` | `未重读 config.toml；修改 [[format]] 条目须重启实例。` |
 
-With `--json`, stdout is one schema-1 document and notices go to stderr. Example mixed result:
+With `--json`, stdout is one schema-1 document and notices go to stderr. All format-selector conflicts (`all` with names, `--format` with `--force` or `--idle-threshold-secs`) produce a schema-1 `usage` error document with `details.reason:"format_selection"` and exit 2; these are not clap parse errors. Example mixed result:
 
 ```json
 {"schema":1,"results":[{"target":"work","port":19901,"outcome":"restarted","name":"keys","program":"keys","version":"1","configReloaded":false},{"target":"work","port":19901,"outcome":"handshake-failed","name":"other","reason":"invalid_output","configReloaded":false}],"summary":{"ok":1,"failed":1}}
@@ -476,13 +481,13 @@ type FormatCommands = {
 };
 ```
 
-`format_list` is a separate read for the instance page rather than a change to every card. It projects snapshot `half_open` as `probing`; absent hello facts or restart time become null. `format_call` resolves the actual JSON result, **not** `{result:…}`; a valid program failure rejects with the author's redacted details. Keep error layers distinct:
+`format_list` is a separate read for the instance page rather than a change to every card. It shows the notify breaker for notify-only entries and the data breaker otherwise. It projects snapshot `half_open` as `probing`; absent hello facts or restart time become null. `format_call` resolves the actual JSON result, **not** `{result:…}`; a valid program failure rejects with the author's redacted details. Keep error layers distinct:
 
 | Code | Details and meaning |
 |---|---|
 | `format_name_reserved` | Config diagnostic `{name:"all"}`: choose another entry name. |
-| `unknown_format` | IPC `{name}`: no matching entry; the whole selection was refused. |
-| `format_control_error` | IPC `{reason}`: `no-control` (no offer/retired), `busy` (queue full), `timeout` (deadline), `protocol` (bad session/exit), `too-large` (params or reply), `spawn` (cannot start the process). |
+| `unknown_format` | IPC `{name}`: zero or multiple matching entries; the whole selection was refused. |
+| `format_control_error` | IPC `{reason}`: `no-control` (no offer/retired), `busy` (queue full), `timeout` (deadline), `protocol` (bad session/exit), `too-large` (compact params, hello or control reply), `spawn` (cannot start the process). |
 | `bad_request`, `unsupported_arg`, `invalid_state`, `unknown_op` | Ordinary IPC validation, unexpected keys, non-serving state, or unavailable operation; check `ops` before sending. |
 | `format_restart_failed` | CLI `{port,reason}`: one instance-wide refusal; the reason is the remote code, `run_changed`, or `ipc`. |
 | `desktop_format` | Window `{reason}`: the six host-side control reasons above, `unknown-format`, or `unsupported` (older instance). |

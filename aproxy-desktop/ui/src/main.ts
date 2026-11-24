@@ -9,4 +9,8 @@ startShell();
 
 const app = mount(App, { target: document.getElementById('app')! });
 
+// 截图场景：只有 debug 构建以 APROXY_DESKTOP_DEMO=…,scene=<名字> 启动的窗口才有（见 lib/backend/demo/scenes.ts）
+const scene = window.__APROXY_DEMO__?.scene;
+if (scene) void import('./lib/backend/demo/scenes').then((m) => m.playScene(scene));
+
 export default app;

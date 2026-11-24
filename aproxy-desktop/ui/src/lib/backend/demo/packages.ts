@@ -79,6 +79,8 @@ export function activate(api) {
     const draw = () => {
       const rows = api.requests.recent();
       const retried = rows.filter((r) => r.attempts > 1).length;
+      // 还没有请求时不显示这一条（「最近 0 条请求里有 0 条重试过」没有意思）
+      el.style.display = rows.length ? '' : 'none';
       el.textContent = t('请求节拍：最近 ' + rows.length + ' 条请求里有 ' + retried + ' 条重试过', 'Pulse: ' + retried + ' of the last ' + rows.length + ' requests were retried');
     };
     draw();

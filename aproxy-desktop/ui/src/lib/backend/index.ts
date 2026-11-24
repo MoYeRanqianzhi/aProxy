@@ -14,8 +14,11 @@ import { demoLink } from './demo';
 
 declare global {
   interface Window {
-    /** 窗口以 APROXY_DESKTOP_DEMO 启动时由 Rust 的初始化脚本写入：用演示数据，并预设语言与深浅色 */
-    __APROXY_DEMO__?: { lang: 'system' | 'en' | 'zh-CN'; mode: 'system' | 'light' | 'dark' };
+    /**
+     * 窗口以 APROXY_DESKTOP_DEMO 启动时由 Rust 的初始化脚本写入：用演示数据，并预设语言与深浅色；
+     * scene 是截图场景的名字（demo/scenes.ts），没给就是 undefined
+     */
+    __APROXY_DEMO__?: { lang: 'system' | 'en' | 'zh-CN'; mode: 'system' | 'light' | 'dark'; scene?: string };
   }
 }
 

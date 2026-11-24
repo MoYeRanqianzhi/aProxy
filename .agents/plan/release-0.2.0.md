@@ -480,6 +480,19 @@
 - 还没做：macOS 菜单栏的应用名显示为小写的 `aproxy`（裸二进制取进程名，打成 .app 才有 CFBundleName）；
   配置页显示的路径会被规范化成 `/private/tmp/...`，与实例页的 `/tmp/...` 不一致（家目录下的配置不受影响）；
   t15 合入后在 runner 上再截一轮，并在 Windows 上确认标题栏没有变化。
+- 2026-11-25 进展（三平台外观，规矩见记忆 desktop-window-chrome、desktop-screenshots）：
+  - 横向滚动条：概览页下半区与日志详情 format 页挤压布局（`c736c636`），滚动条改丁香紫胶囊（`493d5892`）；
+    浏览器逐页审计 900–1440px、中英文无溢出，macOS 与 Windows runner 截图确认。
+  - Linux 自定义标题栏（`2020a6b3`）：去掉装饰、页面画三个窗口按钮；实测脚本 `linux-titlebar.py` 在
+    `probe/screenshots` 分支，结果待看。
+  - Windows 截图换到 `windows-11-arm`（Server 2025 是 Windows 10 外观）。Server 2025 上演示模式的深色场景里，
+    右上角按钮区停在浅色底（像素 `#f4f2fd`）；同样的深色偏好在本机 Windows 11 真实模式下正常。截图脚本已加
+    `DWMWA_CAPTION_COLOR` 回读，看 Windows 11 上是否复现再定修法。
+  - 截图画质：runner 都是 1 倍显示，macOS 的显示器用 `displayplacer` 调到 1920×1080（窗口 1200×780）；
+    Linux 打算 `GDK_SCALE=2`，Windows 200% 缩放待试。
+  - 截图工作流定稿（还没做）：场景要覆盖每个细节页（需要演示模式能指定打开哪一页、哪个浮层）；完整图集强推到
+    专门分支（单提交），README 典型图经 PR；改 main 的 `.github/` 前先告诉用户。
+  - Codex：t13（迁移）按审查 v27 修订、t15（macOS）按审查 v28 修订，2026-11-25 已续接执行。
 
 ### W7 发布
 - 版本 0.2.0（是否先发预发布版待定）、CHANGELOG、README / docs / skill 同步、skill references 是否留存

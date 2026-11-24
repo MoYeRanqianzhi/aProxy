@@ -36,6 +36,13 @@ export function faultText(f: Failure): string {
       return t('fault.install_precheck_failed', { port: f.details.port });
     case 'desktop_package':
       return packageText(f.details);
+    case 'desktop_format': {
+      const key = `fault.desktop_format.${f.details.reason}`;
+      return t(hasMessage(key) ? key : 'fault.desktop_format');
+    }
+    case 'desktop_format_fail':
+      // 原因与代码都是 format 作者写的（宿主已打码），照原样放进句子里，不当成翻译的键
+      return t('fault.desktop_format_fail', { reason: f.details.reason, code: f.details.code });
     case 'desktop_toml': {
       const i = f.details;
       return t(`fault.desktop_toml.${i.kind}`, { line: i.line ?? '?', column: i.column ?? '?', key: i.key ?? '?' });

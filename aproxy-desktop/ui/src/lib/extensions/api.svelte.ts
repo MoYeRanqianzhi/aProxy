@@ -21,10 +21,12 @@ import type {
   DataFile,
   Detail,
   Edit,
+  FormatView,
   InstallEnd,
   LogPage,
   PackageEntry,
   Ref,
+  RestartOutcome,
   Row,
   Run,
   Saved,
@@ -112,11 +114,20 @@ export interface ExtensionApi {
     check(channel: 'auto' | 'pre'): Promise<UpdateInfo>;
     install(check: Token): Promise<InstallEnd>;
   };
-  /** format 的控制与重启：这个版本还没有，调用会以 Error 拒绝 */
+  /**
+   * 一个运行中实例的 [[format]] 条目。用条目名（配置里的 name）选条目；FormatView.program 是程序在握手时报的名字，
+   * 扩展据它认出与自己配对的 format（manifest 的 formats），但两个条目可以跑同一个程序，要按条目名操作
+   */
   formats: {
-    list(run: Run): Promise<never>;
-    call(run: Run, name: string, method: string, params?: unknown): Promise<never>;
-    restart(run: Run, names?: string[]): Promise<never>;
+    /** 这次运行的条目，按配置里的顺序 */
+    list(run: Run): Promise<FormatView[]>;
+    /**
+     * 调用条目的 control 方法，兑现的是程序给的结果（可能是 null）。程序明确拒绝时以 desktop_format_fail 拒绝，
+     * code 与 reason 是程序自己写的；宿主这边没办成时以 desktop_format 拒绝。params 省略时发 null
+     */
+    call(run: Run, name: string, method: string, params?: unknown): Promise<unknown>;
+    /** 不换实例、只重启这些条目（null 是全部）；config.toml 不重读，在途的请求在旧进程上照常收尾 */
+    restart(run: Run, names: string[] | null): Promise<RestartOutcome[]>;
   };
   ui: {
     state(): UiStateView;
@@ -214,10 +225,6 @@ function uiState(): UiStateView {
   return { page: ui.page, lang: ui.lang, variant: ui.variant, mood: store.mood, retrying: store.retrying, inFlight: store.inflight };
 }
 
-function notYet(): Promise<never> {
-  return Promise.reject(new Error('api.formats is not available in this version of aProxy'));
-}
-
 export function createApi(entry: PackageEntry, reg: Registrar, generation: string): ExtensionApi {
   const id = entry.id;
   const sub = (read: () => unknown, cb: () => void) => reg.track(watch(read, cb));
@@ -262,7 +269,11 @@ export function createApi(entry: PackageEntry, reg: Registrar, generation: strin
       install: (check: Token) => store.installUpdate(check),
     },
 
-    formats: { list: notYet, call: notYet, restart: notYet },
+    formats: {
+      list: (run: Run) => store.formatList(run),
+      call: (run: Run, name: string, method: string, params: unknown = null) => store.formatCall(run, name, method, params),
+      restart: (run: Run, names: string[] | null) => store.formatRestart(run, names),
+    },
 
     ui: {
       state: uiState,

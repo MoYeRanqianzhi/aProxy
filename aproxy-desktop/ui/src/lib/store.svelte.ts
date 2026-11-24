@@ -389,6 +389,21 @@ class Store {
     return link.call('rescan', {});
   }
 
+  /** 这次运行的 format 条目。每次都现问实例，不进快照：只有实例页与扩展要看 */
+  formatList(run: Run) {
+    return link.call('format_list', { run });
+  }
+
+  /** 只重启选中的 format 条目（null 是全部），实例不换、config.toml 不重读 */
+  formatRestart(run: Run, names: string[] | null) {
+    return link.call('format_restart', { run, names });
+  }
+
+  /** 调用一个条目的 control 方法；方法与参数的含义由 format 的作者定 */
+  formatCall(run: Run, name: string, method: string, params: unknown) {
+    return link.call('format_call', { run, name, method, params });
+  }
+
   queryLogs(run: Run | null, cursor: Token | null, limit: number): Promise<LogPage> {
     return link.call('query_logs', { run, cursor, limit });
   }

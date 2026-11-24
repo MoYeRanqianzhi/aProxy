@@ -823,6 +823,13 @@ export type Fault =
   | F<'desktop_toml', TomlIssue>
   /** 包与扩展数据：装不了、用不了、超出上限 */
   | F<'desktop_package', PackageIssue>
+  /** format 条目的列出、重启与 control 调用在宿主这边没办成（不是 format 程序自己拒绝） */
+  | F<'desktop_format', { reason: FormatFaultReason }>
+  /**
+   * format 程序收到了 control 调用并明确拒绝。code 与 reason 都由 format 的作者定（已打码），不是宿主的词表：
+   * 照原样显示给人看，不要拿 code 去查翻译
+   */
+  | F<'desktop_format_fail', { code: string; reason: string }>
   | F<
       'desktop_registration',
       {
@@ -839,6 +846,49 @@ export type Fault =
   | F<'install_precheck_failed', { port: number; diagnostics: Issue[] }>;
 
 export type FaultCode = Fault['code'];
+
+/**
+ * desktop_format 的原因：no-control（条目没提供 control，或它的 control 进程已退役）、busy（排队的调用满了）、
+ * timeout（五秒内没办完，含排队、启动与握手）、protocol（control 进程答非所问或中途退出）、
+ * too-large（参数或答复超过上限）、spawn（control 进程起不来）、unknown-format（实例里没有这个条目）、
+ * unsupported（实例的版本太旧，不认这个操作）
+ */
+export type FormatFaultReason =
+  | 'no-control'
+  | 'busy'
+  | 'timeout'
+  | 'protocol'
+  | 'too-large'
+  | 'spawn'
+  | 'unknown-format'
+  | 'unsupported';
+
+/**
+ * 一个运行中实例里的一个 [[format]] 条目。name 是配置里的条目名，用它选条目；program 是握手时程序报的名字，
+ * 两个条目可以跑同一个程序，所以不能拿 program 当唯一的键
+ */
+export interface FormatView {
+  name: string;
+  /** 握手之前、或旧版本实例不报时为 null */
+  program: string | null;
+  version: string | null;
+  process: 'spawn' | 'persistent';
+  stages: string[];
+  /** 必需的条目握手失败时，请求会失败；可选的会被跳过 */
+  required: boolean;
+  /** 请求这一路的熔断器；control 进程不影响它 */
+  breaker: 'closed' | 'open' | 'probing';
+  /** 程序在握手时是否提供了 control */
+  control: boolean;
+  /** 最近一次单独重启的时刻（失败的也算）；实例启动不算，从没单独重启过为 null */
+  restartedAt: Time | null;
+}
+
+/** 单独重启一个条目的结果：每个选中的条目各一条，按配置里的顺序 */
+export type RestartOutcome =
+  | { name: string; outcome: 'restarted'; program: string | null; version: string | null }
+  /** 实例照常运行；reason 是 format 故障的类别（spawn、io、died、timeout、protocol、invalid_output 等），不是给人看的句子 */
+  | { name: string; outcome: 'handshake-failed'; reason: string };
 
 /** 请求失败或重试的原因。不认识的码一律是 unknown */
 export type HistoryCode =
@@ -964,6 +1014,19 @@ export interface Commands {
   extension_file_write: [{ id: string; name: string; bytes: Uint8Array }, DataFile];
   /** 文件本来就不在也不算错 */
   extension_file_delete: [{ id: string; name: string }, null];
+
+  /** 这次运行的 format 条目，按配置里的顺序；没有条目时是空数组 */
+  format_list: [{ run: Run }, FormatView[]];
+  /**
+   * 不换实例、只重启选中的 format 条目：在途的请求与流式响应在旧进程上照常收尾，config.toml 不重读。
+   * names 为 null 是全部条目；列出的名字区分大小写，有一个不认识就整个拒绝、什么都不改
+   */
+  format_restart: [{ run: Run; names: string[] | null }, RestartOutcome[]];
+  /**
+   * 调用条目的 control 方法（方法与参数的含义由 format 的作者定）。兑现的是程序给的结果本身（可能是 null）；
+   * 程序明确拒绝时以 desktop_format_fail 拒绝。method 只能是 [A-Za-z0-9._-]，1–64 个字符；params 序列化后不超过 64 KiB
+   */
+  format_call: [{ run: Run; name: string; method: string; params: unknown }, unknown];
 }
 
 export type CommandName = keyof Commands;

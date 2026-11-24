@@ -16,6 +16,7 @@ import type {
   ConfigTarget,
   DesktopEvent,
   Fault,
+  FormatView,
   InstallEnd,
   InstallPhase,
   Job,
@@ -317,6 +318,37 @@ async function runInstall(version: string): Promise<InstallEnd> {
 }
 
 // ---------------------------------------------------------------------------
+// format 条目：演示里只有 12345 配了两个条目（一个能控制、一个不能），12346 配了一个必需的条目。
+// 重启只记下时刻；control 认两个方法：settings.read 读回上次写的，settings.write 原样存下，别的方法按作者拒绝回答
+// ---------------------------------------------------------------------------
+
+function demoFormats(): Map<number, FormatView[]> {
+  const entry = (name: string, program: string, extra: Partial<FormatView>): FormatView => ({
+    name,
+    program,
+    version: '0.2.0',
+    process: 'persistent',
+    stages: ['request'],
+    required: false,
+    breaker: 'closed',
+    control: false,
+    restartedAt: null,
+    ...extra,
+  });
+  return new Map([
+    [12345, [entry('keys', 'aproxy-format', { control: true }), entry('convert', 'aproxy-format', { stages: ['request', 'response', 'stream'] })]],
+    [12346, [entry('route', 'my-router', { version: '1.4.2', process: 'spawn', required: true, breaker: 'open' })]],
+  ]);
+}
+const formats = demoFormats();
+const formatSettings = new Map<string, unknown>();
+
+function formatEntries(run: Run): FormatView[] {
+  const inst = liveRun(run);
+  if (inst.status === 'unresponsive') throw fault('desktop_unresponsive', { port: inst.port });
+  return formats.get(inst.port) ?? [];
+}
+
 // 命令表
 // ---------------------------------------------------------------------------
 
@@ -516,6 +548,37 @@ const handlers: Handlers = {
   },
 
   about: () => later<About>({ version: CURRENT, variant: 'desktop', home: '~/.aproxy' }),
+
+  format_list: async ({ run }) => later(structuredClone(formatEntries(run))),
+
+  async format_restart({ run, names }) {
+    const list = formatEntries(run);
+    const picked = names === null ? list : names.map((n) => list.find((f) => f.name === n));
+    // 有一个不认识就整个拒绝，什么都不改
+    if (picked.some((f) => !f)) throw fault('desktop_format', { reason: 'unknown-format' });
+    const now = Date.now();
+    for (const f of picked as FormatView[]) {
+      f.restartedAt = now;
+      f.breaker = 'closed';
+    }
+    return later(
+      (picked as FormatView[]).map((f) => ({ name: f.name, outcome: 'restarted' as const, program: f.program, version: f.version })),
+      400,
+    );
+  },
+
+  async format_call({ run, name, method, params }) {
+    const f = formatEntries(run).find((x) => x.name === name);
+    if (!f) throw fault('desktop_format', { reason: 'unknown-format' });
+    if (!f.control) throw fault('desktop_format', { reason: 'no-control' });
+    const key = `${run.port}/${name}`;
+    if (method === 'settings.read') return later(structuredClone(formatSettings.get(key) ?? null));
+    if (method === 'settings.write') {
+      formatSettings.set(key, structuredClone(params));
+      return later(null);
+    }
+    throw fault('desktop_format_fail', { code: 'unknown-method', reason: `No method ${method}` });
+  },
 
   ...packageHandlers,
 };

@@ -21,6 +21,7 @@
   import JellyBar from '../components/JellyBar.svelte';
   import Sparkline from '../components/Sparkline.svelte';
   import ExtensionMounts from '../components/ExtensionMounts.svelte';
+  import FormatsPanel from '../components/FormatsPanel.svelte';
 
   const inst = $derived(store.card(ui.instancePort));
   const status = $derived(inst ? statusOf(inst) : null);
@@ -406,39 +407,43 @@
       {/if}
     </section>
 
-    {#if inst.metadata}
-      {@const m = inst.metadata}
-      <section class="panel summary">
-        <h2 class="section-title">{t('inst.config')}</h2>
-        <dl>
-          <dt>{t('cfgsum.upstream')}</dt>
-          <dd><code class="mono">{m.baseUrl}</code></dd>
-          <dt>{t('cfgsum.listen')}</dt>
-          <dd><code class="mono">{m.listen}</code></dd>
-          <dt>{t('cfgsum.delivery')}</dt>
-          <dd>{#if m.delivery === 'forward'}<span class="muted">{t('mode.noRetry')}</span>{:else if m.delivery === 'retry'}{t('cfgsum.retryForever')}{:else}<span class="muted">{t('status.unknown')}</span>{/if}</dd>
-          <dt>{t('cfgsum.rules')}</dt>
-          <dd>{#if m.retryRuleCount > 0}{t('cfgsum.ruleCount', { n: m.retryRuleCount })}{:else}<span class="muted">{t('cfgsum.none')}</span>{/if}</dd>
-          <dt>{t('cfgsum.keepalive')}</dt>
-          <dd>
-            {#if m.delivery === 'forward' || m.keepaliveIntervalSecs === 0}
-              <span class="muted">{t('cfgsum.keepaliveOff')}</span>
-            {:else}
-              {t('cfgsum.everyN', { n: m.keepaliveIntervalSecs })}
-              {#if m.keepaliveTrigger !== 'unknown'}<span class="chip">{t(`cfg.o.${m.keepaliveTrigger === 'body-stream' ? 'body_stream' : m.keepaliveTrigger}`)}</span>{/if}
+    <div class="side">
+      {#if inst.metadata}
+        {@const m = inst.metadata}
+        <section class="panel summary">
+          <h2 class="section-title">{t('inst.config')}</h2>
+          <dl>
+            <dt>{t('cfgsum.upstream')}</dt>
+            <dd><code class="mono">{m.baseUrl}</code></dd>
+            <dt>{t('cfgsum.listen')}</dt>
+            <dd><code class="mono">{m.listen}</code></dd>
+            <dt>{t('cfgsum.delivery')}</dt>
+            <dd>{#if m.delivery === 'forward'}<span class="muted">{t('mode.noRetry')}</span>{:else if m.delivery === 'retry'}{t('cfgsum.retryForever')}{:else}<span class="muted">{t('status.unknown')}</span>{/if}</dd>
+            <dt>{t('cfgsum.rules')}</dt>
+            <dd>{#if m.retryRuleCount > 0}{t('cfgsum.ruleCount', { n: m.retryRuleCount })}{:else}<span class="muted">{t('cfgsum.none')}</span>{/if}</dd>
+            <dt>{t('cfgsum.keepalive')}</dt>
+            <dd>
+              {#if m.delivery === 'forward' || m.keepaliveIntervalSecs === 0}
+                <span class="muted">{t('cfgsum.keepaliveOff')}</span>
+              {:else}
+                {t('cfgsum.everyN', { n: m.keepaliveIntervalSecs })}
+                {#if m.keepaliveTrigger !== 'unknown'}<span class="chip">{t(`cfg.o.${m.keepaliveTrigger === 'body-stream' ? 'body_stream' : m.keepaliveTrigger}`)}</span>{/if}
+              {/if}
+            </dd>
+            <dt>{t('cfgsum.diskCache')}</dt>
+            <dd>{m.diskCache ? t('cfgsum.on') : t('cfgsum.off')}</dd>
+            {#if m.aliases.length > 1}
+              <dt>{t('cfgsum.aliases')}</dt>
+              <dd>{m.aliases.join(', ')}</dd>
             {/if}
-          </dd>
-          <dt>{t('cfgsum.diskCache')}</dt>
-          <dd>{m.diskCache ? t('cfgsum.on') : t('cfgsum.off')}</dd>
-          {#if m.aliases.length > 1}
-            <dt>{t('cfgsum.aliases')}</dt>
-            <dd>{m.aliases.join(', ')}</dd>
-          {/if}
-          <dt>{t('cfgsum.file')}</dt>
-          <dd>{#if m.configPath}<code class="mono">{m.configPath}</code>{:else}<span class="muted">{t('cfgsum.none')}</span>{/if}</dd>
-        </dl>
-      </section>
-    {/if}
+            <dt>{t('cfgsum.file')}</dt>
+            <dd>{#if m.configPath}<code class="mono">{m.configPath}</code>{:else}<span class="muted">{t('cfgsum.none')}</span>{/if}</dd>
+          </dl>
+        </section>
+      {/if}
+      <!-- 不答复的实例问不到条目；启动、停止、重启进行中时不让单独重启 format，免得和整个实例的操作交错 -->
+      <FormatsPanel run={status === 'unresponsive' ? null : inst.run} controllable={controllable(inst) && !busy} />
+    </div>
   </div>
 {/if}
 
@@ -796,6 +801,11 @@
   }
   .reasons b {
     margin-left: 2px;
+  }
+  .side {
+    display: grid;
+    gap: 20px;
+    min-width: 0;
   }
   .summary {
     padding: 16px 18px 8px;

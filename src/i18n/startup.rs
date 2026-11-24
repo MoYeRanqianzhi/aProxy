@@ -133,9 +133,9 @@ impl LaunchReason {
                 &d.code,
             ));
         }
-        if issues.iter().any(|d| d.code == "config_legacy_shape") {
+        if let Some(hint) = issues.iter().find(|d| d.code == "config_legacy_shape") {
             lines.push('\n');
-            lines.push_str(&Reason::LegacyConfig.render(lang));
+            lines.push_str(&hint.reason.render(lang));
         } else {
             lines.push_str(&hint);
         }

@@ -113,7 +113,7 @@ impl Kind {
         }
     }
     /// 保留原诊断，并把提示一并交给体检或启动结果的接收端，避免它稍后从磁盘猜测旧现场。
-    pub(crate) fn append_hint(self, path: &Path, diagnostics: &mut Vec<Diagnostic>) {
+    pub fn append_hint(self, path: &Path, named: bool, diagnostics: &mut Vec<Diagnostic>) {
         if diagnostics.iter().any(Diagnostic::is_error) && self.legacy_file(path) {
             diagnostics.push(Diagnostic {
                 code: "config_legacy_shape",
@@ -122,7 +122,11 @@ impl Kind {
                 key: None,
                 line: None,
                 column: None,
-                message: aproxy_ipc::i18n::diagnostic::Reason::LegacyConfig,
+                message: if named {
+                    path_hint(path)
+                } else {
+                    Reason::LegacyConfig
+                },
                 details: Default::default(),
             });
         }
@@ -144,6 +148,20 @@ impl Kind {
         })
     }
 }
+/// 构造指定文件的修复提示。普通路径不加装饰；有空格或 shell 元字符时作为一个字面参数，
+/// Windows 使用 PowerShell 的单引号规则，Unix 使用 POSIX shell 的单引号规则。
+pub fn path_hint(path: &Path) -> Reason {
+    let raw = path.to_string_lossy();
+    let path = if raw
+        .chars()
+        .all(|c| c.is_alphanumeric() || "_-.:/".contains(c) || (cfg!(windows) && c == '\\'))
+    {
+        raw.into_owned()
+    } else {
+        crate::cli::quoted_arg(&raw)
+    };
+    Reason::LegacyConfigPath { path }
+}
 fn format_key(path: &str) -> Option<(usize, &str)> {
     let (index, key) = path.strip_prefix("format[")?.split_once("].")?;
     Some((index.parse().ok()?, key))
@@ -161,6 +179,19 @@ pub struct ResultFile {
     pub changes: Vec<Change>,
     /// 文件未改写或已回滚的原因，不含文件原文。
     pub issues: Vec<Issue>,
+}
+/// 给整批迁移选择退出码：I/O 故障优先，只有同时存在实际（或计划的）改写才算部分完成。
+pub fn exit_code(files: &[ResultFile]) -> u8 {
+    let has = |outcome| files.iter().any(|r| r.outcome == outcome);
+    if has("failed") {
+        1
+    } else if !has("needs-review") {
+        0
+    } else if has("migrated") {
+        5
+    } else {
+        3
+    }
 }
 // 文件操作保留 OsStr 的原始字节，展示与其他 CLI 路径一样使用可读的 Unicode 替代。
 fn display_path<S: serde::Serializer>(path: &Path, s: S) -> Result<S::Ok, S::Error> {

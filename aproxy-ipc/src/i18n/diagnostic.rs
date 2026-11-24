@@ -72,6 +72,9 @@ reasons! {
     LegacyConfig,
         en: "Preview the 0.1.x changes with `aproxy migrate --dry-run`, then run `aproxy migrate`.",
         zh: "运行 `aproxy migrate --dry-run` 预览 0.1.x 文件的改动，确认后运行 `aproxy migrate`。";
+    LegacyConfigPath { path: String },
+        en: "Preview the 0.1.x changes with `aproxy migrate --dry-run {path}`, then run `aproxy migrate {path}`.",
+        zh: "运行 `aproxy migrate --dry-run {path}` 预览 0.1.x 文件的改动，确认后运行 `aproxy migrate {path}`。";
     AlwaysTrigger,
         en: "keepalive.trigger = \"always\" cannot be set in the config file: it would break non-streaming clients. Only a format can ask for it, per request",
         zh: "配置文件不能设置 keepalive.trigger = \"always\"，否则非流式客户端无法工作。只有 format 才能按请求指定此值";

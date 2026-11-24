@@ -67,7 +67,18 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) -> u8 {
     let overrides = overrides_from_cli(&args);
     let cfg = match resolve_runtime_config(&overrides, cfg_file) {
         Ok(c) => c,
-        Err(e) => return config_failure(&e).report(json),
+        Err(mut e) => {
+            // 启动目标可能不在 home 的目录清单中；把解析出的实际路径带进同一份双语诊断。
+            if explicit
+                && let ConfigError::Invalid { diagnostics, .. } = &mut e
+                && let Some(hint) = diagnostics
+                    .iter_mut()
+                    .find(|d| d.code == "config_legacy_shape")
+            {
+                hint.message = aproxy::migrate::path_hint(&cfg_path);
+            }
+            return config_failure(&e).report(json);
+        }
     };
     let listen_addr = cfg.listen_addr.clone();
     let port = daemon::port_of(&listen_addr).to_string();

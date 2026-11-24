@@ -460,7 +460,7 @@ fn cli_logs_stay_off_stdout() {
         &["find", "--json"],
         &["settings", "show", "--json"],
         &["doctor", "--json"],
-        &["migrate", "--dry-run", "--json"],
+        &["migrate", "--dry-run", "--json", cfg, cfg],
         &["stop", &port_arg, "--json"],
     ] {
         let out = with_logs(args);
@@ -674,7 +674,7 @@ fn expected_machine_output(
     let syntax = "JSON syntax error: EOF while parsing an object at line 1 column 1";
     let diag = json!({"code":"config_syntax","severity":"error","file":settings,"line":1,"column":1,"message":syntax,"details":{}});
     match code {
-        "migration"=>(3,json!({"schema":1,"files":[{"path":std::fs::canonicalize(&settings).unwrap(),"outcome":"needs-review","changes":[],"issues":[{"key":null,"line":1,"message":"This value or file is not valid in the target format.","section":"compatibility.md#settingsjson-keys-renamed-in-020"}]}],"summary":{"dry_run":true,"current":0,"migrated":0,"needs_review":1,"failed":0,"running_instances":"Running instances keep the configuration they loaded."}})),
+        "migration"=>(3,json!({"schema":1,"files":[{"path":std::fs::canonicalize(&settings).unwrap(),"outcome":"needs-review","changes":[],"issues":[{"key":null,"line":1,"message":"This value or file is not valid in the target format.","section":"compatibility.md#settingsjson-keys-renamed-in-020"}]}],"summary":{"dry_run":true,"current":0,"migrated":0,"needs_review":1,"failed":0,"running_instances":"Running instances keep the configuration they loaded; restart them to use the migrated files."}})),
         "instances"=>(0,json!({"schema":1,"instances":[],"unreadable":[],"watchdog":null,"processes":[]})),
         "files"=>(3,json!({"schema":1,"files":[{"file":settings,"kind":"settings","diagnostics":[diag]},{"file":home.path(),"kind":"home","diagnostics":[]}],"summary":{"errors":1,"warnings":0}})),
         "absent"=>(4,json!({"schema":1,"state":"not_installed","skills":[],"next":"aproxy skill install"})),
@@ -768,4 +768,38 @@ fn english_force_guidance_discloses_downgrade_and_process_scope() {
         warning.contains("(pid 17)")
             && warning.contains("stops all other aProxy processes in this home")
     );
+}
+
+/// 位置参数和是否读取 home 的区别在两种终端语言里都必须可发现。
+#[test]
+fn migrate_path_help_in_both_languages() {
+    let h = TestHome::new();
+    for (lang, help) in [
+        (
+            "en",
+            "Config files to migrate (default: settings.json and every config the home knows)",
+        ),
+        (
+            "zh-CN",
+            "要迁移的配置文件（默认：settings.json 与 home 知道的全部配置）",
+        ),
+    ] {
+        let out = h
+            .cmd()
+            .env("APROXY_LANG", lang)
+            .args(["migrate", "--help"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let help_text = text(&out.stdout);
+        assert!(
+            help_text.contains("[PATH]...")
+                && help_text
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .contains(help),
+            "{help_text}"
+        );
+    }
 }

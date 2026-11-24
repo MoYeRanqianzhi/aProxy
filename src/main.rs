@@ -204,8 +204,13 @@ async fn run(cli: Cli) -> u8 {
     }
 
     // 迁移必须见到磁盘原文，不能在旧设置上提前退出或触发安装续作。
-    if let Some(Commands::Migrate { dry_run, json }) = cli.command {
-        return commands::migrate::run(&home, dry_run, json);
+    if let Some(Commands::Migrate {
+        paths,
+        dry_run,
+        json,
+    }) = cli.command
+    {
+        return commands::migrate::run(&home, &paths, dry_run, json);
     }
 
     // settings.json 的检查，每次运行都做。文件无效时（不认识的键、类型不对、schema 更高……）：

@@ -10,6 +10,22 @@ use clap::{Parser, Subcommand};
 mod help;
 use std::path::PathBuf;
 
+/// 修复命令要保留完整的路径或键名，不能让其中的引号结束外层 shell 引号。
+pub fn quoted_arg(arg: &str) -> String {
+    let mut text = String::from("'");
+    for c in arg.chars() {
+        // PowerShell 的弯单引号也能关闭字符串；加一个单引号便保留原字符。
+        if cfg!(windows) && matches!(c, '\'' | '\u{2018}'..='\u{201b}') {
+            text.push('\'');
+        } else if !cfg!(windows) && c == '\'' {
+            text.push_str("'\\'");
+        }
+        text.push(c);
+    }
+    text.push('\'');
+    text
+}
+
 #[derive(Parser, Debug, Clone)]
 // 不带任何参数时打印帮助（写到 stderr）并以 2 退出：那是一次没说要做什么的调用，按 clap 的
 // 惯例算用法错误。启动实例要写 `aproxy start`
@@ -165,6 +181,8 @@ pub enum Commands {
 
     #[command(about = help::migrate(current()))]
     Migrate {
+        #[arg(value_name="PATH", help=help::migrate_paths(current()))]
+        paths: Vec<PathBuf>,
         #[arg(long, help = help::migrate_preview(current()))]
         dry_run: bool,
         #[arg(long, help = help::json(current()))]

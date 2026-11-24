@@ -896,7 +896,7 @@ fn migrate_preview_apply_and_repeat_in_a_mixed_home() {
     let current = home.join("current.toml");
     let manual = home.join("manual.toml");
     let sp = home.join("settings.json");
-    let settings=json!({"aliases":{"demo":alias},"default_config":alias,"config_dirs":[configs],"forward_only":false,"watchdog":false,"download_proxy":"http://username:private-value@proxy.example"}).to_string();
+    let settings=json!({"aliases":{"demo":alias},"default_config":alias,"config_dirs":[configs],"forward_only":false,"watchdog":false,"download_proxy":"http://username:private-value@proxy.example","download_chain":[{"url":"https://mirror.example","ignored":[{"extra_headers":{"Authorization":"nested-secret"}}]}]}).to_string();
     h.settings(&settings);
     let orig = "base_url = 'http://127.0.0.1'\nlisten_addr = '127.0.0.1:0'\n# keep the cap\nmax_body_mb = 17 # important\nread_timeout_secs = 44\n";
     let other = "base_url='http://127.0.0.1'\nbounded_retry_paths=['/count']\n";
@@ -931,6 +931,7 @@ fn migrate_preview_apply_and_repeat_in_a_mixed_home() {
         let (doc, stderr) = failed_document(&h, &args, 5);
         assert!(stderr.is_empty(), "{stderr}");
         assert!(!doc.to_string().contains("private-value"));
+        assert!(!doc.to_string().contains("nested-secret"));
         assert_keys(&doc, &["schema", "files", "summary"]);
         assert_eq!(doc["summary"]["dry_run"], dry);
         assert_eq!(doc["summary"]["migrated"], 3);
@@ -958,6 +959,11 @@ fn migrate_preview_apply_and_repeat_in_a_mixed_home() {
         }
         doc["files"].clone()
     };
+    let text = h.cmd().args(["migrate", "--dry-run"]).output().unwrap();
+    assert_eq!(text.status.code(), Some(5));
+    for stream in [&text.stdout, &text.stderr] {
+        assert!(!String::from_utf8_lossy(stream).contains("nested-secret"));
+    }
     let preview = check(true);
     assert!(!home.join("run").exists());
     for (p, s) in all {
@@ -1038,9 +1044,43 @@ fn migrate_never_overwrites_a_different_backup() {
         );
     }
     fs::write(&backup, old).unwrap();
+    #[cfg(windows)]
+    {
+        // 本机临时目录可能本来就私有；显式开放给 Everyone，避免测试在旧代码上也通过。
+        assert!(
+            h.cmd_with(
+                std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                    .join("System32")
+                    .join("icacls.exe")
+            )
+            .arg(&backup)
+            .args(["/grant", "*S-1-1-0:(R)"])
+            .status()
+            .unwrap()
+            .success()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&backup, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    assert_ne!(
+        aproxy::fsx::access_of(&backup).unwrap(),
+        aproxy::fsx::Access::Private
+    );
+    run(&h, &["migrate", "--dry-run", "--json"]);
+    assert_ne!(
+        aproxy::fsx::access_of(&backup).unwrap(),
+        aproxy::fsx::Access::Private
+    );
     assert_eq!(
         document(&run(&h, &["migrate", "--json"]))["summary"]["migrated"],
         1
+    );
+    assert_eq!(
+        aproxy::fsx::access_of(&backup).unwrap(),
+        aproxy::fsx::Access::Private
     );
     let missing = TestHome::unborn();
     let doc = document(&run(&missing, &["migrate", "--dry-run", "--json"]));
@@ -1065,6 +1105,7 @@ fn migrate_suggestions_are_specific_to_legacy_files() {
         ),
         ("{}", "max_body_mb=1", true),
         ("{}", "max_body_mb=1\nunrelated=2", false),
+        ("{}", "'format[0].mode'='spawn'", false),
     ] {
         h.settings(settings);
         fs::write(&c, toml).unwrap();
@@ -1087,5 +1128,103 @@ fn migrate_suggestions_are_specific_to_legacy_files() {
             fs::read(h.path().join("settings.json")).unwrap(),
             settings.as_bytes()
         );
+    }
+}
+
+/// 有路径时只处理指定配置；没有路径时，损坏的设置仍能提供部分清单，但不能用于启动。
+#[test]
+fn migrate_limits_explicit_targets_and_discovers_readable_directory_entries() {
+    let h = TestHome::new();
+    let outside = TestHome::new();
+    let config = outside.path().join("one file.toml");
+    let other = h.path().join("ignored.toml");
+    let old = "base_url='http://127.0.0.1'\nmax_body_mb=3\n";
+    fs::write(&config, old).unwrap();
+    fs::write(&other, old).unwrap();
+    let sp = h.path().join("settings.json");
+    h.settings("{}");
+    let path = config.to_str().unwrap();
+    for args in [
+        vec!["start", path, "--json"],
+        vec!["config", "--config", path, "show", "--json"],
+    ] {
+        let (doc, stderr) = failed_document(&h, &args, 3);
+        let hint = aproxy::migrate::path_hint(&config).render(aproxy_ipc::i18n::Lang::En);
+        assert!(hint.contains(path));
+        assert!(stderr.trim_end().ends_with(&hint), "{stderr}");
+        let ds = doc
+            .pointer("/error/details/diagnostics")
+            .or_else(|| doc.get("diagnostics"))
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(
+            ds.iter()
+                .any(|d| d["code"] == "config_legacy_shape" && d["message"] == hint)
+        );
+    }
+    let second = outside.path().join(".").join("one file.toml");
+    let args = [path, second.to_str().unwrap(), path];
+    for dry in [true, false] {
+        let mut cmd = vec!["migrate", "--json"];
+        if dry {
+            cmd.push("--dry-run");
+        }
+        cmd.extend(args);
+        let doc = document(&run(&h, &cmd));
+        assert_eq!(doc["files"].as_array().unwrap().len(), 1);
+        assert_eq!(doc["files"][0]["outcome"], "migrated");
+        assert_eq!(fs::read(&sp).unwrap(), b"{}");
+        assert_eq!(fs::read_to_string(&other).unwrap(), old);
+        assert_eq!(fs::read_to_string(&config).unwrap() == old, dry);
+    }
+    h.settings(&json!({"config_dirs":[outside.path(),7]}).to_string());
+    let (doc, _) = failed_document(&h, &["migrate", "--dry-run", "--json"], 3);
+    assert!(
+        doc["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["outcome"] == "current"
+                && fs::canonicalize(f["path"].as_str().unwrap()).unwrap()
+                    == fs::canonicalize(&config).unwrap())
+    );
+    let reserved = outside.path().join("other.0.1.BaK");
+    fs::write(&reserved, old).unwrap();
+    let (doc, _) = failed_document(&h, &["migrate", "--json", reserved.to_str().unwrap()], 3);
+    assert!(
+        doc["files"][0]["issues"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("migration backup")
+    );
+    assert_eq!(fs::read_to_string(reserved).unwrap(), old);
+}
+
+#[cfg(unix)]
+#[test]
+fn migrate_keeps_linked_files_together() {
+    use std::os::unix::fs::MetadataExt;
+    let h = TestHome::new();
+    let path = h.path().join("a.toml");
+    let link = h.path().join("alias");
+    let old = "base_url='http://localhost'\nforward_only=true";
+    fs::write(&path, old).unwrap();
+    fs::hard_link(&path, &link).unwrap();
+    for flags in [
+        vec!["migrate", "--dry-run", "--json"],
+        vec!["migrate", "--json"],
+    ] {
+        let (doc, _) = failed_document(&h, &flags, 3);
+        assert_eq!(
+            doc["files"][0]["issues"][0]["message"],
+            "This file has other hard links; migrating it would separate them."
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().ino(),
+            fs::metadata(&link).unwrap().ino()
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), old);
+        assert!(!h.path().join("a.toml.0.1.bak").exists());
     }
 }

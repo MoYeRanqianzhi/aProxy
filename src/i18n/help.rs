@@ -66,6 +66,7 @@ message!(login_home(), en: "Absolute path to the home registered for login", zh:
 message!(alias(), en: "Manage configuration aliases in ~/.aproxy/settings.json. An alias names a config.toml file for starting and stopping instances", zh: "管理配置别名（存于 ~/.aproxy/settings.json，内部配置不建议手改）。 别名指向某个 config.toml，让多开配置可以用名字快捷启停。");
 
 message!(migrate(), en: "Migrate 0.1.x settings and configuration files, backing up each original", zh: "迁移 0.1.x 设置与配置文件，先备份每份原文");
+message!(migrate_paths(), en: "Config files to migrate (default: settings.json and every config the home knows)", zh: "要迁移的配置文件（默认：settings.json 与 home 知道的全部配置）");
 message!(migrate_preview(), en: "Preview changes without writing any files", zh: "预览逐项改动，不写入任何文件");
 
 message!(doctor(), en: "Check settings.json, configurations referenced by aliases, and TOML files in configuration directories. Includes port conflicts", zh: "全面体检全部配置（settings.json error 级检查 + 别名配置深入审查 + 配置目录 toml 扫描，均含端口冲突检测）");

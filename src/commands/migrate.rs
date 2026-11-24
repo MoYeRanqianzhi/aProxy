@@ -6,10 +6,16 @@ use serde_json::json;
 mod text;
 
 /// 输出每份文件的整体现状；即使部分失败也只交付一个机器文档。
-pub(crate) fn run(home: &std::path::Path, dry: bool, json: bool) -> u8 {
+pub(crate) fn run(
+    home: &std::path::Path,
+    paths: &[std::path::PathBuf],
+    dry: bool,
+    json: bool,
+) -> u8 {
     use aproxy::migrate::run;
     let lang = if json { Lang::En } else { current() };
-    let files = run(home, dry, lang);
+    let files = run(home, paths, dry, lang);
+    let code = aproxy::migrate::exit_code(&files);
     let count = |outcome| files.iter().filter(|f| f.outcome == outcome).count();
     let (migrated, current, review, failed) = (
         count("migrated"),
@@ -51,13 +57,5 @@ pub(crate) fn run(home: &std::path::Path, dry: bool, json: bool) -> u8 {
         }
         println!("{}", text::running(lang));
     }
-    if failed > 0 {
-        1
-    } else if review == 0 {
-        0
-    } else if migrated > 0 {
-        5
-    } else {
-        3
-    }
+    code
 }

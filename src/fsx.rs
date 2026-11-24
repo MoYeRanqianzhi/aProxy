@@ -319,6 +319,12 @@ fn set_dacl(path: &Path, descriptor: &Descriptor) -> std::io::Result<()> {
     }
 }
 
+/// 为已确认内容的私有文件设置与私有写者相同的受保护 DACL，不沿用父目录的继承项。
+#[cfg(windows)]
+pub(crate) fn secure_private_file(path: &Path) -> std::io::Result<()> {
+    set_dacl(path, &Descriptor::owner_only(false)?)
+}
+
 /// SID 写成 `S-1-…` 的文本。
 ///
 /// # Safety

@@ -159,7 +159,7 @@ fn settings_report(
         kind: "settings",
         diagnostics,
     };
-    crate::migrate::Kind::Settings.append_hint(path, &mut file.diagnostics);
+    crate::migrate::Kind::Settings.append_hint(path, false, &mut file.diagnostics);
     for (table, headers) in [
         ("extra_headers", &settings.defaults.extra_headers),
         ("override_headers", &settings.defaults.override_headers),
@@ -315,7 +315,7 @@ fn config_reports(home: &Path, settings: &Settings, defaults: &Defaults) -> Vec<
             }
             Ok(resolved) => {
                 file.diagnostics = resolved.diagnostics;
-                crate::migrate::Kind::Config.append_hint(&path, &mut file.diagnostics);
+                crate::migrate::Kind::Config.append_hint(&path, false, &mut file.diagnostics);
                 if !has_errors(&file.diagnostics) {
                     let cfg = resolved.config;
                     if cfg.forward_only_enabled() {

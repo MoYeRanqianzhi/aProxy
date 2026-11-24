@@ -131,7 +131,8 @@ fn show(path: &Path, explicit: bool, effective: bool, json: bool) {
             json!({"target": path.display().to_string()}),
         );
     }
-    let resolved = resolve(path, json);
+    let mut resolved = resolve(path, json);
+    aproxy::migrate::Kind::Config.append_hint(path, explicit, &mut resolved.diagnostics);
     let file_values = text.as_deref().and_then(view::file_value);
     let values = view::redacted(if effective {
         view::effective_value(&resolved, file_values.as_ref())
@@ -180,7 +181,11 @@ fn show(path: &Path, explicit: bool, effective: bool, json: bool) {
         print!("{}", view::to_document(&view::for_display(values)));
     }
 
-    for d in resolved.diagnostics.iter().filter(|d| !d.is_error()) {
+    for d in resolved
+        .diagnostics
+        .iter()
+        .filter(|d| !d.is_error() && d.code != "config_legacy_shape")
+    {
         eprintln!(
             "{}",
             text::warning(
@@ -205,11 +210,12 @@ fn show(path: &Path, explicit: bool, effective: bool, json: bool) {
             .filter(|d| d.code == "config_unknown_key")
             .filter_map(|d| d.key.as_deref())
             .collect();
-        if aproxy::migrate::Kind::Config.legacy_file(path) {
-            eprintln!(
-                "{}",
-                aproxy_ipc::i18n::diagnostic::Reason::LegacyConfig.render(current())
-            );
+        if let Some(hint) = resolved
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "config_legacy_shape")
+        {
+            eprintln!("{}", hint.message.render(current()));
         } else if !unknown.is_empty() {
             eprintln!();
             eprintln!("{}", text::unknown_keys(current()));

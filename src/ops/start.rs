@@ -117,7 +117,7 @@ pub fn resolve_runtime_config_in(
             .into_iter()
             .filter(|d| d.is_error())
             .collect();
-        crate::migrate::Kind::Settings.append_hint(&settings_path, &mut diagnostics);
+        crate::migrate::Kind::Settings.append_hint(&settings_path, false, &mut diagnostics);
         return Err(ConfigError::Settings {
             file: settings_path,
             diagnostics,
@@ -152,7 +152,7 @@ pub fn resolve_runtime_config_in(
     }
     let mut diagnostics = resolved.errors().cloned().collect();
     if let Some(path) = cfg_path {
-        crate::migrate::Kind::Config.append_hint(path, &mut diagnostics);
+        crate::migrate::Kind::Config.append_hint(path, false, &mut diagnostics);
     }
     Err(ConfigError::Invalid {
         file: cfg_path.map(Path::to_path_buf),

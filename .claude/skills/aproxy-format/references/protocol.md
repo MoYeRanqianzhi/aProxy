@@ -51,9 +51,10 @@ line on the wire.
   until EOF. A partial line before EOF is not a frame.
 - **Restart without restarting the instance.** `aproxy restart <target> --format <name>` (or the
   same request from the desktop window) starts fresh workers for an entry, using the configuration
-  the instance started with. Messages already sent finish on the old workers, which then get EOF;
-  new messages go to the new ones. A program that reads its own settings at startup picks up an
-  edit this way.
+  the instance started with. The new workers must pass hello first; only then do they take over.
+  Messages already sent finish on the old workers, which then get EOF, and later messages of the
+  same request go to the new ones, so keep per-request facts in `state`. If the new hello fails,
+  nothing is replaced. A program that reads its own settings at startup picks up an edit this way.
 
 ## hello
 
@@ -84,7 +85,7 @@ The shape of this line never changes, and its `v` is always 1.
 | `request_body` | no | Per stage, how much of the client's request body to send: `"none"`, `"digest"` or `"full"`. Only `request`, `retry`, `decide` and `notify` are read; other keys are ignored. Defaults: `full` for request and retry, `none` for decide and notify. `notify` cannot be `full`. An unknown value makes the hello reply invalid. |
 | `features` | yes | Features the program wants; a feature is active only when both sides list it. Protocol 1 defines `decide.success`. |
 | `name`, `version` | yes | The program's own name and version, shown in diagnostics. |
-| `control` | no | `{"args":[...]}`: offers a control process, started with these arguments instead of the configured ones ([control](#control)). At most 32 strings of up to 4096 bytes each; an empty list is allowed. A malformed offer makes the hello reply invalid. Omit it when the program offers no control. |
+| `control` | no | `{"args":[...]}`: offers a control process, started with these arguments instead of the configured ones ([control](#control)). At most 32 strings of up to 4096 bytes each; an empty list is allowed. A malformed offer makes the hello reply invalid. Omit it (or send null) when the program offers no control. |
 
 About `request_body`:
 
@@ -504,10 +505,9 @@ A **process-level failure** is: cannot start, I/O error, exit midway, timeout, p
 - After the cooldown one message is let through as a probe on a fresh worker. Success closes the
   breaker; failure reopens it for another cooldown.
 - Network failures never trip a breaker: an unreachable upstream is still retried forever.
-- Restarting the entry (`aproxy restart <target> --format <name>`) starts fresh workers with a
-  closed breaker and a zero failure count. If their hello fails, the entry behaves as after a
-  failed startup handshake: an optional entry is skipped, a required one answers 503
-  `format_unavailable` until a later restart or probe succeeds.
+- Restarting the entry (`aproxy restart <target> --format <name>`) replaces its workers with fresh
+  ones that start with a closed breaker and a zero failure count. If the new hello fails, nothing
+  changes: the old workers, breaker and count stay as they were.
 - State is visible in `aproxy status --json` under `formats[]` (`breaker`, `notify_breaker`,
   `notify_dropped_total`).
 - With an optional judging program unavailable, requests follow the instance's default

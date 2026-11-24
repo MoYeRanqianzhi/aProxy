@@ -880,14 +880,17 @@ export interface FormatView {
   breaker: 'closed' | 'open' | 'probing';
   /** 程序在握手时是否提供了 control */
   control: boolean;
-  /** 最近一次单独重启的时刻（失败的也算）；实例启动不算，从没单独重启过为 null */
+  /** 最近一次成功的单独重启（握手失败的不算，那次什么都没替换）；实例启动不算，从没单独重启过为 null */
   restartedAt: Time | null;
 }
 
 /** 单独重启一个条目的结果：每个选中的条目各一条，按配置里的顺序 */
 export type RestartOutcome =
   | { name: string; outcome: 'restarted'; program: string | null; version: string | null }
-  /** 实例照常运行；reason 是 format 故障的类别（spawn、io、died、timeout、protocol、invalid_output 等），不是给人看的句子 */
+  /**
+   * 新进程没通过握手，什么都没替换：这个条目仍按原样运行。reason 是 format 故障的类别
+   * （spawn、io、died、timeout、protocol、invalid_output 等），不是给人看的句子
+   */
   | { name: string; outcome: 'handshake-failed'; reason: string };
 
 /** 请求失败或重试的原因。不认识的码一律是 unknown */

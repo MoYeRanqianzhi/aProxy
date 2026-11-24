@@ -333,8 +333,9 @@ stages = ["request", "retry"]
   through that instance, so pick a quiet moment.
 - After changing only the program or its own files (a script, a role file, its settings), run
   `aproxy restart <port|alias> --format <name>` instead: the instance stays up, requests in flight
-  finish on the old processes, and new ones reach a fresh process. config.toml is not reread. A
-  program that loads its settings once at startup needs exactly this after each edit.
+  finish on the old processes, and new ones reach a fresh process. config.toml is not reread. If
+  the new process fails its hello, nothing is replaced and the old one keeps serving. A program
+  that loads its settings once at startup needs exactly this after each edit.
 - Watch it work with `aproxy logs <port|alias>`: your stderr lines carry the prefix
   `format[<name>]`, and breaker changes are logged as warnings.
 

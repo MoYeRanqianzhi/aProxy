@@ -487,10 +487,12 @@ is the gentle option when the instance carries your own session.
 - **Nothing in flight is cut.** Requests and streams already being handled finish on the old
   processes; later requests go to the new ones. A replacement starts with a closed breaker.
 - Per entry it prints `端口 <port>：已重启 format <name>（<program> <version>）。` or
-  `端口 <port>：format <name> 握手失败：<reason>。`, where reason is a fault kind such as `spawn`,
-  `timeout` or `invalid_output`. After a failed handshake the instance keeps running: an optional
-  entry is skipped, a required one makes requests fail with `format_unavailable` until a later
-  restart succeeds. Fix the program and run the same command again.
+  `端口 <port>：format <name> 握手失败：<reason>；没有替换，仍按原样运行。`, where reason is a fault
+  kind such as `spawn`, `timeout` or `invalid_output`. A failed handshake replaces nothing: the
+  entry keeps its current processes, breaker and settings, as `restart` keeps an old instance whose
+  pre-check failed. Fix the program and run the same command again.
+- An entry already being restarted (by another command or the desktop window) refuses the whole
+  selection at once; run it again when that restart has finished.
 - An unknown entry name refuses the whole selection before anything changes. An instance started by
   an older aproxy prints `端口 <port>：此实例不支持单独重启 format。`; restart that instance fully
   once.

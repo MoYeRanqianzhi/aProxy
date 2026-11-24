@@ -439,6 +439,8 @@
     background: var(--card-bg);
     color: var(--text-2);
     font-size: var(--fs-sm);
+    /* 胶囊是固定 28px 高：标签一折行就溢出边框。放不下时整颗换到下一行（.stats 是 flex-wrap） */
+    white-space: nowrap;
   }
   .stat b {
     color: var(--text);
@@ -468,6 +470,20 @@
   }
   .r-today {
     margin-top: 2px;
+  }
+  /* 窗口窄（接近最小宽度 900px，或屏幕小、窗口被缩到屏幕里）时三栏挤不下：「救回」票根宽度固定，
+     中间的文字栏会被压到放不下一颗统计胶囊。这时票根挪到文字下面，与文字左对齐 */
+  @media (max-width: 1000px) {
+    .hero {
+      grid-template-columns: 132px 1fr;
+    }
+    .hero.bare {
+      grid-template-columns: 1fr;
+    }
+    .rescued {
+      grid-column: -2;
+      justify-self: start;
+    }
   }
 
   /* ---------- 空状态 ---------- */

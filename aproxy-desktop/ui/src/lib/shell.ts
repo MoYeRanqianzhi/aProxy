@@ -74,8 +74,18 @@ export function startShell(): void {
 let sentTheme: 'light' | 'dark' | null | undefined;
 let sentCaption: string | null | undefined;
 let micaTarget = false;
-/** Mica 的切换要按顺序做完（先材质、后页面或者反过来），连点开关时排队 */
-let micaQueue: Promise<void> = Promise.resolve();
+/**
+ * 发给窗口的调用（窗口主题、Mica、标题栏按钮后面的底色）排成一队，上一个完成了才发下一个。
+ * 每个调用是一次独立的 IPC 请求，同时发出的几个不保证按发出的顺序在 Rust 那边执行：
+ * 启动时偏好还没读到，先按系统深浅色发一次底色，读到「深色」后马上再发一次，后发的先执行时，
+ * 按钮区就停在了浅色（Windows 11 上见过）。Mica 的切换本身也要按顺序做完（先材质、后页面或者反过来）。
+ */
+let windowQueue: Promise<void> = Promise.resolve();
+
+/** 排进 windowQueue；出错只记一笔，不挡后面的调用 */
+function queueWindow(what: string, call: () => Promise<void>): void {
+  windowQueue = windowQueue.then(call).catch((err) => console.warn(`[shell] ${what} failed`, err));
+}
 
 /** 把界面的外观同步到窗口。App 每次改完 <html> 的主题属性之后调用，这时读到的计算样式才是新的。 */
 export function syncWindow(): void {
@@ -87,24 +97,22 @@ export function syncWindow(): void {
   const theme = ui.modePref === 'system' ? null : ui.modePref;
   if (theme !== sentTheme) {
     sentTheme = theme;
-    win.setTheme(theme).catch((err) => console.warn('[shell] setTheme failed', err));
+    queueWindow('setTheme', () => win.setTheme(theme));
   }
 
   const wantMica = ui.micaEnabled && ui.micaSupport !== 'unsupported';
   if (wantMica !== micaTarget) {
     micaTarget = wantMica;
-    micaQueue = micaQueue
-      .then(async () => {
-        if (wantMica) {
-          await win.setEffects({ effects: [Effect.Mica] });
-          ui.micaWindow = true;
-        } else {
-          ui.micaWindow = false;
-          await nextPaint();
-          await win.clearEffects();
-        }
-      })
-      .catch((err) => console.warn('[shell] switching Mica failed', err));
+    queueWindow('switching Mica', async () => {
+      if (wantMica) {
+        await win.setEffects({ effects: [Effect.Mica] });
+        ui.micaWindow = true;
+      } else {
+        ui.micaWindow = false;
+        await nextPaint();
+        await win.clearEffects();
+      }
+    });
   }
 
   // 标题栏右上角原生按钮后面的底色：Mica 开着时交给系统（材质一直铺到按钮下面），
@@ -112,7 +120,7 @@ export function syncWindow(): void {
   const caption = ui.micaActive ? null : toHex(getComputedStyle(document.documentElement).backgroundColor);
   if (caption !== sentCaption) {
     sentCaption = caption;
-    setTitlebarColor(caption).catch((err) => console.warn('[shell] setTitlebarColor failed', err));
+    queueWindow('setTitlebarColor', () => setTitlebarColor(caption));
   }
 }
 

@@ -47,3 +47,5 @@
 - [Security contributions](memory/security-contributions.md) -- 给审查 skill 补危险信号：只增不减、先查重，PR 披露发现来源与 AI 参与程度；默认 PR 模板对所有 PR 问简版披露（用户 2026-11-23）。
 - [Desktop package origins and provenance](memory/desktop-package-origins.md) -- 包资源的地址要保留层级、style-src 不能带 nonce；仓库事实只有在原始 ZIP 的摘要对上 release asset 时才描述这个包。
 - [Format process generations](memory/format-process-generations.md) -- 单独重启 format 时，哪些状态要跨代保留、哪些不能，旧的流式响应怎样收尾。
+- [Desktop window chrome](memory/desktop-window-chrome.md) -- 三个平台都用自定义标题栏（Linux 自己画窗口按钮），页面不许出现横向滚动条、滚动条跟界面同风格，渲染对不对只认截图（用户 2026-11-24/25）。
+- [Desktop screenshots](memory/desktop-screenshots.md) -- 截图用演示数据、每个细节页都截；完整图集放专门分支（单提交强推），README 典型图经 PR；Windows 要 Windows 11；截图链路不许缩放，托管 runner 都是 1 倍显示。

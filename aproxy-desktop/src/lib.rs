@@ -323,25 +323,38 @@ fn desktop_info(state: tauri::State<'_, Mutex<DesktopInfo>>) -> DesktopInfo {
 
 /// 截图与演示用的开关：设了 `APROXY_DESKTOP_DEMO`，页面改用内置的演示数据（与浏览器里预览时同一套），
 /// 窗口外壳照常是真的（标题栏、Mica、交通灯），标题栏照样常驻「演示数据」标签，不会被当成本机的实例。
-/// 值是逗号分隔的词，只认语言（`en`、`zh-CN`）与深浅色（`light`、`dark`），例如 `zh-CN,dark`；其余的词
-/// 忽略，所以拼进页面脚本的只有这几个固定字面量。没设时返回 None，窗口照常读本机数据。
+/// 值是逗号分隔的词，只认语言（`en`、`zh-CN`）、深浅色（`light`、`dark`）与截图场景 `scene=<名字>`，
+/// 例如 `zh-CN,dark,scene=log-format`；场景名只许小写字母、数字与连字符（至多 40 个），其余的词一律忽略，
+/// 所以拼进页面脚本的只有固定字面量和这个受限的名字（页面拿它查 ui/src/lib/backend/demo/scenes.ts 的表）。
+/// 没设时返回 None，窗口照常读本机数据。
 /// 只编进 debug 构建：发布的二进制里没有这个开关，用户的窗口不会因为一个环境变量显示假数据。
 /// 页面那一侧只认这里注入的标记（ui/src/lib/backend/index.ts），所以 release 里开关是关死的。
 #[cfg(debug_assertions)]
 fn demo_script() -> Option<String> {
     let value = std::env::var("APROXY_DESKTOP_DEMO").ok()?;
-    let (mut lang, mut mode) = ("system", "system");
+    let (mut lang, mut mode, mut scene) = ("system", "system", None);
+    let scene_name = |name: &str| {
+        (1..=40).contains(&name.len())
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
     for word in value.split(',').map(str::trim) {
         match word {
             "en" => lang = "en",
             "zh-CN" => lang = "zh-CN",
             "light" => mode = "light",
             "dark" => mode = "dark",
-            _ => {}
+            other => match other.strip_prefix("scene=") {
+                Some(name) if scene_name(name) => scene = Some(name),
+                _ => {}
+            },
         }
     }
+    // 名字只含小写字母、数字与连字符，{:?} 写出来的就是一个合法的 JS 字符串字面量
+    let scene = scene.map_or_else(|| "undefined".to_owned(), |name| format!("{name:?}"));
     Some(format!(
-        "window.__APROXY_DEMO__ = {{ lang: {lang:?}, mode: {mode:?} }};"
+        "window.__APROXY_DEMO__ = {{ lang: {lang:?}, mode: {mode:?}, scene: {scene} }};"
     ))
 }
 

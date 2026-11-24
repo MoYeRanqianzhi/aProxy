@@ -62,9 +62,8 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] **W7 发布 0.2.0**。另外两件：
   - 撤回预发布期的措辞（`--pre` / `@next` / `--version`、「目前只有预发布」）。2026-10-13 文档终审列的位置：README.md 31、60–63，
     README_EN.md 81、135–142、183，docs/INSTALL_AGENT.md 54–58、156，compatibility.md 步骤 3，CHANGELOG.md 24；
-    带「alpha.1」字样、等有真实数据要改的：README.md 206，README_EN.md 380，SKILL.md 88，commands.md 476，troubleshooting.md 145，
-    architecture.md 513、678，aproxy-format 的 guide.md（envelope 钉 `=0.2.0-alpha.1` 改回 `"0.2"`）。行号会漂，按内容找。
-  - 重写 SECURITY.md：支持的版本改为 0.2.x，威胁模型补上桌面窗口与强制安装。
+    「演示数据、预览版」的说法已在 2026-11-24 随真实数据改掉（README、architecture、aproxy-cli skill）；
+    aproxy-format 的 guide.md 里 envelope 钉 `=0.2.0-alpha.1` 的要改回 `"0.2"`。行号会漂，按内容找。
   - **0.1.x 的 settings.json 怎么过渡**（B3 留下，rc.1 之前要定并做完）：0.2.0 只认分节的新形状，0.1.x 的平铺文件会让
     多数命令以退出码 3 结束。现在只有技能 compatibility.md 里的手工对照表。倾向：`install` 换版时把平铺文件迁成新形状
     （原文件留备份），并让 `upgrade_from_0_1_0` 的 CI 测试在升级后跑一条要读 settings 的命令。见计划 B3 记录第 4 条。
@@ -84,9 +83,6 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   重启这个 format）做一个扩展样例，示范扩展与 format 的配对、control 进程与 `formats.*` 接口。前提是 t10c 的 control 与
   format 重启做完，且这个角色实现了 control。版本未定。
 
-- [ ] **SECURITY.md 跟上 0.2.0**（发布 0.2.0 之前）：现在写的是 0.1.x（受支持版本、`request_transform` /
-  `response_transform`），没有 0.2.0 的 format、主题与扩展的信任模型（安装前逐条提醒、不做沙箱）。补上这些，并指向三个
-  审查 skill，以及贡献危险信号走 `aproxy-contribute-security`、aProxy 自身的漏洞仍走私密报告。
 - [ ] **安全加固：安装时自动识别典型危险信号**（用户 2026-11-23；工作量大、要考虑的情况极多，不是 0.2.0 必需，
   至少 0.2.1 以后才开做）：安装主题包与扩展时自动扫一遍包内容，命中典型危险信号（运行时加载代码、混淆或加密、
   发往 webhook 与隧道之类的地址、读密码框与剪贴板、绕过扩展接口调内部命令、碰安装提醒、主题里带脚本或远程资源等）

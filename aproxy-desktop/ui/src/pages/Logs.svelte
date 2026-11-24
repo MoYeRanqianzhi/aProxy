@@ -408,9 +408,9 @@
       <span role="columnheader">{t('logs.col.model')}</span>
       <span role="columnheader">{t('logs.col.result')}</span>
       <span role="columnheader" class="r">{t('logs.col.duration')}</span>
-      <span role="columnheader" class="r">{t('logs.col.size')}</span>
-      <span role="columnheader">{t('logs.col.id')}</span>
-      <span role="columnheader">{t('logs.col.instance')}</span>
+      <span role="columnheader" class="r c-size">{t('logs.col.size')}</span>
+      <span role="columnheader" class="c-id">{t('logs.col.id')}</span>
+      <span role="columnheader" class="c-inst">{t('logs.col.instance')}</span>
     </div>
 
     <div class="scroller" bind:this={scroller} onscroll={onScroll} role="rowgroup">
@@ -456,9 +456,9 @@
             {#if r}<ResultChip row={r} />{:else}<span class="mark-result">{resultText(it)}{#if it.mark!.attempts > 1}<span class="times">×{it.mark!.attempts - 1}</span>{/if}</span>{/if}
           </span>
           <span class="r num dur" role="cell">{r ? durShort(durationOf(r, store.now)) : '—'}</span>
-          <span class="r num size" role="cell">{r?.responseBytes ? bytes(r.responseBytes) : '—'}</span>
-          <span class="seq mono" role="cell">{r ? `#${r.seq}` : ''}</span>
-          <span role="cell"><span class="port">{it.ref.run.port}</span></span>
+          <span class="r num size c-size" role="cell">{r?.responseBytes ? bytes(r.responseBytes) : '—'}</span>
+          <span class="seq mono c-id" role="cell">{r ? `#${r.seq}` : ''}</span>
+          <span class="c-inst" role="cell"><span class="port">{it.ref.run.port}</span></span>
         </div>
       {:else}
         <div class="empty" in:pop>
@@ -635,6 +635,25 @@
     flex-direction: column;
     margin: 0 12px 0 12px;
     border-top: var(--line-w) solid var(--line);
+  }
+  /* 九列最少要约 940px：窗口窄时多出来的列原本被 overflow 悄悄裁掉。这里按宽度分级收列，留下的列
+     始终完整可见：先收编号与实例（详情里都有），再收大小；耗时对判断重试最要紧，一直留着 */
+  @media (max-width: 1200px) {
+    .table {
+      --cols: 30px 74px minmax(160px, 1fr) 132px 146px 66px 66px;
+    }
+    .c-id,
+    .c-inst {
+      display: none;
+    }
+  }
+  @media (max-width: 1050px) {
+    .table {
+      --cols: 30px 74px minmax(140px, 1fr) 118px 140px 62px;
+    }
+    .c-size {
+      display: none;
+    }
   }
   .thead,
   .row {

@@ -826,6 +826,22 @@
     flex-direction: column;
     gap: 18px;
     padding-bottom: 80px;
+    /* 网格子项默认 min-width: auto，长网址、长请求头名会把整列撑宽，页面出现横向滚动条 */
+    min-width: 0;
+  }
+  /* 窗口窄（接近最小宽度 900px，或小屏幕上窗口被缩进屏幕）时，左边那列分组目录占掉 170px，
+     右边每个字段的控件只剩一百多像素，网址被截断、按钮文字被挤掉。这时目录改成表单上方的一行药丸，
+     表单拿到整个宽度。这一行不再贴顶：内容区开着 Mica 时是半透明的，贴顶的一行配不出与之一致的底色 */
+  @media (max-width: 1000px) {
+    .layout {
+      grid-template-columns: 1fr;
+      gap: 14px;
+    }
+    .groups {
+      position: static;
+      flex-direction: row;
+      flex-wrap: wrap;
+    }
   }
   .group {
     padding: 6px 20px 8px;

@@ -3,7 +3,7 @@ mod common;
 use common::ReportExit as _;
 #[path = "common/manual_clock.rs"]
 mod manual_clock;
-use common::{TestHome, format_echo_path, free_port};
+use common::{TestHome, format_echo_path, free_port, refused_address};
 use manual_clock::Clock;
 use serde_json::Value;
 
@@ -3007,13 +3007,6 @@ async fn decide_stop_with_response_returns_it_as_retry_stopped() {
             }
         );
     }
-}
-/// 只占住端口而不 listen，确保整个尝试期间都拒绝连接，不误连另一个测试的监听器。
-fn refused_address() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
-    let reservation = tokio::net::TcpSocket::new_v4().unwrap();
-    reservation.bind(([127, 0, 0, 1], 0).into()).unwrap();
-    let addr = reservation.local_addr().unwrap();
-    (reservation, addr)
 }
 /// 有上游时保留原错体，没有上游时生成带 last_code 的 502。
 #[tokio::test]

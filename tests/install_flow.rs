@@ -141,7 +141,11 @@ fn residues(home: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// 路径是 bin 里一个让位的旧二进制（`aproxy.old-…`）
 #[cfg(unix)]
 fn is_retired_old(home: &std::path::Path, path: &std::path::Path) -> bool {
-    path.parent() == Some(aproxy::install::swap::bin_dir_in(home).as_path())
+    // 镜像路径可能已经解析了 /tmp 或 /var 的符号链接，目录按真实路径比较。
+    path.parent().unwrap().canonicalize().unwrap()
+        == aproxy::install::swap::bin_dir_in(home)
+            .canonicalize()
+            .unwrap()
         && path
             .file_name()
             .and_then(|n| n.to_str())

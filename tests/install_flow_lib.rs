@@ -713,8 +713,7 @@ fn restore_spec_of(run_dir: &Path, port: u16) -> Option<aproxy::spec::InstanceSp
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
-    let norm = |p: &Path| p.to_string_lossy().replace('\\', "/").to_lowercase();
-    norm(a) == norm(b)
+    a.canonicalize().unwrap() == b.canonicalize().unwrap()
 }
 
 /// 「新二进制拉不起实例」的两种形态：

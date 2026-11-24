@@ -157,13 +157,18 @@ impl TestHome {
 
     /// 非 Unicode 的绝对路径仍位于受控临时目录内，用于核对 JSON 显示与实际读写的区别。
     #[cfg(unix)]
-    pub fn non_unicode() -> Self {
+    pub fn non_unicode() -> Option<Self> {
         use std::os::unix::ffi::OsStrExt;
-        Self::in_temp_dir(|dir| {
-            let home = dir.join(OsStr::from_bytes(b"home-\xff"));
-            std::fs::create_dir(&home).unwrap();
-            home
-        })
+        let fixture = Self::in_temp_dir(|dir| dir.join(OsStr::from_bytes(b"home-\xff")));
+        match std::fs::create_dir(fixture.path()) {
+            Ok(()) => {
+                aproxy::fsx::secure_home_in(fixture.path()).unwrap();
+                Some(fixture)
+            }
+            // APFS 不接受非 UTF-8 文件名；只有文件系统明确拒绝时才跳过，不掩盖权限等错误。
+            Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => None,
+            Err(e) => panic!("创建非 Unicode 测试目录失败: {e}"),
+        }
     }
 
     /// 新建临时目录并核对它的位置；`home_of` 由临时目录给出注入的 APROXY_HOME。
@@ -375,6 +380,19 @@ impl Drop for ChildGuard {
         let _ = self.0.kill();
         let _ = self.0.wait().report_exit();
     }
+}
+
+/// 保持一对已连接的套接字，客户端源端口不会被别人抢走，也不接受新连接。
+/// 只 bind 不 listen 在 macOS 会丢弃 SYN 而不是拒连，混淆拒连与超时两种结果。
+pub fn refused_address() -> (
+    (std::net::TcpStream, std::net::TcpStream),
+    std::net::SocketAddr,
+) {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (peer, _) = listener.accept().unwrap();
+    let addr = client.local_addr().unwrap();
+    ((client, peer), addr)
 }
 
 /// 向系统要一个当前空闲的环回端口（绑定 127.0.0.1:0、读出端口号、随即放开），给要写进

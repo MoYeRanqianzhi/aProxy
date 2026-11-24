@@ -342,7 +342,10 @@ fn alias_conflicts_with_binary_continuation() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn non_unicode_home_has_display_locations() {
-    let h = TestHome::non_unicode();
+    let Some(h) = TestHome::non_unicode() else {
+        eprintln!("temporary filesystem does not support non-UTF-8 names (EILSEQ)");
+        return;
+    };
     mirror(&h, VERSION).await;
     let document =
         |args: &[&str], code| serde_json::from_slice::<Value>(&run(&h, args, code).stdout).unwrap();

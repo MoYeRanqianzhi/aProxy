@@ -3931,10 +3931,7 @@ async fn forward_only_enforces_max_body_mb() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn forward_only_unreachable_upstream_returns_502() {
-    // 绑定但不 listen：连接会被拒绝，而端口在请求结束前不会被并行测试的监听器拿走。
-    let reservation = tokio::net::TcpSocket::new_v4().unwrap();
-    reservation.bind(([127, 0, 0, 1], 0).into()).unwrap();
-    let dead_addr = reservation.local_addr().unwrap();
+    let (_reservation, dead_addr) = common::refused_address();
 
     let mut cfg = proxy_config_for(&format!("http://{dead_addr}"));
     cfg.forward_only = Some(true);
@@ -5015,30 +5012,38 @@ fn stop_from_another_home_does_not_reach_this_instance() {
 
 #[test]
 fn daemon_without_its_control_endpoint_exits_without_registering() {
-    // 同一 home 里已有实例占着端口 P 的控制端点；后来者监听 127.0.0.2:P，
-    // TCP 绑得上，控制端点却建不成。它必须启动失败、在 startup.log 说明原因，
-    // 不登记、不覆盖前者的注册与恢复记录。曾经它不带控制通道跑下去——stop、
-    // status 都找不到它，它的 .pid 还盖掉了前者的记录
+    // 前者占住同一 home、同一端口的控制端点。后来者能在另一个地址绑定 TCP，
+    // 却不能覆盖前者的注册与恢复记录，也不能在没有控制通道时继续运行。
     let home = TestHome::new();
     let run_dir = home.path().join("run");
-    let port = free_port();
-    let cfg = |name: &str, ip: &str| {
+    let cfg = |name: &str, addr: &str| {
         let path = home.path().join(name);
         std::fs::write(
             &path,
-            format!("base_url = \"https://{ip}.example.com\"\nlisten_addr = \"{ip}:{port}\"\n"),
+            format!("base_url = \"https://local.example.com\"\nlisten_addr = \"{addr}\"\n"),
         )
         .unwrap();
         path
     };
-    let cfg_a = cfg("a.toml", "127.0.0.1");
-    let cfg_b = cfg("b.toml", "127.0.0.2");
-    home.stop_on_drop(port);
-    let pid_a = spawn_daemon_in(&home, &cfg_a);
-    assert!(
-        wait_daemon_ready_in(&run_dir, port),
-        "守护 a 未就绪 (pid {pid_a})"
-    );
+    let cfg_a = cfg("a.toml", "127.0.0.1:0");
+    let out = home
+        .cmd()
+        .args(["start", "--json", "--config"])
+        .arg(cfg_a)
+        .output()
+        .report_exit()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let started = common::output_document(&out);
+    let port = home.track_started_port(&started);
+    let pid_a = u32::try_from(started["pid"].as_u64().unwrap()).unwrap();
+    // macOS 的 lo0 默认没有 127.0.0.2，用同一端口的 IPv6 回环地址，不修改网卡配置。
+    let second = if cfg!(target_os = "macos") {
+        "[::1]"
+    } else {
+        "127.0.0.2"
+    };
+    let cfg_b = cfg("b.toml", &format!("{second}:{port}"));
 
     let mut late = ChildGuard(
         home.serve_cmd(&cfg_b)

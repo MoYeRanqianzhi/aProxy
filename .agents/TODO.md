@@ -72,9 +72,8 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] **用量与费用统计**、**按 key 限速**、**预算上限**（建在生命周期通知上）
 - [ ] **Gemini 协议**（官方 aproxy-format 的协议转换）
 
-- [ ] **给扩展作者的文档**（beta.1 之前）：`docs/` 下写包的标准、manifest、扩展接口第 1 版（`aproxy-desktop/ui/src/lib/extensions/api.svelte.ts`
-  的类型是准绳）、数据位置、发布与核对（release 的 asset、digest）、本地调试（拖入解开的目录）。接口以后只加不改，
-  文档写明这一点。可能还要一个写扩展的 skill，等文档定了再说。
+- [ ] **写扩展的 skill**（文档已在 2026-11-24 写成 [docs/extensions.md](../docs/extensions.md)）：要不要再给 agent 一个写主题与
+  扩展的 skill，等有人真的用文档写过一两个包、知道 agent 卡在哪里再定。接口或包格式变了，文档要跟着改。
 - [ ] **aProxy 插件 `[[plugin]]`**（用户 2026-11-23，0.2.0 之后，版本未定）：实例启动时在后台拉起配置里的任意程序，用环境变量
   交给它 home、控制端点、协议版本等信息，之后不再管它；插件经 IPC 与命令行的 `--json` 做事（TUI、别的界面框架、通知等），
   按规范只管理声明了它的配置；settings.json 可声明对全部配置生效的全局插件。启动时检查，防止未知插件被偷偷加上。设计与待定的三个问题见 [plan/plugins.md](plan/plugins.md)。

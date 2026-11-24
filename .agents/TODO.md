@@ -63,9 +63,14 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   - 撤回预发布期的措辞（`--pre` / `@next` / `--version`、「目前只有预发布」）。2026-10-13 文档终审列的位置：README.md 31、60–63，
     README_EN.md 81、135–142、183，docs/INSTALL_AGENT.md 54–58、156，compatibility.md 步骤 3，CHANGELOG.md 24；
     「演示数据、预览版」的说法已在 2026-11-24 随真实数据改掉（README、architecture、aproxy-cli skill）。行号会漂，按内容找。
-  - **0.1.x 的 settings.json 怎么过渡**（B3 留下，rc.1 之前要定并做完）：0.2.0 只认分节的新形状，0.1.x 的平铺文件会让
-    多数命令以退出码 3 结束。现在只有技能 compatibility.md 里的手工对照表。倾向：`install` 换版时把平铺文件迁成新形状
-    （原文件留备份），并让 `upgrade_from_0_1_0` 的 CI 测试在升级后跑一条要读 settings 的命令。见计划 B3 记录第 4 条。
+  - **0.1.x 的 settings.json 与 config.toml 怎么过渡**（B3 留下，rc.1 之前做完）：0.2.0 只认分节的 settings.json 与新键名的
+    config.toml，0.1.x 的文件会让多数命令以退出码 3 结束，现在只有 compatibility.md 里的手工对照表。原先倾向在 `install` 换版
+    时迁，但 0.1.x 根本不能原地装 0.2.0（它拒绝），用户是重装过来的，`install` 碰不到这一步。**2026-11-24 主代理定：**加一个
+    一次性的 `aproxy migrate [--dry-run]`：按 compatibility.md 的两张表改写 settings.json 与 home 认得的每份配置（别名、
+    `default_config`、`config_dirs`、`<home>/*.toml`），每个文件先留 `<文件>.0.1.bak` 备份；能机械对应的才改，碰到
+    `[request_transform]` 一类、`extra`、不认识的键就整份不动、列出要人来改的地方；改完按 `start` 的规则校验。命令在读到
+    0.1.x 形状的文件时提示 `aproxy migrate`。`upgrade_from_0_1_0` 的 CI 测试在重装后跑它再跑一条要读 settings 的命令。
+    排在 t10d 之后交给 Codex（t13）；用户可以改这个决定。
 
 ### 0.2.0 之后紧接着（近期，用户 2026-10-12）
 - [ ] **并发限制与排队**：aproxy 的排队放行 + 官方 aproxy-format 的并发/限速/额度规则（协议形状在 0.2.0 定稿，见计划 W2 的 format 定稿补充）

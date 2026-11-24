@@ -59,7 +59,7 @@ The `code` of the error object an instance returns on its control endpoint.
 | `unknown_format` | No configured format has this name. Nothing was restarted. | `name` (string) |
 | `unknown_op` | There is no such op. Nothing was done. | `op` (string) |
 | `unsupported_arg` | The request carries arguments this instance does not know. | `args` (string list) |
-| `invalid_state` | Not allowed in the instance's current state. | `state` (string) |
+| `invalid_state` | Not allowed in the instance's current state. | `state` (string), `reason`? (string) |
 | `condition_not_met` | The condition of a conditional op does not hold. | `idle_ms`? (milliseconds) |
 | `busy` | All streaming connections are in use. | `limit` (integer) |
 | `not_found` | The request, or the body asked for, cannot be retrieved. | `request_id` (string), `reason` (string), `cause`? (string) |

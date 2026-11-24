@@ -5,7 +5,7 @@ metadata:
   type: project
   scope: aProxy 0.2.0 起的配置与设置（W2 契约块 B2、B3、B4）
   status: active
-  last_verified: 2026-11-19
+  last_verified: 2026-11-24
 ---
 
 0.2.0 把两个配置文件都换了形状，并从「不认识的键静默忽略」改成「严格解析，出错指出文件、键、行列」。
@@ -37,7 +37,7 @@ metadata:
   规范化后相同时继承，代理口令跟着 `defaults.proxy`；扣下的项在 `Resolved.withheld`。
 - settings.json 无效时各命令的分工在 `src/main.rs` 开头那一段：`settings` 与 `doctor` 自己报告，`status`、`stop`、`install`
   告警后按内置默认运行，其余退出 3。新增命令时要想清楚它归哪一类。
-- 0.1.x 的平铺 settings.json 目前没有自动迁移（见 TODO 的 W7 一条），接手时先看那条有没有定。
+- Only an explicit `aproxy migrate` rewrites 0.1.x files; `--dry-run` only previews. See [[migration-validation-boundary]].
 - For a read-only inventory, distinguish a missing file from an empty config layer. `config::resolve` intentionally
   accepts a missing file: startup may have enough information in overrides and defaults. A successful resolve is
   therefore not evidence that an alias target exists. Likewise, inspect settings with `settings::read`; `load_from`
@@ -49,7 +49,7 @@ metadata:
 
 The missing-file distinction is exercised by `doctor_json_document` (`tests/json_docs.rs`) and
 `instance_without_a_config_file_restarts_and_restores` (`tests/restart_integration.rs`); the settings distinction
-by `an_invalid_file_falls_back_to_the_last_valid_settings` (`src/settings/mod.rs`).
+by `an_invalid_file_falls_back_to_the_last_valid_settings` (`src/settings/mod.rs`). Migration evidence is in [[migration-validation-boundary]].
 
 **Recheck when:** Either reader changes its missing/invalid-file policy, the runtime config or settings fields
-are renamed, or the migration strategy for 0.1.x settings is decided.
+are renamed, or the explicit migration changes how it classifies files.

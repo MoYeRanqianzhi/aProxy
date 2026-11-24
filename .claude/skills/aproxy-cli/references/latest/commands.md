@@ -799,16 +799,24 @@ aproxy settings get defaults.max_request_mb
 aproxy desktop
 ```
 
-Opens the desktop window. It is a separate process that runs until its window is closed. The window
-itself starts, stops and reconfigures nothing, so opening or closing it never affects running
-instances; like every other `aproxy` command, it only resumes an install that was interrupted (see
-install / upgrade). It opens on the user's screen, so run it only when the user asks for the window.
+Opens the desktop window. It is a separate process that runs until its window is closed; opening
+or closing it never affects running instances, and like every other `aproxy` command it resumes an
+install that was interrupted (see install / upgrade). It opens on the user's screen, so run it only
+when the user asks for the window.
 
-**In the 0.2.0 alpha releases the window is a preview filled with demo data.** The instances, logs and counts
-it shows are made up, not the ones on this machine, and a label `预览版 · 演示数据` ("preview · demo
-data") stays on screen to say so. Never read the state of the user's proxies from it, and never
-tell the user that what it shows is real; use `aproxy status` and `aproxy logs`. Its preferences
-(theme, language, Mica) are not saved either: a reopened window starts with the defaults.
+The window shows this home's real instances, request history and configs, and lets the user start,
+stop and restart instances, restart single format programs, edit configs, switch the watchdog and
+start-at-login, and install updates. Everything it does goes through the same records and control
+channel as the CLI, so `aproxy status` and the window agree; for your own work, use the CLI, which
+you can read. Its preferences, the enabled extensions and their settings are kept in
+`<home>/desktop/desktop.toml`.
+
+**Themes and extensions** are installed from the window's settings page, from a local .zip or an
+unpacked folder, into `<home>/desktop/extensions/`. An extension is JavaScript that runs inside the
+window without a sandbox and can do anything the window can; before installing, the window explains
+each risk that applies and asks the user to confirm each one. When the user asks whether a package
+is safe, review it with the aproxy-audit-extension or aproxy-audit-theme skill rather than judging
+from its description.
 
 - **Windows, from a terminal:** the command returns at once with `已打开 aProxy 桌面界面（pid <pid>）。`
   ("desktop window opened") and the window runs on its own. Exit code 0 here only means the window

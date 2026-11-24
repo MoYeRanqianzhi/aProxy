@@ -98,9 +98,9 @@ Every other client, the reasoning behind the timeouts, and how to verify the set
   (`--api-key`) travel in a launch-spec file, not on the instance's command line.
 - A `--foreground` instance writes no record: closing its console ends it, `restore` does not
   revive it, and `restart` refuses it.
-- `aproxy desktop` opens the desktop window. In the 0.2.0 alpha releases it is a preview that shows demo
-  data, not this machine's instances, so never take the state of the proxies from it; the CLI is
-  the source of truth. Details: commands.md, desktop.
+- `aproxy desktop` opens the desktop window for the user: the same instances, logs and configs
+  the CLI sees, plus themes and extensions. You work through the CLI; open the window only when the
+  user asks for it. Details: commands.md, desktop.
 
 ### Change configuration
 

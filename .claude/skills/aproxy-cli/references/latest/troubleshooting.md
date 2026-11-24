@@ -157,8 +157,8 @@ the aproxy-format skill's troubleshooting.md.
 ## Desktop window and variants
 
 `aproxy --version` says which build runs: `desktop` or `headless`, the first word in the
-parentheses. A failing window never affects the proxy or the other commands. In the 0.2.0 alpha releases the
-window shows demo data only (commands.md, desktop).
+parentheses. A failing window never affects the proxy or the other commands (commands.md,
+desktop).
 
 | Symptom | Cause | Fix |
 |---|---|---|

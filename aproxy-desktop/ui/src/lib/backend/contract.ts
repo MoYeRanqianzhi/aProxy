@@ -678,6 +678,8 @@ export interface ShellInfo {
   customTitlebar: boolean;
   /** macOS 的 Overlay 标题栏：页面画整条栏，左上角让给系统的交通灯 */
   trafficLights: boolean;
+  /** Linux 没有窗口管理器的装饰：页面画整条栏和最小化、最大化、关闭三个按钮 */
+  ownControls: boolean;
   mica: 'available' | 'unsupported' | 'transparency-off';
   windowsBuild: number | null;
 }

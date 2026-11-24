@@ -67,6 +67,8 @@ class UiState {
   micaSupport = $state<MicaSupport>('available');
   /** macOS 的 Overlay 标题栏在用：标题栏左上角是系统的交通灯，拖动靠 data-tauri-drag-region（见 lib/shell.ts） */
   trafficLights = $state(false);
+  /** Linux 没有窗口管理器的装饰：标题栏最右边画页面自己的最小化、最大化、关闭按钮，拖动由页面发起（见 lib/shell.ts） */
+  ownControls = $state(false);
   /** Windows 的系统 build（Mica 不可用时设置页据此说明原因）；不是 Windows 为 null。浏览器里是一个 Windows 10 的假值 */
   windowsBuild = $state<number | null>(19045);
   /**

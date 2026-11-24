@@ -26,6 +26,8 @@ interface DesktopInfo {
   customTitlebar: boolean;
   /** macOS 的 Overlay 标题栏：页面铺到窗口顶上画整条栏，交通灯由系统叠在左上角 */
   trafficLights: boolean;
+  /** Linux 没有窗口管理器的装饰：页面画整条栏，最小化、最大化、关闭三个按钮也是页面画的 */
+  ownControls: boolean;
   mica: MicaSupport;
   /** Windows 的系统 build；不是 Windows 为 null */
   windowsBuild: number | null;
@@ -54,6 +56,10 @@ export function startShell(): void {
         ui.trafficLights = true;
         root.setProperty('--titlebar-left', '84px');
         root.setProperty('--titlebar-right', '14px');
+      } else if (info.ownControls) {
+        // Linux：三个窗口按钮画在标题栏最右边（Titlebar.svelte），右内边距只留一点，按钮离窗口边 8px
+        ui.ownControls = true;
+        root.setProperty('--titlebar-right', '8px');
       } else {
         // 原生标题栏之下的一行工具栏：右边没有要让位的按钮，与左边留一样的边
         root.setProperty('--titlebar-right', '14px');

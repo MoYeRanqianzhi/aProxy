@@ -14,6 +14,11 @@
   画的交通灯，右边没有按钮；WKWebView 不认 app-region，拖动与双击缩放改由 Tauri 的
   data-tauri-drag-region="deep" 提供（栏里任何不可点的地方都能拖，按钮、链接自动排除），只在 macOS 上加，
   免得 Windows 上与 app-region 重复处理同一次按下。快捷键提示按平台写 ⌘K 或 Ctrl K。
+  Linux（窗口没有装饰，见 aproxy-desktop/src/lib.rs）也用同一条栏，右边是页面自己画的最小化、最大化/还原、
+  关闭三个按钮。WebKitGTK 不认 app-region；data-tauri-drag-region 在 X11 上双击不灵（第一下按下就交给了
+  窗口管理器的移动，第二下到不了页面），所以拖动与双击最大化用 titlebar.js 的 enableDragRegion：只认按在
+  栏本身上的那一下，品牌区因此设成不接收指针（pointer-events: none），按在上面等于按在栏上。栏上的右键
+  不弹 WebKit 的页面菜单（后退、刷新、检查元素，对窗口没有意义）。
   后端给的是演示数据时（预览版），右侧常驻一个「预览版 · 演示数据」标签：标题栏在每一页都看得见，
   用户不会把假的实例当成自己电脑上正在跑的。悬停有完整说明，所以它也不参与拖动（no-drag 写在 app.css）。
 -->
@@ -25,12 +30,36 @@
   import MascotView from './MascotView.svelte';
   import Icon from './Icon.svelte';
   import { ui } from '../lib/state.svelte';
+  import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { enableDragRegion } from '../lib/titlebar.js';
 
   // 快捷键的监听同时认 Ctrl 与 ⌘（App.svelte），这里只决定提示怎么写
   const isMac = navigator.userAgent.includes('Mac');
+
+  let bar: HTMLElement;
+  /** 窗口是否最大化：决定中间那个按钮画「最大化」还是「还原」 */
+  let maximized = $state(false);
+
+  // 只有 Linux 的窗口（ownControls）才接管拖动与窗口按钮；getCurrentWindow 只在 Tauri 里能调，
+  // 所以也只在这里调。窗口大小一变（拖拽改大小、最大化、还原）就重新问一次是否最大化
+  $effect(() => {
+    if (!ui.ownControls) return;
+    const win = getCurrentWindow();
+    const stopDrag = enableDragRegion(bar, win);
+    const noMenu = (e: MouseEvent) => e.preventDefault();
+    bar.addEventListener('contextmenu', noMenu);
+    const sync = () => void win.isMaximized().then((m) => (maximized = m));
+    sync();
+    const unlisten = win.onResized(sync);
+    return () => {
+      stopDrag();
+      bar.removeEventListener('contextmenu', noMenu);
+      void unlisten.then((off) => off());
+    };
+  });
 </script>
 
-<header class="titlebar" data-tauri-drag-region={ui.trafficLights ? 'deep' : undefined}>
+<header class="titlebar" class:own={ui.ownControls} bind:this={bar} data-tauri-drag-region={ui.trafficLights ? 'deep' : undefined}>
   <div class="brand">
     <!-- 标志就是吉祥物的图标版：状态点跟着整体状态变。选了「不显示」时退回一个中性的 ↻ 标记 -->
     {#if mascots.current}
@@ -49,6 +78,24 @@
     <span class="demo chip solid butter" role="note" title={t('demo.explain')}>
       <Icon name="info" size={13} stroke={2.4} />{t('demo.label')}
     </span>
+  {/if}
+  {#if ui.ownControls}
+    <div class="controls">
+      <button class="ctl" onclick={() => getCurrentWindow().minimize()} title={t('win.minimize')} aria-label={t('win.minimize')}>
+        <Icon name="minus" size={16} stroke={2.2} />
+      </button>
+      <button
+        class="ctl"
+        onclick={() => getCurrentWindow().toggleMaximize()}
+        title={t(maximized ? 'win.restore' : 'win.maximize')}
+        aria-label={t(maximized ? 'win.restore' : 'win.maximize')}
+      >
+        <Icon name={maximized ? 'restore' : 'maximize'} size={14} stroke={2.2} />
+      </button>
+      <button class="ctl close" onclick={() => getCurrentWindow().close()} title={t('win.close')} aria-label={t('win.close')}>
+        <Icon name="x" size={16} stroke={2.2} />
+      </button>
+    </div>
   {/if}
 </header>
 
@@ -137,5 +184,54 @@
     height: min(26px, calc(var(--bar) - 14px));
     font-weight: 600;
     cursor: help;
+  }
+
+  /* ---------- Linux：页面自己画的窗口按钮 ---------- */
+  /* 品牌区不接收指针：按在上面的那一下落到栏本身，enableDragRegion 才认作拖动或双击最大化 */
+  .own .brand {
+    pointer-events: none;
+  }
+  /* 三个按钮靠右；有「演示数据」标签时由它占住剩下的空白，按钮紧跟在后面 */
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+    flex: none;
+  }
+  .demo ~ .controls {
+    margin-left: 0;
+  }
+  /* 和页面上别的图标按钮一样是圆的：平时只有图标，悬停时浮出一块浅底；关闭按钮悬停变珊瑚色，
+     与「停止」这类操作同一个警示色。尺寸跟着栏高走，主题把栏压矮时一起变小 */
+  .ctl {
+    display: grid;
+    place-items: center;
+    width: min(32px, calc(var(--bar) - 12px));
+    height: min(32px, calc(var(--bar) - 12px));
+    padding: 0;
+    border: 0;
+    border-radius: var(--r-pill);
+    background: transparent;
+    color: var(--text-2);
+    transition:
+      background-color var(--dur-fast) linear,
+      color var(--dur-fast) linear,
+      transform var(--dur-fast) var(--ease-spring);
+  }
+  .ctl:hover {
+    background: var(--hover);
+    color: var(--text);
+  }
+  .ctl.close:hover {
+    background: var(--coral);
+    color: var(--on-fill);
+  }
+  .ctl:active {
+    transform: scale(0.92);
+  }
+  .ctl:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 1px;
   }
 </style>

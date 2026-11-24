@@ -65,6 +65,8 @@ class UiState {
   systemDark = $state(false);
   systemReducedMotion = $state(false);
   micaSupport = $state<MicaSupport>('available');
+  /** macOS 的 Overlay 标题栏在用：标题栏左上角是系统的交通灯，拖动靠 data-tauri-drag-region（见 lib/shell.ts） */
+  trafficLights = $state(false);
   /** Windows 的系统 build（Mica 不可用时设置页据此说明原因）；不是 Windows 为 null。浏览器里是一个 Windows 10 的假值 */
   windowsBuild = $state<number | null>(19045);
   /**

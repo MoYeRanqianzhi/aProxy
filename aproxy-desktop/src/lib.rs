@@ -65,6 +65,16 @@ const MAIN_WINDOW: &str = "main";
 /// 窗口的初始与最小逻辑尺寸。初始尺寸放不进屏幕工作区时按工作区缩小（见 [`fit_to_monitor`]）。
 const INITIAL_SIZE: (f64, f64) = (1200.0, 780.0);
 const MIN_SIZE: (f64, f64) = (900.0, 600.0);
+/// macOS 交通灯（关闭、最小化、缩放三个按钮）的位置，逻辑像素。窗口用 Overlay 标题栏：页面铺到窗口最顶上，
+/// 自己画整条标题栏，交通灯仍由系统画、叠在页面左上角。
+/// - x 是关闭按钮左边缘离窗口左边的距离，取 15，与页面标题栏的左右留白相近；
+/// - y 不是按钮顶边的位置：tao 把装交通灯的标题栏容器设成「按钮高度 + y」高，按钮在容器里保持原来的
+///   偏移（tao 的 `inset_traffic_lights`）。在 macOS 26 上实测（2026-11-24，GitHub 的 arm64 runner 截图）：
+///   y = 15 时按钮中心离窗口顶约 12.5，比页面 44px 标题栏（app.css 的 --titlebar-min）的中线 22 高 9.5，
+///   所以取 24.5 让按钮上下居中。换 macOS 大版本或改了 --titlebar-min 都要截图重新核对。
+/// 页面左侧为它们让出的宽度（--titlebar-left）在 ui/src/lib/shell.ts，改 x 要一起改。
+#[cfg(target_os = "macos")]
+const TRAFFIC_LIGHTS: (f64, f64) = (15.0, 24.5);
 
 /// 窗口以 `visible: false` 创建，由页面在脚本跑起来之后调用 `show()`——这样启动时不会先
 /// 闪一下白底（WebView2 挂上之前窗口是白的）。页面出了错（脚本异常、CSP 拦截、权限不对）
@@ -276,9 +286,12 @@ pub fn message_box(text: &str, error: bool) {
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopInfo {
-    /// Windows 自定义标题栏装上了（原生按钮留在右上角，页面画其余部分）。没装上（非
-    /// Windows，或 install 失败降级）时页面的标题栏只是原生标题栏下面的一行工具栏。
+    /// Windows 自定义标题栏装上了（原生按钮留在右上角，页面画其余部分）。两个都为假（Linux，
+    /// 或 Windows 上 install 失败降级）时页面的标题栏只是原生标题栏下面的一行工具栏。
     custom_titlebar: bool,
+    /// macOS 的 Overlay 标题栏：页面画整条标题栏，左上角让给系统的交通灯，拖动走
+    /// data-tauri-drag-region。与 custom_titlebar 互斥（那个只在 Windows 上为真）。
+    traffic_lights: bool,
     mica: MicaSupport,
     /// Windows 的系统版本号（build），设置页说明 Mica 为什么不可用时要用；非 Windows 为 None
     windows_build: Option<u32>,
@@ -322,6 +335,16 @@ fn open_main_window(app: &tauri::App, data_dir: PathBuf) -> Result<(), Error> {
     // Windows 有，别的平台不开透明，免得某些 Linux 合成器把窗口画成透明或黑底。
     #[cfg(windows)]
     let builder = builder.transparent(true);
+    // macOS 的自定义标题栏：Overlay 让页面延伸到标题栏底下，系统只画交通灯（保留原生的悬停、
+    // 按住 Option 变成「缩放」、全屏等行为），标题文字隐藏，由页面画品牌、搜索框等。拖动与双击
+    // 缩放靠页面标题栏上的 data-tauri-drag-region（WKWebView 不认 app-region），见 Titlebar.svelte。
+    // 已知限制（tauri-apps/tauri#13044）：之后再调用 set_title 会把交通灯挪回默认位置，所以窗口
+    // 标题只在这里设一次，页面不改它。
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition::new(TRAFFIC_LIGHTS.0, TRAFFIC_LIGHTS.1));
     let window = builder.build().map_err(|e| Error::Startup(e.to_string()))?;
 
     fit_to_monitor(&window);
@@ -339,12 +362,16 @@ fn open_main_window(app: &tauri::App, data_dir: PathBuf) -> Result<(), Error> {
         let (mica, windows_build) = mica::support(&window);
         DesktopInfo {
             custom_titlebar,
+            traffic_lights: false,
             mica,
             windows_build,
         }
     };
     #[cfg(not(windows))]
-    let info = DesktopInfo::default();
+    let info = DesktopInfo {
+        traffic_lights: cfg!(target_os = "macos"),
+        ..DesktopInfo::default()
+    };
     *app.state::<Mutex<DesktopInfo>>()
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = info;

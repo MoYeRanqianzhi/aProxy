@@ -53,6 +53,10 @@ fn check_grants() {
         "core:window:allow-show".into(),
         "core:window:allow-set-effects".into(),
         "core:window:allow-set-theme".into(),
+        // macOS 的 Overlay 标题栏靠 data-tauri-drag-region 拖动与双击缩放（Tauri 的 drag.js 调这两个命令）；
+        // 别的平台页面不加这个属性，两条授权用不上
+        "core:window:allow-start-dragging".into(),
+        "core:window:allow-internal-toggle-maximize".into(),
     ]);
     for name in COMMANDS {
         let id = name.replace('_', "-");

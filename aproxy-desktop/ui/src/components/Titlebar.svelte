@@ -10,6 +10,10 @@
   - 顶部 --titlebar-top 是最大化时被屏幕吃掉的部分；
   - 整条 app-region: drag（拖动、双击最大化、右键系统菜单、Aero Snap 都由 Windows 提供），
     可交互的子元素 app-region: no-drag。
+  macOS（Overlay 标题栏，见 aproxy-desktop/src/lib.rs）用同一条栏：左边 --titlebar-left 宽的一块让给系统
+  画的交通灯，右边没有按钮；WKWebView 不认 app-region，拖动与双击缩放改由 Tauri 的
+  data-tauri-drag-region="deep" 提供（栏里任何不可点的地方都能拖，按钮、链接自动排除），只在 macOS 上加，
+  免得 Windows 上与 app-region 重复处理同一次按下。快捷键提示按平台写 ⌘K 或 Ctrl K。
   后端给的是演示数据时（预览版），右侧常驻一个「预览版 · 演示数据」标签：标题栏在每一页都看得见，
   用户不会把假的实例当成自己电脑上正在跑的。悬停有完整说明，所以它也不参与拖动（no-drag 写在 app.css）。
 -->
@@ -20,9 +24,13 @@
   import { mascots } from '../lib/mascot/registry.svelte';
   import MascotView from './MascotView.svelte';
   import Icon from './Icon.svelte';
+  import { ui } from '../lib/state.svelte';
+
+  // 快捷键的监听同时认 Ctrl 与 ⌘（App.svelte），这里只决定提示怎么写
+  const isMac = navigator.userAgent.includes('Mac');
 </script>
 
-<header class="titlebar">
+<header class="titlebar" data-tauri-drag-region={ui.trafficLights ? 'deep' : undefined}>
   <div class="brand">
     <!-- 标志就是吉祥物的图标版：状态点跟着整体状态变。选了「不显示」时退回一个中性的 ↻ 标记 -->
     {#if mascots.current}
@@ -35,7 +43,7 @@
   <button class="search" onclick={() => (overlays.palette = true)}>
     <Icon name="search" size={14} stroke={2.4} />
     <span class="ph">{t('search.placeholder')}</span>
-    <span class="kbd">Ctrl K</span>
+    <span class="kbd">{isMac ? '⌘K' : 'Ctrl K'}</span>
   </button>
   {#if store.demo}
     <span class="demo chip solid butter" role="note" title={t('demo.explain')}>
@@ -53,7 +61,7 @@
     box-sizing: content-box;
     flex: none;
     height: var(--bar);
-    padding: var(--titlebar-top, 0px) var(--titlebar-right, 146px) 0 14px;
+    padding: var(--titlebar-top, 0px) var(--titlebar-right, 146px) 0 var(--titlebar-left, 14px);
     display: flex;
     align-items: center;
     gap: 14px;
@@ -71,7 +79,9 @@
     display: flex;
     align-items: center;
     gap: 7px;
-    width: calc(var(--nav-w) - 14px - 14px);
+    /* 搜索框与下面的内容区左边对齐：品牌区宽度 = 导航宽度减去标题栏左内边距与 gap；
+       macOS 的左内边距让给了交通灯，品牌区跟着变窄，至少留出标志与字标的宽度 */
+    width: max(96px, calc(var(--nav-w) - var(--titlebar-left, 14px) - 14px));
   }
   .mark {
     display: grid;

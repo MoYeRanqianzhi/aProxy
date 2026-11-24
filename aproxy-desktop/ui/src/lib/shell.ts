@@ -24,6 +24,8 @@ export const inTauri = isTauri();
 interface DesktopInfo {
   /** Windows 自定义标题栏装上了：原生按钮留在右上角，页面画标题栏的其余部分 */
   customTitlebar: boolean;
+  /** macOS 的 Overlay 标题栏：页面铺到窗口顶上画整条栏，交通灯由系统叠在左上角 */
+  trafficLights: boolean;
   mica: MicaSupport;
   /** Windows 的系统 build；不是 Windows 为 null */
   windowsBuild: number | null;
@@ -43,11 +45,18 @@ export function startShell(): void {
     (info) => {
       ui.micaSupport = info.mica;
       ui.windowsBuild = info.windowsBuild;
+      const root = document.documentElement.style;
       if (info.customTitlebar) {
         watchTitlebarInsets();
+      } else if (info.trafficLights) {
+        // macOS：交通灯在左上角（位置见 aproxy-desktop/src/lib.rs 的 TRAFFIC_LIGHTS：离左边 15px，
+        // 三个 14px 的按钮加两道间隔约 54px 宽），左边让出 15 + 54 + 15 = 84px，右边没有按钮
+        ui.trafficLights = true;
+        root.setProperty('--titlebar-left', '84px');
+        root.setProperty('--titlebar-right', '14px');
       } else {
         // 原生标题栏之下的一行工具栏：右边没有要让位的按钮，与左边留一样的边
-        document.documentElement.style.setProperty('--titlebar-right', '14px');
+        root.setProperty('--titlebar-right', '14px');
       }
       syncWindow();
     },

@@ -11,6 +11,8 @@
     "core:window:allow-show",
     "core:window:allow-set-effects",
     "core:window:allow-set-theme",
+    "core:window:allow-start-dragging",
+    "core:window:allow-internal-toggle-maximize",
     "allow-desktop-info",
     "allow-titlebar-insets",
     "allow-set-caption-color",

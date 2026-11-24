@@ -356,7 +356,7 @@ type Handlers = { [N in CommandName]: (args: Commands[N][0]) => Promise<Commands
 
 const handlers: Handlers = {
   // 浏览器里没有窗口外壳：没有自绘标题栏，也没有 Mica
-  desktop_info: () => later({ customTitlebar: false, mica: 'unsupported', windowsBuild: null }),
+  desktop_info: () => later({ customTitlebar: false, trafficLights: false, mica: 'unsupported', windowsBuild: null }),
   titlebar_insets: () => later({ top: 0, height: 0, right: 0 }),
   set_caption_color: () => later(null),
 

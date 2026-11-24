@@ -12,8 +12,6 @@
 mod common;
 use common::ReportExit as _;
 use common::TestHome;
-#[cfg(unix)]
-use common::free_port;
 
 use std::path::Path;
 use std::process::Command;
@@ -170,19 +168,15 @@ fn control_socket_refuses_other_users_and_admits_root() {
     let other = std::env::var("APROXY_TEST_OTHER_USER")
         .expect("APROXY_TEST_OTHER_USER 应是一个已存在的、不是本用户的用户名");
     let home = TestHome::new();
-    let port = free_port();
     let cfg = home.path().join("access.toml");
     std::fs::write(
         &cfg,
-        format!(
-            "base_url = \"https://access-test.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"
-        ),
+        "base_url = \"https://access-test.example.com\"\nlisten_addr = \"127.0.0.1:0\"\n",
     )
     .unwrap();
-    home.stop_on_drop(port);
     let out = home
         .cmd()
-        .args(["start", "--config", cfg.to_str().unwrap()])
+        .args(["start", "--json", "--config", cfg.to_str().unwrap()])
         .output()
         .report_exit()
         .expect("运行 aproxy 失败");
@@ -193,6 +187,7 @@ fn control_socket_refuses_other_users_and_admits_root() {
     );
 
     let run = home.path().join("run");
+    let port = home.track_started_port(&common::output_document(&out));
     let socket = run.join(format!("{port}.sock"));
     {
         use std::os::unix::fs::PermissionsExt;

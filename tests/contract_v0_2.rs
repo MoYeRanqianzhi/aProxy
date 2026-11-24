@@ -279,9 +279,7 @@ fn start<'a>(home: &'a TestHome, port: u16, args: &[&str]) -> Instance<'a> {
         String::from_utf8_lossy(&out.stderr)
     );
     let port = if port == 0 {
-        let bound = u16::try_from(common::output_document(&out)["port"].as_u64().unwrap()).unwrap();
-        home.stop_on_drop(bound);
-        bound
+        home.track_started_port(&common::output_document(&out))
     } else {
         port
     };
@@ -446,17 +444,15 @@ fn request_history_is_read_over_the_control_channel() {
     const UPSTREAM_BODY: &str = r#"{"id":"msg_1","content":"hello"}"#;
 
     let home = TestHome::new();
-    let port = free_port();
     let upstream = fixed_upstream(UPSTREAM_BODY);
     let cfg = home.path().join("history.toml");
     std::fs::write(
         &cfg,
-        format!(
-            "base_url = \"{upstream}\"\nlisten_addr = \"127.0.0.1:{port}\"\napi_key = \"{KEY}\"\n"
-        ),
+        format!("base_url = \"{upstream}\"\nlisten_addr = \"127.0.0.1:0\"\napi_key = \"{KEY}\"\n"),
     )
     .unwrap();
-    let instance = start(&home, port, &["start", "--config", cfg.to_str().unwrap()]);
+    let instance = start(&home, 0, &["start", "--config", cfg.to_str().unwrap()]);
+    let port = instance.port;
     let snapshot = instance.snapshot("{\"v\":1,\"op\":\"ping\"}\n");
     assert_eq!(snapshot["behavior"]["history"]["body_budget_mb"], 64);
 
@@ -780,17 +776,15 @@ fn request_history_is_read_over_the_control_channel() {
 #[test]
 fn control_channel_speaks_v1_as_sampled() {
     let home = TestHome::new();
-    let port = free_port();
     let cfg = home.path().join("contract.toml");
     // 上游地址带 userinfo：快照与记录里只许出现打过码的
     std::fs::write(
         &cfg,
-        format!(
-            "base_url = \"https://alice:WIREPASS123@contract-test.example.com/v1\"\nlisten_addr = \"127.0.0.1:{port}\"\n"
-        ),
+        "base_url = \"https://alice:WIREPASS123@contract-test.example.com/v1\"\nlisten_addr = \"127.0.0.1:0\"\n",
     )
     .unwrap();
-    let instance = start(&home, port, &["start", "--config", cfg.to_str().unwrap()]);
+    let instance = start(&home, 0, &["start", "--config", cfg.to_str().unwrap()]);
+    let port = instance.port;
 
     // ---- ping ----
     let snapshot = instance.snapshot("{\"v\":1,\"op\":\"ping\"}\n");
@@ -988,12 +982,8 @@ fn instance_without_a_config_file_reports_null_config_path() {
         r#"{"watchdog": {"enabled": false},
             "defaults": {"base_url": "https://defaults-only.example.com"}}"#,
     );
-    let port = free_port();
-    let instance = start(
-        &home,
-        port,
-        &["start", "--listen-addr", &format!("127.0.0.1:{port}")],
-    );
+    let instance = start(&home, 0, &["start", "--listen-addr", "127.0.0.1:0"]);
+    let port = instance.port;
 
     let snapshot = instance.snapshot("{\"v\":1,\"op\":\"ping\"}\n");
     assert!(snapshot["instance"]["config_path"].is_null(), "{snapshot}");

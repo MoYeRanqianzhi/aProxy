@@ -9,11 +9,11 @@ use serde_json::Value;
 
 /// 启动器来不及输出 JSON 时，保留销毁临时 home 前的子进程侧证据。只读这次测试的日志和台账，
 /// 不枚举系统进程，不输出配置、环境或请求样例；每份日志只取末尾 4 KiB。
-fn launch_evidence(home: &TestHome, port: u16) -> String {
+fn launch_evidence(home: &TestHome) -> String {
     use std::fmt::Write as _;
     use std::io::{Read, Seek, SeekFrom};
     let entries = aproxy_ipc::ledger::read_all_in(home.path());
-    let mut text = format!("port={port} ledger_entries={}", entries.len());
+    let mut text = format!("ledger_entries={}", entries.len());
     for found in entries {
         let e = found.entry;
         let _ = write!(
@@ -64,7 +64,7 @@ fn failed_launcher_evidence_preserves_child_log_tail_without_config() {
     )
     .unwrap();
     std::fs::write(home.path().join("chain.toml"), "not for diagnostics").unwrap();
-    let evidence = launch_evidence(&home, 0);
+    let evidence = launch_evidence(&home);
     assert!(evidence.contains("final marker") && evidence.contains("ledger_entries=0"));
     assert!(!evidence.contains("prefix") && !evidence.contains("not for diagnostics"));
 }
@@ -72,8 +72,6 @@ fn failed_launcher_evidence_preserves_child_log_tail_without_config() {
 /// 用裸名从 home/bin 找到本地测试程序。真实命令、注册记录与 IPC 应答共用同一个临时 home。
 fn start(mode: &str, required: bool) -> (TestHome, std::process::Output) {
     let home = TestHome::new();
-    let port = free_port();
-    home.stop_on_drop(port);
     let bin = home.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::copy(
@@ -81,18 +79,10 @@ fn start(mode: &str, required: bool) -> (TestHome, std::process::Output) {
         bin.join(format!("local-format{}", std::env::consts::EXE_SUFFIX)),
     )
     .unwrap();
-    let cfg = home.path().join("instance.toml");
-    std::fs::write(&cfg, format!("base_url='http://127.0.0.1:{port}'\nlisten_addr='127.0.0.1:{port}'\n[[format]]\nname='test-layer'\ncommand='local-format'\nstages=['request']\nargs=['{mode}']\nrequired={required}\nenv={{ ECHO_SECRET='fixture-credential' }}\n")).unwrap();
-    let out = home
-        .cmd()
-        .args(["start", "--json", "--config"])
-        .arg(cfg)
-        .output()
-        .report_exit()
-        .unwrap();
-    if !out.status.success() {
-        eprintln!("{}", launch_evidence(&home, port));
-    }
+    let config = format!(
+        "[[format]]\nname='test-layer'\ncommand='local-format'\nstages=['request']\nargs=['{mode}']\nrequired={required}\nenv={{ ECHO_SECRET='fixture-credential' }}\n"
+    );
+    let (_, out) = launch(&home, free_port(), &config);
     (home, out)
 }
 /// 绑定成功不能代表已就绪；透过启动命令验证子进程的错误不被折叠成 start_failed。
@@ -180,10 +170,7 @@ async fn failed_start_exits_while_descendant_still_holds_stderr() {
     );
     std::fs::write(
         &cfg,
-        format!(
-            "base_url='http://127.0.0.1:1'\nlisten_addr='127.0.0.1:{}'\n{format}",
-            free_port()
-        ),
+        format!("base_url='http://127.0.0.1:1'\nlisten_addr='127.0.0.1:0'\n{format}"),
     )
     .unwrap();
     let mut command = tokio::process::Command::from(home.cmd());
@@ -304,10 +291,8 @@ fn launch_with_backoff(
     config: &str,
     cap: u64,
 ) -> (u16, std::process::Output) {
-    let port = free_port();
-    home.stop_on_drop(port);
     let cfg = home.path().join("chain.toml");
-    std::fs::write(&cfg,format!("base_url='http://127.0.0.1:{upstream}'\nlisten_addr='127.0.0.1:{port}'\nretry.max_backoff_secs={cap}\n{config}")).unwrap();
+    std::fs::write(&cfg,format!("base_url='http://127.0.0.1:{upstream}'\nlisten_addr='127.0.0.1:0'\nretry.max_backoff_secs={cap}\n{config}")).unwrap();
     let out = home
         .cmd()
         .env("NO_PROXY", "127.0.0.1,localhost")
@@ -316,9 +301,13 @@ fn launch_with_backoff(
         .output()
         .report_exit()
         .unwrap();
-    if !out.status.success() {
-        eprintln!("{}", launch_evidence(home, port));
-    }
+    let port = if out.status.success() {
+        home.track_started_port(&common::output_document(&out))
+    } else {
+        // 失败应答没有端口，只保留本次启动的诊断，不登记清理目标。
+        eprintln!("{}", launch_evidence(home));
+        0
+    };
     (port, out)
 }
 

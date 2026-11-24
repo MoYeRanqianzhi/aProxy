@@ -3,7 +3,7 @@
 
 mod common;
 use common::ReportExit as _;
-use common::{TestHome, free_port};
+use common::TestHome;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -368,21 +368,13 @@ fn show_json_documents() {
 #[test]
 fn writes_report_the_instances_to_restart() {
     let home = TestHome::new();
-    let (port, other_port) = (free_port(), free_port());
-    let file = write_config(
-        &home,
-        "running.toml",
-        &format!("listen_addr = \"127.0.0.1:{port}\"\n"),
-    );
-    let other = write_config(
-        &home,
-        "other.toml",
-        &format!("listen_addr = \"127.0.0.1:{other_port}\"\n"),
-    );
-    for (cfg, port) in [(&file, port), (&other, other_port)] {
+    let listen = "listen_addr = '127.0.0.1:0'\n";
+    let file = write_config(&home, "running.toml", listen);
+    let other = write_config(&home, "other.toml", listen);
+    let [port, other_port] = [&file, &other].map(|cfg| {
         let out = home
             .cmd()
-            .args(["start", cfg.to_str().unwrap()])
+            .args(["start", "--json", cfg.to_str().unwrap()])
             .stdin(Stdio::null())
             .output()
             .report_exit()
@@ -393,8 +385,8 @@ fn writes_report_the_instances_to_restart() {
             text(&out.stdout),
             text(&out.stderr)
         );
-        home.stop_on_drop(port);
-    }
+        home.track_started_port(&common::output_document(&out))
+    });
 
     let set = doc(
         &home,

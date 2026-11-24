@@ -310,6 +310,14 @@ impl TestHome {
         cmd
     }
 
+    /// 端口 0 由实例自己绑定；后续请求与清理都要使用启动结果里的实际端口。
+    pub fn track_started_port(&self, doc: &serde_json::Value) -> u16 {
+        let port = u16::try_from(doc["port"].as_u64().unwrap()).unwrap();
+        assert_ne!(port, 0, "{doc}");
+        self.stop_on_drop(port);
+        port
+    }
+
     /// 登记一个端口：析构时用当前构建执行 `aproxy stop <端口>`。在拉起实例的地方紧接着
     /// 登记；那个端口上到时没有实例也无妨（stop 报「没有运行中的实例」，忽略）。
     pub fn stop_on_drop(&self, port: u16) {

@@ -1360,10 +1360,8 @@ async fn request_persistent_reused_worker_dying_on_write_is_retried_once() {
 fn forward_and_format_start_together() {
     isolate_env_proxy();
     let home = TestHome::new();
-    let port = common::free_port();
-    home.stop_on_drop(port);
     let cfg_path = home.path().join("forward.toml");
-    std::fs::write(&cfg_path,format!("base_url='http://127.0.0.1:{}'\nlisten_addr='127.0.0.1:{port}'\ndelivery='forward'\n[[format]]\ncommand={}\nstages=['request']\nargs=['echo']\n",common::free_port(),serde_json::to_string(&format_echo_path()).unwrap())).unwrap();
+    std::fs::write(&cfg_path,format!("base_url='http://127.0.0.1:{}'\nlisten_addr='127.0.0.1:0'\ndelivery='forward'\n[[format]]\ncommand={}\nstages=['request']\nargs=['echo']\n",common::free_port(),serde_json::to_string(&format_echo_path()).unwrap())).unwrap();
     let out = home
         .cmd()
         .args(["start", "--json", "--config"])
@@ -1373,6 +1371,7 @@ fn forward_and_format_start_together() {
         .unwrap();
     assert!(out.status.success(), "{out:?}");
     let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    home.track_started_port(&doc);
     assert_eq!(doc["instance"]["state"], "serving");
     assert_eq!(doc["instance"]["formats"][0]["protocol"], 1);
 }

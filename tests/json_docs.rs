@@ -105,15 +105,14 @@ fn status_json_document() {
         })
     );
 
-    let port = free_port();
     let path = home.path().join("a.toml");
     fs::write(
         &path,
-        format!("base_url = \"https://a.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
+        "base_url = \"https://a.example.com\"\nlisten_addr = \"127.0.0.1:0\"\n",
     )
     .unwrap();
-    home.stop_on_drop(port);
     let start = document(&run(&home, &["start", path.to_str().unwrap(), "--json"]));
+    let port = home.track_started_port(&start);
     let pid = start["pid"].as_u64().unwrap();
 
     let doc = document(&run(&home, &args));
@@ -414,15 +413,14 @@ fn settings_set_and_unset_json_documents() {
     assert_eq!(doc["changed"], true);
     assert_eq!(doc["value"], builtin["value"]);
 
-    let port = free_port();
     let path = home.path().join("a.toml");
     fs::write(
         &path,
-        format!("base_url = \"https://a.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
+        "base_url = \"https://a.example.com\"\nlisten_addr = \"127.0.0.1:0\"\n",
     )
     .unwrap();
-    home.stop_on_drop(port);
-    run(&home, &["start", path.to_str().unwrap(), "--json"]);
+    let start = document(&run(&home, &["start", path.to_str().unwrap(), "--json"]));
+    let port = home.track_started_port(&start);
     for (key, value, ports) in [
         ("defaults.max_request_mb", "64", json!([port])),
         ("watchdog.heartbeat_secs", "60", json!([])),
@@ -838,8 +836,7 @@ fn restart_formats_json_document() {
     fs::write(&role, "2").unwrap();
     fs::write(&cfg,format!("base_url='http://127.0.0.1'\nlisten_addr='127.0.0.1:0'\n[[format]]\nname='a'\ncommand={0}\nstages=['request']\n[[format]]\nname='b'\ncommand={0}\nargs=['role-version',{1}]\nstages=['request']",json!(common::format_echo_path()),json!(role))).unwrap();
     let start = document(&run(&home, &["start", cfg.to_str().unwrap(), "--json"]));
-    let port = u16::try_from(start["port"].as_u64().unwrap()).unwrap();
-    home.stop_on_drop(port);
+    let port = home.track_started_port(&start);
     let addr = port.to_string();
     let args = ["restart", &addr, "--format", "b", "--json"];
     let one = run(&home, &args);

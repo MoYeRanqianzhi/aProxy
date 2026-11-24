@@ -93,6 +93,11 @@
      29px，最大化时约 22px）放不下舒展的搜索框，所以标题栏取二者中大的那个（tauri-custom-titlebar 的
      「最小高度变体」，见 components/Titlebar.svelte）。主题可以改它（主题字符串的 titlebarMin，36 – 64） */
   --titlebar-min: 44px;
+  /* 标题栏的下沿离窗口顶边多远：最大化时被屏幕吃掉的 --titlebar-top 加上栏高（与 components/Titlebar.svelte
+     的 --bar 同一个算法）。弹窗与命令面板的遮罩从这里往下铺，不盖标题栏：标题栏上有系统自己画的东西
+     （Windows 的原生按钮、macOS 的交通灯），遮罩压不暗它们，盖上去反而在按钮那一块留下一块亮斑；
+     标题栏露在外面，弹窗开着时也照样能拖动、最小化、关闭窗口 */
+  --titlebar-bottom: calc(var(--titlebar-top, 0px) + max(var(--titlebar-height, 32px), var(--titlebar-min)));
 }
 
 /* ---------- 浅色主题（默认） ---------- */

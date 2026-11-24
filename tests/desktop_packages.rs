@@ -351,7 +351,7 @@ async fn github_repo_and_release_facts_use_only_bounded_anonymous_api_requests()
     use std::time::Duration;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        net::{TcpListener, TcpSocket},
+        net::{TcpListener, TcpStream},
     };
     let h = TestHome::new();
     let host = host(&h);
@@ -525,12 +525,15 @@ async fn github_repo_and_release_facts_use_only_bounded_anonymous_api_requests()
             }
         }
     }
-    // 绑定但不监听，端口仍由本测试占有，拒绝连接不能误中第三方服务。
-    let socket = TcpSocket::new_v4().unwrap();
-    socket
-        .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+    // 已连接的客户端占有源端口，但只匹配已有连接；新的代理连接没有监听者。
+    // 仅 bind 不 listen 在 macOS 上可能静默丢弃 SYN，把拒连样本变成超时样本。
+    let silent = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
         .unwrap();
-    let proxy = format!("http://{}", socket.local_addr().unwrap());
+    let listening = silent.local_addr().unwrap();
+    let client = TcpStream::connect(listening).await.unwrap();
+    let (_peer, _) = silent.accept().await.unwrap();
+    let proxy = format!("http://{}", client.local_addr().unwrap());
     assert!(matches!(
         facts(repository, "1.2.0", &directory, api, Some(&proxy), timeout).await,
         GithubFacts::Unreachable {
@@ -538,7 +541,8 @@ async fn github_repo_and_release_facts_use_only_bounded_anonymous_api_requests()
             ..
         }
     ));
-    let _silent = socket.listen(1).unwrap();
+    // 监听端口能完成 TCP 握手，但没有代理应答，因此必须报告超时。
+    let proxy = format!("http://{listening}");
     assert!(matches!(
         facts(
             repository,

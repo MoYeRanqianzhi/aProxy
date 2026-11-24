@@ -3,7 +3,9 @@
 # 在真机上验证 aProxy 的行为。中继账号的公钥在服务器上被限制为只能在回环地址的一个端口上开反向转发
 # （不能登录、不能执行命令）；runner 上的 sshd 只监听回环地址。不发布、不写仓库，查完删除分支与 secret。
 #
-# 结束方式：在 runner 上 `touch ~/probe-done`，或者在 GitHub 上取消这次运行；最长挂 180 分钟。
+# 结束方式：在 runner 上 `touch ~/probe-done`，或者在 GitHub 上取消这次运行；最长挂 330 分钟。
+# 截屏：经 SSH 登录的进程没有屏幕录制权限，所以由本工作流的等待步骤代劳：`touch ~/probe-shot`，
+# 几秒后 ~/probe-shot.png 出现（失败时 ~/probe-shot.err 记下原因）。
 name: macOS shell
 
 on:
@@ -20,7 +22,7 @@ concurrency:
 jobs:
   shell:
     runs-on: macos-latest
-    timeout-minutes: 240
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -90,8 +92,14 @@ jobs:
           echo "relay loop started"
       - name: Wait for the maintainer
         run: |
-          end=$(( $(date +%s) + 180 * 60 ))
-          while [ ! -e "$HOME/probe-done" ] && [ "$(date +%s)" -lt "$end" ]; do sleep 30; done
+          end=$(( $(date +%s) + 330 * 60 ))
+          while [ ! -e "$HOME/probe-done" ] && [ "$(date +%s)" -lt "$end" ]; do
+            if [ -e "$HOME/probe-shot" ]; then
+              rm -f "$HOME/probe-shot" "$HOME/probe-shot.png" "$HOME/probe-shot.err"
+              screencapture -x "$HOME/probe-shot.png" 2>"$HOME/probe-shot.err" || true
+            fi
+            sleep 2
+          done
           echo "finished"
       - name: Close the relay
         if: always()

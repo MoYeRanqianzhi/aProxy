@@ -19,6 +19,7 @@ line on the wire.
 - [heartbeat](#heartbeat)
 - [notify](#notify)
 - [report](#report)
+- [control](#control): a separate process for calls from tools and extensions
 - [Delivery: forward and retry](#delivery-forward-and-retry)
 - [Errors, `required` and the circuit breaker](#errors-required-and-the-circuit-breaker)
 - [Security](#security)
@@ -45,8 +46,14 @@ line on the wire.
   secrets are replaced. Lines are cut at 8 KiB and limited to 50 per second per program.
 - **Lifetime.** Every process, in either mode, reads `hello` first. A `persistent` worker then
   answers messages until stdin reaches EOF and must exit on EOF (aProxy waits up to 2 seconds
-  before killing it). A `spawn` process gets `hello`, one stage message, then EOF. Both modes are
-  the same loop: read a line, write a line, until EOF. A partial line before EOF is not a frame.
+  before killing it). A `spawn` process gets `hello`, one stage message, then EOF; up to
+  `pool_max` such processes run at once. Both modes are the same loop: read a line, write a line,
+  until EOF. A partial line before EOF is not a frame.
+- **Restart without restarting the instance.** `aproxy restart <target> --format <name>` (or the
+  same request from the desktop window) starts fresh workers for an entry, using the configuration
+  the instance started with. Messages already sent finish on the old workers, which then get EOF;
+  new messages go to the new ones. A program that reads its own settings at startup picks up an
+  edit this way.
 
 ## hello
 
@@ -77,6 +84,7 @@ The shape of this line never changes, and its `v` is always 1.
 | `request_body` | no | Per stage, how much of the client's request body to send: `"none"`, `"digest"` or `"full"`. Only `request`, `retry`, `decide` and `notify` are read; other keys are ignored. Defaults: `full` for request and retry, `none` for decide and notify. `notify` cannot be `full`. An unknown value makes the hello reply invalid. |
 | `features` | yes | Features the program wants; a feature is active only when both sides list it. Protocol 1 defines `decide.success`. |
 | `name`, `version` | yes | The program's own name and version, shown in diagnostics. |
+| `control` | no | `{"args":[...]}`: offers a control process, started with these arguments instead of the configured ones ([control](#control)). At most 32 strings of up to 4096 bytes each; an empty list is allowed. A malformed offer makes the hello reply invalid. Omit it when the program offers no control. |
 
 About `request_body`:
 
@@ -405,6 +413,44 @@ the rest of the reply.
 Every action may carry a `label`. An unknown `type` is displayed by its `label`. Never put
 credentials, header values or body content in a report.
 
+## control
+
+A program that offers `control` in its hello reply can be called by tools that speak the instance
+protocol, typically a desktop extension paired with it. The methods and their meaning are yours;
+aProxy only carries the calls.
+
+- **A separate process.** On the first call, aProxy starts the same `command` in the same working
+  directory and environment, with the offered `args` in place of the configured ones. It is not a
+  request worker: it never receives request messages, does not count toward `pool_max`, and its
+  failures never touch the request breaker.
+- **Its hello** has `seq` 0, `process:"persistent"`, `stages:["control"]` and `worker_id`
+  4294967295. The reply must list `control` in `stages`.
+- **Calls and replies**, one per line, `seq` counting up from 1. `method` matches
+  `[A-Za-z0-9._-]{1,64}`; `params` is any JSON value, including null, at most 64 KiB serialized.
+  Reply with exactly one of `result` (any JSON value, including null) or `fail`:
+
+```json
+-> {"v":1,"seq":1,"stage":"control","method":"settings.read","params":null}
+<- {"v":1,"seq":1,"result":{"profile":"work"}}
+-> {"v":1,"seq":2,"stage":"control","method":"profile.use","params":{"name":"home"}}
+<- {"v":1,"seq":2,"fail":{"code":"unknown-profile","reason":"No profile named home"}}
+```
+
+- **`fail` is an answer, not an error**: the session continues and the caller receives your
+  `code` and `reason`. Use it for an unknown method too.
+- **One call at a time per entry**, with up to 16 waiting; the next caller is refused as busy.
+  Each call must finish within 5 seconds, counting the wait, the start and the hello. A timeout,
+  a wrong `seq`, an invalid or oversized reply (the limit is `limits.control`, 1 MiB) or an exit
+  ends that process; the next call starts a new one.
+- **Lifetime.** After 5 minutes without a call the process gets EOF. Restarting the entry or
+  stopping the instance retires it the same way.
+- **Redaction.** Before a reply reaches the caller, aProxy replaces the instance's known secrets
+  in string values, object keys and both strings of a `fail`. Still, do not return keys: the
+  caller may be an extension that shows or stores what it gets.
+- **Control does not reconfigure workers.** Request workers keep running with what they loaded.
+  If a call changes something they use, make them reread it (for example from a file), or have the
+  user restart the entry with `aproxy restart <target> --format <name>`.
+
 ## Delivery: forward and retry
 
 Every request has a delivery mode:
@@ -458,6 +504,10 @@ A **process-level failure** is: cannot start, I/O error, exit midway, timeout, p
 - After the cooldown one message is let through as a probe on a fresh worker. Success closes the
   breaker; failure reopens it for another cooldown.
 - Network failures never trip a breaker: an unreachable upstream is still retried forever.
+- Restarting the entry (`aproxy restart <target> --format <name>`) starts fresh workers with a
+  closed breaker and a zero failure count. If their hello fails, the entry behaves as after a
+  failed startup handshake: an optional entry is skipped, a required one answers 503
+  `format_unavailable` until a later restart or probe succeeds.
 - State is visible in `aproxy status --json` under `formats[]` (`breaker`, `notify_breaker`,
   `notify_dropped_total`).
 - With an optional judging program unavailable, requests follow the instance's default

@@ -1,6 +1,6 @@
 ---
 name: aproxy-format
-description: Write, test and configure format programs - the external programs aProxy runs on a request's way upstream and a response's way back (stages request, retry, decide, response, stream, heartbeat, notify of a [[format]] entry) - and use the official aproxy-format binary: roles convert, keys, route, policy, adaptive, rewrite, heartbeat; tools init, check, try, translate. Covers format protocol 1 frame by frame, spawn vs persistent workers, conversion between OpenAI Chat, OpenAI Responses and Anthropic Messages including streaming, key rotation, routing and failover by model, retry policy, and diagnosing failures a format causes. Use whenever a request must be rewritten, routed or re-keyed through aProxy, a response rewritten on its way back, or retry decisions customised, even if the user never says "format" - e.g. "convert Anthropic requests to OpenAI", "rotate between these three keys", "my format makes every request fail with 422". For aProxy commands and the rest of config.toml use the aproxy-cli skill.
+description: Write, test and configure format programs - the external programs aProxy runs on a request's way upstream and a response's way back (stages request, retry, decide, response, stream, heartbeat, notify of a [[format]] entry) - and use the official aproxy-format binary: roles convert, keys, route, policy, adaptive, rewrite, heartbeat; tools init, check, try, translate. Covers format protocol 1 frame by frame, spawn vs persistent workers, conversion between OpenAI Chat, OpenAI Responses and Anthropic Messages including streaming, key rotation, routing and failover by model, retry policy, restarting one format without restarting the instance, control methods a desktop extension can call, and diagnosing failures a format causes. Use whenever a request must be rewritten, routed or re-keyed through aProxy, a response rewritten on its way back, or retry decisions customised, even if the user never says "format" - e.g. "convert Anthropic requests to OpenAI", "rotate between these three keys", "my format makes every request fail with 422". For aProxy commands and the rest of config.toml use the aproxy-cli skill.
 ---
 
 # aProxy format programs
@@ -62,7 +62,11 @@ do not cover.
    plays aProxy's side, sends a realistic message for every stage the program declares and
    checks each reply against the protocol.
 5. **Configure it** as a `[[format]]` entry (keys in the aproxy-cli skill,
-   `references/latest/config-toml.md`), run `aproxy doctor`, and restart the instance.
+   `references/latest/config-toml.md`), run `aproxy doctor`, and restart the instance. Later
+   changes to the program itself only need `aproxy restart <port> --format <name>`, which keeps
+   the instance and its in-flight requests.
+6. **Optionally offer control methods** that a desktop extension can call, served by a separate
+   process (`control` in [references/protocol.md](references/protocol.md#control)).
 
 ## The rules that matter most, and why
 

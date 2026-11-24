@@ -610,14 +610,14 @@ worker_idle_secs = 0
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `name` | string | file stem of `command` | Identifies the program in `config show`, logs, status and the error body's `details.format`. Unique in the list, 1 to 64 bytes, no control characters. |
+| `name` | string | file stem of `command` | Identifies the program in `config show`, logs, status and the error body's `details.format`. Unique in the list, 1 to 64 bytes, no control characters. `all` is reserved (it selects every entry in `aproxy restart --format all`) and is rejected as a name, including one derived from `command`. |
 | `command` | string | required | The program, run directly and never through a shell. A leading `~` expands to the user's home directory; a relative path resolves against `<home>`; a bare name is looked up in `<home>/bin/` and then on `PATH` (the `PATH` in this entry's `env` if it sets one). On Windows a bare name without an extension means `<name>.exe`, and `.cmd` and `.bat` files are rejected: they only run through cmd.exe, and killing cmd.exe leaves the real program alive. To run a script, put the interpreter in `command` and the script in `args`. |
 | `args` | array of strings | `[]` | Arguments, passed verbatim (no `~` expansion). The worker's working directory is `<home>`, so a relative path in `args` resolves there. |
 | `env` | table of strings | `{}` | Extra environment variables for the program; the place for secrets. `config show` lists the names only, never the values. |
 | `process` | `"spawn"` \| `"persistent"` | `"spawn"` | `spawn`: a new process per message. `persistent`: a pool of long-running workers. Required for `stream` and `notify`, and for any program that keeps state between requests. |
 | `stages` | array of strings | required, non-empty | Which stages this program serves (below). |
 | `required` | boolean | `true` | What happens when the program itself breaks (crash, timeout, invalid reply, open breaker) at the `request` or `retry` stage: a required program fails the attempt, an optional one is skipped. It does not affect a deliberate `fail` reply, which is always obeyed. |
-| `pool_max` | integer | `4` | Most pooled workers in `persistent` mode; further messages queue. `0` is rejected. Workers that own a stream in progress are not counted, so the process count can reach `pool_max` plus the number of concurrent streams. Use `1` for a program whose in-memory state must be shared by all requests. |
+| `pool_max` | integer | `4` | Most pooled workers in `persistent` mode, and most `spawn` processes handling messages at once; further messages queue. `0` is rejected. Workers that own a stream in progress are not counted, so the process count can reach `pool_max` plus the number of concurrent streams. Use `1` for a program whose in-memory state must be shared by all requests. |
 | `worker_idle_secs` | integer | `300` | A `persistent` worker idle this long is stopped. `0` = never; use it together with `pool_max = 1` when losing the state would matter. |
 | `timeout_secs` | integer | `30` | Time limit for one reply. `0` = none. A worker that times out is killed and replaced. Not used for `decide` and `notify`. |
 | `decide_timeout_secs` | integer | `2` | Time limit for a `decide` reply. A late answer counts as "no opinion"; a decision program never ends a request by being slow. |

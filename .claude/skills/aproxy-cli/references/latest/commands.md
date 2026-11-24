@@ -424,6 +424,7 @@ asking.
 ```
 aproxy restart [PORT|ALIAS|PATH|default|all] [--force] [--json]
 aproxy restart idle [--idle-threshold-secs SECS] [--force] [--json]
+aproxy restart [PORT|ALIAS|PATH|default|all|idle] --format all|NAME... [--json]
 ```
 
 Restarts running instances from their launch specs, which is how config.toml edits take effect.
@@ -467,6 +468,36 @@ your connection to the model.
   `restore` can still bring the instance back if the new one fails. The watchdog may respawn it
   first; both use the same launch spec, and a new instance that finds the port already taken by the
   same config is treated as a success.
+
+### Restarting only the format programs
+
+`--format` replaces the processes of selected `[[format]]` entries and leaves the instance itself
+running. Use it after editing a format program's own files (a role file of `aproxy-format`, a
+script, its settings) or to clear an open breaker. Nothing else about the instance changes, so it
+is the gentle option when the instance carries your own session.
+
+- `--format all` selects every entry of each target instance; repeat `--format NAME` for a subset
+  (entry names from `[[format]].name`, case-sensitive). `all` cannot be mixed with names, and
+  `--format` cannot be combined with `--force` or `--idle-threshold-secs`; those are usage errors
+  (exit 2): `请单独使用 --format all，或指定一个或多个 format 条目名。`
+- **config.toml is not reread.** Each new process starts from the configuration the instance was
+  started with, and the output ends with `未重读 config.toml；修改 [[format]] 条目须重启实例。`
+  ("config.toml was not reloaded; restart the instance to change a [[format]] entry"). Adding,
+  removing or editing a `[[format]]` entry still needs a full `restart`.
+- **Nothing in flight is cut.** Requests and streams already being handled finish on the old
+  processes; later requests go to the new ones. A replacement starts with a closed breaker.
+- Per entry it prints `端口 <port>：已重启 format <name>（<program> <version>）。` or
+  `端口 <port>：format <name> 握手失败：<reason>。`, where reason is a fault kind such as `spawn`,
+  `timeout` or `invalid_output`. After a failed handshake the instance keeps running: an optional
+  entry is skipped, a required one makes requests fail with `format_unavailable` until a later
+  restart succeeds. Fix the program and run the same command again.
+- An unknown entry name refuses the whole selection before anything changes. An instance started by
+  an older aproxy prints `端口 <port>：此实例不支持单独重启 format。`; restart that instance fully
+  once.
+- Exit codes count entries: 0 all restarted, 1 only failures, 5 a mix, 2 for a bad selection;
+  target resolution keeps its usual codes. With `--json`, stdout is one document with an item per
+  entry (`target`, `port`, `outcome` `restarted` / `handshake-failed` / `failed`, `name`,
+  `program`, `version` or `reason`, `configReloaded: false`) and a `summary` of `ok` and `failed`.
 
 ## logs
 

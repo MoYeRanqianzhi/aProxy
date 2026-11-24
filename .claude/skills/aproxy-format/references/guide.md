@@ -45,7 +45,7 @@ and breaker, so a slow or broken one does not take the other down.
 
 | | `process = "spawn"` (default) | `process = "persistent"` |
 |---|---|---|
-| Lifetime | A new process per message: hello, one message, EOF | Workers answer messages until EOF; up to `pool_max` (default 4) run at once |
+| Lifetime | A new process per message: hello, one message, EOF; up to `pool_max` (default 4) at once | Workers answer messages until EOF; up to `pool_max` (default 4) run at once |
 | Cost | Process start plus handshake on every message | One handshake per worker |
 | Stages | All except `stream` and `notify` | All |
 | Memory between messages | None | Per worker; see below |
@@ -328,8 +328,26 @@ stages = ["request", "retry"]
 - Tuning keys: `pool_max` (4), `worker_idle_secs` (300; 0 = never retire), `timeout_secs` (30),
   `decide_timeout_secs` (2), `breaker_failures` (5; 0 = no breaker), `breaker_cooldown_secs`
   (30). The full table is in the aproxy-cli skill, `references/latest/config-toml.md`.
-- After editing, run `aproxy doctor` to validate the file, then restart the instance; a format
-  chain is fixed for the life of an instance. A restart cuts the connections going through that
-  instance, so pick a quiet moment.
+- After editing a `[[format]]` entry, run `aproxy doctor` to validate the file, then restart the
+  instance; the chain is fixed for the life of an instance. A restart cuts the connections going
+  through that instance, so pick a quiet moment.
+- After changing only the program or its own files (a script, a role file, its settings), run
+  `aproxy restart <port|alias> --format <name>` instead: the instance stays up, requests in flight
+  finish on the old processes, and new ones reach a fresh process. config.toml is not reread. A
+  program that loads its settings once at startup needs exactly this after each edit.
 - Watch it work with `aproxy logs <port|alias>`: your stderr lines carry the prefix
   `format[<name>]`, and breaker changes are logged as warnings.
+
+## Offer a control interface
+
+A desktop extension (or another tool speaking the instance protocol) can call methods you define
+on your program: read its settings, change them, ask for its state. Offer it by adding
+`"control":{"args":[...]}` to the hello reply. When the first call arrives, aProxy starts a separate
+process of the same executable with those arguments instead of the configured ones and sends it
+`stage:"control"` messages. That process never sees requests, and request workers never see
+control calls, so a slow call cannot hold up traffic.
+
+Control changes nothing by itself. If a call changes settings that request workers read, decide
+how they learn about it: write a file the workers reread, or tell the user to run
+`aproxy restart <port> --format <name>`. The frames, limits and failure handling are in
+[protocol.md](protocol.md#control).

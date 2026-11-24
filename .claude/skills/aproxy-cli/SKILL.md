@@ -88,6 +88,10 @@ Every other client, the reasoning behind the timeouts, and how to verify the set
   from its launch spec. It does not start an instance that is not running; use `start`. If the new
   instance fails to come up, the desired-state record is still there: fix the cause and run
   `aproxy restore` (the watchdog also retries).
+- `aproxy restart PORT|ALIAS --format NAME` (or `--format all`) restarts only those format programs
+  and keeps the instance and its in-flight requests. Prefer it when only a program or its own files
+  changed; it does not reread config.toml, so a changed `[[format]]` entry still needs a full
+  restart.
 - A background instance keeps a desired-state record under `<home>/run/`. Only `stop` deletes it,
   so a crash, a kill, a reboot or a failed restart can be recovered with `aproxy restore` or by the
   watchdog. `stop` on an instance that already crashed deletes its record. Secrets given to `start`

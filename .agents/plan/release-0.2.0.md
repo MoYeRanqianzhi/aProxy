@@ -1313,3 +1313,13 @@
     里的表现，归页面一侧。
 - **W7 — explicit settings/config migration after a 0.1.x reinstall.** `aproxy migrate --dry-run` previews the documented key moves; `aproxy migrate` backs up and validates each rewritten file. Current files, unrelated unknown keys and choices about formats or unbound credentials are not rewritten. Normal readers remain strict; legacy-file diagnostics point to preview rather than running it. With explicit paths, only those configurations are targeted; without paths, discovery uses aliases, the default config, declared directories and the home itself. Desired-state records and running instances are not migrated.
   - **Verification:** The mixed-home CLI test checks byte-identical preview and originals, a real port-0 start/stop with the migrated alias, partial success and an idempotent rerun. See [the validation boundary](../memory/migration-validation-boundary.md).
+- **W8 — native macOS process support.** Supersedes the investigation baseline above. The watchdog, startup
+  waiter and installer distinguish a dead-but-unreaped process from a live one. Installation jurisdiction and
+  force-install stray reporting can read native executable paths; the frozen ledger and the rule that strays
+  are never killed are unchanged. See [Darwin exit evidence](../memory/darwin-exit-evidence.md).
+  - **Verified on arm64 macOS:** both workspace variants passed (1,312 passed, 0 failed, 12 ignored each),
+    as did both all-target Clippy gates. `--adopt` moved an outside instance into `bin/`, force-install restored
+    two instances and left an unregistered executable alive, and a mismatched marker protected a suspended process.
+  - **Other platforms:** both Windows suites passed (1,313 passed, 0 failed, 11 ignored each), as did desktop
+    and headless Clippy and the Linux cross-check. The unchanged force-install contract was also run on native Linux.
+  - **Boundary:** workflow changes are proposals, not evidence of a hosted CI gate or an interactive desktop test.

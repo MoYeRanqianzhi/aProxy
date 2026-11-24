@@ -7,6 +7,8 @@
 实测（排查分支 `probe/macos`，计划见 release-0.2.0 的 W8）。下文的现状与行号是 2026-09 的，0.2.0 已改了
 不少（登记表已有 macOS 实现，当年 3 个 lib 测试已通过），引用前先对照当前代码。
 
+Implementation status: the `/dev/shm` and `/proc` limitations described below are historical. See the W8 progress entry in the release plan and [[darwin-exit-evidence]] for the verified process behavior. Native runner tests are separate from CI workflow adoption and interactive window acceptance.
+
 ## 决定
 
 **macOS 支持是必须项，不是可选项。** 对外承诺已经存在：README 安装引导

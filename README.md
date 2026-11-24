@@ -189,7 +189,7 @@ Codex 的 `stream_idle_timeout_ms` 默认 300000（5 分钟），按 SSE 事件�
 | `aproxy start --foreground` | 前台运行（日志走控制台，Ctrl+C 停止） |
 | `aproxy status` | 列出 home 里的实例与看护者：运行中、无响应、等待恢复的实例与读不懂的记录分块列出；`--idle`/`--busy` 只筛运行中的实例 |
 | `aproxy stop [PORT\|all\|别名]` | 停止实例；多实例必须指定端口、`all` 或别名；`--force` 立即强杀（不会被看门狗复活）；目标已崩溃时删掉它留下的期望状态记录 |
-| `aproxy restart [PORT\|all\|别名]` | 重启运行中的实例（只重启不启动；改配置生效用）；停旧实例前先预检新配置，不通过则旧实例保持运行；失败时记录保留，`restore` 或看门狗可拉回；`--force` 立即强杀重启 |
+| `aproxy restart [PORT\|all\|别名]` | 重启运行中的实例（只重启不启动；改配置生效用）；停旧实例前先预检新配置，不通过则旧实例保持运行；失败时记录保留，`restore` 或看门狗可拉回；`--force` 立即强杀重启；`--format all\|<名字>` 只重启 format 程序，实例与在途请求不受影响 |
 | `aproxy logs [PORT\|别名]` | 打印实例日志最近 200 行后退出；`-n N` 改行数，`-f` 持续跟随；不支持 `all` |
 | `aproxy restore` | 恢复崩溃/重启前在运行的实例（按期望状态记录）；配置文件暂时找不到时保留记录并说明；无实例则静默结束（开机自启友好） |
 | `aproxy alias add\|remove\|list` | 管理配置别名（存于 settings.json） |
@@ -198,15 +198,16 @@ Codex 的 `stream_idle_timeout_ms` 默认 300000（5 分钟），按 SSE 事件�
 | `aproxy config show\|get\|set\|unset` | 查看或修改配置：`show` 打印文件里写的值，`--effective` 连全局默认与内置默认一起打印并注明来源；`set`/`unset` 每次改一个键 |
 | `aproxy settings show\|get\|set\|unset` | 查看或修改全局设置（`~/.aproxy/settings.json`）：别名、`defaults` 全局默认、看护者、日志、安装更新；settings.json 有错误时也能用，用来修复它 |
 | `aproxy install [版本]` | 安装或升级（别名 `upgrade`），逐实例滚动重启，动第一个实例之前先预检；`--check` 只查询有没有新版本，`--variant` 换变体，`--force` 强制安装；见「入门」里的升级说明 |
-| `aproxy desktop` | 打开桌面界面（预览版，显示的是演示数据，见下） |
+| `aproxy desktop` | 打开桌面界面（见下） |
 
 `start` 的参数：`<别名|路径>` 或 `--config <PATH>`（指定配置文件，多开用；两者等价）、`--listen-addr <ADDR>`、`--base-url <URL>`、`--proxy <URL>`、`--api-key <KEY|->`（只记录进这次启动的拉起规格，`restart`/`restore` 沿用，不写进 config.toml；`-` 表示从 stdin 读一行）、`--log-file <PATH>`、`--foreground`。不带命令的 `aproxy` 只打印帮助并以退出码 2 结束。
 
-## 桌面界面（预览）
+## 桌面界面
 
-`aproxy desktop` 打开桌面界面。它是一个独立的窗口进程，关掉窗口就退出。窗口本身不启停、不改动任何实例；和其余 aproxy 命令一样，它发现上次的安装没做完时会在后台把安装续完，续作可能逐个重启实例。
+`aproxy desktop` 打开桌面界面。它是一个独立的窗口进程，关掉窗口就退出，实例照常运行，与窗口开没开无关。和其余 aproxy 命令一样，它发现上次的安装没做完时会在后台把安装续完，续作可能逐个重启实例。
 
-- **0.2.0 各 alpha 版的界面是预览版**：里面的实例、请求日志与统计都是演示数据，不是这台电脑上正在运行的 aProxy，界面顶部常驻「预览版 · 演示数据」标签。真实数据在之后的版本接入，在那之前以 `aproxy status`、`aproxy logs` 为准。界面偏好（主题、语言、Mica 开关）这个版本也不保存：关掉窗口再打开，恢复默认。
+- **能做什么**：总览这个 home 下的全部实例（状态、在途请求、重试与救回、近一小时的走势）；查看请求日志与单条请求的详情（请求与响应的正文、每次尝试为什么失败，密钥已打码），把要留着的请求固定下来；启动、停止、重启实例，或只重启某个 format 程序；编辑配置（保存前按 `start` 的规则检查，重启实例后生效）；开关看护者与开机自启；检查并安装更新；切换语言、深浅色、Mica 与吉祥物。界面偏好存在 `~/.aproxy/desktop/desktop.toml`。
+- **主题与扩展**：在设置页可以装主题包（换颜色，可以带样式表、图片与字体）与扩展包（在窗口里运行的 JavaScript，可以加页面与面板、读写实例与配置）。包只从本地装：选一个 .zip 文件，或把 .zip 与解开的目录拖进窗口。扩展不在沙箱里，能做窗口能做的一切，所以安装之前窗口会把适用的风险逐条讲清（闭源、与 GitHub release 的摘要对不上、仓库星数很少、核对不了），每一条都要你确认。拿不准时，先让你的 agent 用随 aProxy 发布的审查 skill（`aproxy-audit-extension`、`aproxy-audit-theme`）审一遍。
 - Windows 需要 Microsoft Edge WebView2 运行时（Windows 11 自带，Windows 10 没有时按提示安装）。从终端运行时命令立即返回，窗口独立运行。
 - Linux 需要图形会话与 WebKitGTK 4.1（2.40 或更新）。带界面的版本动态链接 WebKitGTK，缺这些库时整个程序都起不来（连 `aproxy --version` 也不行），没有图形界面的机器请用无界面的 headless 版本——一键安装脚本与 `aproxy install` 在缺库的机器上会自动装它；musl 构建只有 headless 版本。
 - macOS 的带界面版本只保证编得过，窗口未经真机验证（和整个 macOS 支持一样，见「平台支持」）。

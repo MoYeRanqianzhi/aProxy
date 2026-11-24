@@ -364,7 +364,7 @@ timeout (for Claude Code, `API_TIMEOUT_MS`).
 | `aproxy start --foreground` | Run in the foreground (logs to console, Ctrl+C to stop) |
 | `aproxy status` | List the home's instances and watchdog: running, unresponsive and waiting-to-be-restored instances and unreadable records, each in its own block; `--idle`/`--busy` filter the running ones |
 | `aproxy stop [PORT\|all\|alias]` | Stop instances; multi-instance requires a port, `all`, or an alias; `--force` kills instantly (the watchdog will not revive it); a target that already crashed has its desired-state record deleted |
-| `aproxy restart [PORT\|all\|alias]` | Restart running instances (restart-only, never starts); the new config is pre-checked before the old instance is stopped, and a failed check leaves it running; a failed start keeps the record, so `restore` or the watchdog can bring it back; `--force` kills instantly |
+| `aproxy restart [PORT\|all\|alias]` | Restart running instances (restart-only, never starts); the new config is pre-checked before the old instance is stopped, and a failed check leaves it running; a failed start keeps the record, so `restore` or the watchdog can bring it back; `--force` kills instantly; `--format all\|<name>` restarts only format programs, leaving the instance and its in-flight requests alone |
 | `aproxy logs [PORT\|ALIAS]` | Print the instance's most recent 200 log lines and exit; `-n N` sets the count, `-f` keeps following; `all` not supported |
 | `aproxy restore` | Revive instances from their desired-state records; a temporarily missing config file keeps the record and is reported; exits silently if none |
 | `aproxy alias add\|remove\|list` | Manage config aliases (stored in settings.json) |
@@ -373,7 +373,7 @@ timeout (for Claude Code, `API_TIMEOUT_MS`).
 | `aproxy config show\|get\|set\|unset` | View or modify the config: `show` prints the values written in the file, `--effective` adds the global and built-in defaults with each value's source; `set`/`unset` change one key per command |
 | `aproxy settings show\|get\|set\|unset` | View or modify the global settings (`~/.aproxy/settings.json`): aliases, `defaults` global defaults, watchdog, logs, install updates; works even when settings.json has errors, to repair it |
 | `aproxy install [VERSION]` | Install or upgrade (alias `upgrade`), rolling-restarting instances after a precheck of each; `--check` only looks for a newer version, `--variant` switches the build, `--force` forces an install; see the upgrade notes under Getting started |
-| `aproxy desktop` | Open the desktop window (a preview showing demo data; see below) |
+| `aproxy desktop` | Open the desktop window (see below) |
 
 `start` options: `<alias|path>` or `--config <PATH>` (the same thing;
 multi-instance), `--listen-addr <ADDR>`, `--base-url <URL>`,
@@ -382,18 +382,30 @@ multi-instance), `--listen-addr <ADDR>`, `--base-url <URL>`,
 `--log-file <PATH>`, `--foreground`. A bare `aproxy` with no command only prints the
 help and exits 2.
 
-## Desktop window (preview)
+## Desktop window
 
 `aproxy desktop` opens the desktop window. It is a separate process that exits when its window is
-closed. The window itself starts, stops and changes no instance; like every other aproxy command,
+closed; instances keep running whether the window is open or not. Like every other aproxy command,
 it resumes an interrupted install in the background when it finds one, and finishing that install
 may restart instances one at a time.
 
-- **In the 0.2.0 alpha releases the window is a preview**: the instances, request logs and statistics in it
-  are demo data, not the aProxy running on your computer, and a "Preview · demo data" label stays
-  at the top of the window. Real data comes in a later version; until then `aproxy status` and
-  `aproxy logs` are the source of truth. Interface preferences (theme, language, the Mica switch)
-  are not saved in this version either: a reopened window starts with the defaults.
+- **What it does**: an overview of every instance in the home (state, requests in flight, retries
+  and rescues, the last hour at a glance); the request log and each request's details (request and
+  response bodies, why each attempt failed, with keys redacted), with pins for the requests you
+  want to keep; starting, stopping and restarting instances, or restarting just one format
+  program; editing configs (checked by the rules `start` applies before saving, applied by
+  restarting the instance); the watchdog and start-at-login switches; checking for and installing
+  updates; language, light and dark, Mica and mascots. Window preferences are kept in
+  `~/.aproxy/desktop/desktop.toml`.
+- **Themes and extensions**: the settings page installs theme packages (colors, optionally a
+  stylesheet with images and fonts) and extension packages (JavaScript that runs in the window and
+  can add pages and panels and read and change instances and configs). Packages come only from
+  your machine: choose a .zip file, or drag a .zip or an unpacked folder into the window.
+  Extensions are not sandboxed and can do anything the window can, so before installing, the
+  window explains each risk that applies (closed source, a digest that does not match the GitHub
+  release, a repository with few stars, nothing to check against) and asks you to confirm each one.
+  When in doubt, have your agent review the package first with the audit skills that ship with
+  aProxy (`aproxy-audit-extension`, `aproxy-audit-theme`).
 - Windows needs the Microsoft Edge WebView2 runtime (built into Windows 11; on Windows 10, install
   it when told to). Run from a terminal, the command returns at once and the window runs on its
   own.

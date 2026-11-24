@@ -1088,16 +1088,34 @@
   }
   .ch-head {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 8px;
     margin-bottom: 8px;
   }
+  /* format 的名字是用户在 config.toml 里起的，可能很长：放不下时在任意处折行，不撑宽抽屉 */
   .field {
+    min-width: 0;
     font-weight: 600;
+    overflow-wrap: anywhere;
   }
+  /* 每个动作一条胶囊。动作文字可能很长（「走渠道 …，模型 … → …」带完整的模型名），
+     窄窗口下抽屉只有三百多像素：列宽写成 minmax(0, 1fr) 不让最长的一条撑开，
+     胶囊本身也改成可以折行（取消全局 .chip 的单行与固定高度），长模型名在任意处断开 */
   .ch-body {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 5px;
+  }
+  .ch-body .chip {
+    justify-self: start;
+    max-width: 100%;
+    height: auto;
+    min-height: 24px;
+    padding-block: 4px;
+    line-height: 1.35;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   /* format 的报告摘要：来自 format 程序的文字，只当纯文本显示 */

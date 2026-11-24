@@ -58,7 +58,8 @@ public static class W {
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int a, out RECT r, int s);
-  [DllImport("dwmapi.dll", EntryPoint = "DwmGetWindowAttribute")] public static extern int DwmGetInt(IntPtr h, int a, out int v, int s);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, int flags, IntPtr extra);
   public struct RECT { public int L, T, R, B; }
 }
 "@
@@ -67,19 +68,19 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
 $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
 $g = [System.Drawing.Graphics]::FromImage($bmp)
-$g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
-$bmp.Save($args[0], [System.Drawing.Imaging.ImageFormat]::Png)
 # 从共享控制台启动时 aproxy desktop 会另起一个独立进程再退出（src/commands/desktop.rs），
 # 所以按「有主窗口的 aproxy 进程」找，而不是用启动的那个 pid
 $p = Get-Process aproxy | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+# 先把窗口切到前台再截：从后台进程调用 SetForegroundWindow 会被前台锁挡住，先按一下 Alt 就放行
+[W]::keybd_event(0x12, 0, 0, [IntPtr]::Zero)
+[W]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
+[W]::keybd_event(0x12, 0, 2, [IntPtr]::Zero)
+Start-Sleep -Milliseconds 800
+$g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+$bmp.Save($args[0], [System.Drawing.Imaging.ImageFormat]::Png)
 $r = New-Object W+RECT
 # DWMWA_EXTENDED_FRAME_BOUNDS = 9：不含不可见的缩放边
 [W]::DwmGetWindowAttribute($p.MainWindowHandle, 9, [ref]$r, 16) | Out-Null
-# 页面经 set_caption_color 交给 DWM 的按钮底色（DWMWA_CAPTION_COLOR = 35，COLORREF 0x00BBGGRR），
-# 用来核对深色场景下按钮区有没有跟着页面变深
-$c = 0
-$hr = [W]::DwmGetInt($p.MainWindowHandle, 35, [ref]$c, 4)
-"caption color: hr=$hr colorref=0x{0:x8}" -f $c
 "$($r.L),$($r.T),$($r.R),$($r.B)"
 """
     script = os.path.join(OUT, "shot.ps1")

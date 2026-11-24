@@ -51,13 +51,17 @@ jobs:
           npm run build
       - name: Windows screen resolution
         if: matrix.name == 'windows'
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File .github/screenshots/resolution.ps1
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .github/screenshots/resolution.ps1
+          powershell -NoProfile -ExecutionPolicy Bypass -File .github/screenshots/clear-desktop.ps1
       - run: cargo build --locked --bins
       - run: python -m pip install --quiet pillow
       - name: Shoot (Windows, macOS)
         if: matrix.name != 'linux'
         shell: bash
         run: |
+          # 首次登录体验的向导可能在构建期间又弹出来：开拍前再清一次
+          if [ "${{ matrix.name }}" = windows ]; then powershell -NoProfile -ExecutionPolicy Bypass -File .github/screenshots/clear-desktop.ps1; fi
           for scene in "en light" "en dark" "zh-CN light"; do
             set -- $scene
             python .github/screenshots/scene.py "${{ matrix.exe }}" "shots/${{ matrix.name }}-$1-$2" "$1" "$2" || true

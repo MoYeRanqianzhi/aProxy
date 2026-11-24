@@ -126,6 +126,13 @@
    - 续原会话时中转接口报 `session_account_lost`，一行没改；改派新会话 **t10d-review-fixes**（2026-11-24，任务书
      `.agents/codex.local/t10d-review-fixes.md`，回执 `t10d-review-fixes.receipt.md`，分支 `codex/t10d-review-fixes`，
      起点 master `945718cc`），任务就是 t10c 的 Revision 2。
+   - t10d 结果（2026-11-24）：19 条都改了、有测试钉住，四个提交（`e49f0d97`..`8c82832c`）；Gate F 只差生成的
+     `docs/error-codes.md`（`invalid_state` 多了可选的 `details.reason`）。Revision 1 允许它只重生成这一个文件，
+     并顺带修 CI 上的两个失败：macOS 上 `tests/desktop_packages.rs:534`（代理指向绑定未监听的端口，macOS 不返回
+     `Network`，从 ba8e4d35 起 macOS 一直红）和 ubuntu 上 `format_protocol` 的端口竞争（`free_port()` 先挑后放，
+     改成端口 0 加 `start --json` 读实际端口）。
+   - 之后依次：**t13-migrate**（`aproxy migrate`，任务书已写好）、**t14-english-text**（审查 v26 的英文文案，49 条，
+     裁定写在任务书第 2 节：记录统一叫 desired-state record，launch spec 不改，因为 README 与 skill 都这么叫）。
 9a. **随 t10b 顺带**：`cargo update -p url`（到 ≥2.5.9）。RUSTSEC-2026-0592（`Url::origin()` 对嵌套
    `blob:` 递归、栈溢出），2026-11-22 起 main 的 Review 工作流（cargo-deny）因此失败；aproxy-format 的 convert/keys/route
    对配置与上游地址调用 `origin()`，都不是客户端给的输入，风险低。只动 Cargo.lock，验收是 cargo-deny 过、两个变体全量过。

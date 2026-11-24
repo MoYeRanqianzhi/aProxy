@@ -1,7 +1,8 @@
 """README 截图的场景：用桌面窗口的演示数据（APROXY_DESKTOP_DEMO，与浏览器里预览时同一套）打开窗口，
 预设界面语言与深浅色，截全屏并按窗口裁出来。窗口外壳是真的（标题栏、交通灯、原生按钮），数据是演示的。
 
-用法：python scene.py <aproxy 可执行文件> <输出目录> <lang: en|zh-CN> <mode: light|dark>
+用法：python scene.py <aproxy 可执行文件> <输出目录> <lang: en|zh-CN> <mode: light|dark> [场景名]
+场景名见 aproxy-desktop/ui/src/lib/backend/demo/scenes.ts（overview、log-format、palette……），不给就是总览。
 只用标准库起场景；截屏与裁剪用各平台自带的工具加 Pillow（工作流里 pip 装）。临时 home，不碰 ~/.aproxy。
 """
 
@@ -13,11 +14,12 @@ import tempfile
 import time
 
 AP, OUT, LANG, MODE = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+SCENE = sys.argv[5] if len(sys.argv) > 5 else "overview"
 os.makedirs(OUT, exist_ok=True)
 SYSTEM = platform.system()
 
 home = tempfile.mkdtemp(prefix="aproxy-shots-")
-env = dict(os.environ, APROXY_HOME=home, APROXY_LANG="en", APROXY_DESKTOP_DEMO=f"{LANG},{MODE}")
+env = dict(os.environ, APROXY_HOME=home, APROXY_LANG="en", APROXY_DESKTOP_DEMO=f"{LANG},{MODE},scene={SCENE}")
 
 
 def run(*args):

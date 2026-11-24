@@ -27,7 +27,10 @@ jobs:
           - { os: macos-latest, name: macos, exe: target/debug/aproxy }
           - { os: ubuntu-24.04, name: linux, exe: target/debug/aproxy }
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 120
+    env:
+      # 场景名与 aproxy-desktop/ui/src/lib/backend/demo/scenes.ts 的表一一对应；每个场景截英文浅色、英文深色、中文浅色
+      SCENES: overview overview-lower instance instance-restore logs log-detail log-request log-response log-format config update settings settings-packages pulse palette start-menu empty
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -62,9 +65,11 @@ jobs:
         run: |
           # 首次登录体验的向导可能在构建期间又弹出来：开拍前再清一次
           if [ "${{ matrix.name }}" = windows ]; then powershell -NoProfile -ExecutionPolicy Bypass -File .github/screenshots/clear-desktop.ps1; fi
-          for scene in "en light" "en dark" "zh-CN light"; do
-            set -- $scene
-            python .github/screenshots/scene.py "${{ matrix.exe }}" "shots/${{ matrix.name }}-$1-$2" "$1" "$2" || true
+          for scene in $SCENES; do
+            for v in "en light" "en dark" "zh-CN light"; do
+              set -- $v
+              python .github/screenshots/scene.py "${{ matrix.exe }}" "shots/${{ matrix.name }}/$scene-$1-$2" "$1" "$2" "$scene" || true
+            done
           done
       - name: Shoot (Linux)
         if: matrix.name == 'linux'
@@ -74,9 +79,11 @@ jobs:
           export DISPLAY=:99
           openbox &
           sleep 1
-          for scene in "en light" "en dark" "zh-CN light"; do
-            set -- $scene
-            dbus-run-session -- python .github/screenshots/scene.py "${{ matrix.exe }}" "shots/${{ matrix.name }}-$1-$2" "$1" "$2" || true
+          for scene in $SCENES; do
+            for v in "en light" "en dark" "zh-CN light"; do
+              set -- $v
+              dbus-run-session -- python .github/screenshots/scene.py "${{ matrix.exe }}" "shots/${{ matrix.name }}/$scene-$1-$2" "$1" "$2" "$scene" || true
+            done
           done
       # Linux 的标题栏是页面画的（没有窗口管理器的装饰）：用 xdotool 实际拖动、双击、点按钮、改大小，读回结果
       - name: Check the Linux title bar
@@ -84,6 +91,22 @@ jobs:
         run: |
           export DISPLAY=:99
           dbus-run-session -- python .github/screenshots/linux-titlebar.py "${{ matrix.exe }}" shots/linux-titlebar
+      # 图集只要裁好的窗口图，按「场景-语言-深浅色.png」平铺；全屏截图与日志另放一份，排查时用
+      - name: Collect the gallery
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p gallery/${{ matrix.name }}
+          for d in shots/${{ matrix.name }}/*/; do
+            [ -f "$d/window.png" ] && cp "$d/window.png" "gallery/${{ matrix.name }}/$(basename "$d").png"
+          done
+          ls gallery/${{ matrix.name }} | wc -l
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: gallery-${{ matrix.name }}
+          path: gallery/
+          retention-days: 7
       - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:

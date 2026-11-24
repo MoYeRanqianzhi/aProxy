@@ -62,8 +62,7 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] **W7 发布 0.2.0**。另外两件：
   - 撤回预发布期的措辞（`--pre` / `@next` / `--version`、「目前只有预发布」）。2026-10-13 文档终审列的位置：README.md 31、60–63，
     README_EN.md 81、135–142、183，docs/INSTALL_AGENT.md 54–58、156，compatibility.md 步骤 3，CHANGELOG.md 24；
-    「演示数据、预览版」的说法已在 2026-11-24 随真实数据改掉（README、architecture、aproxy-cli skill）；
-    aproxy-format 的 guide.md 里 envelope 钉 `=0.2.0-alpha.1` 的要改回 `"0.2"`。行号会漂，按内容找。
+    「演示数据、预览版」的说法已在 2026-11-24 随真实数据改掉（README、architecture、aproxy-cli skill）。行号会漂，按内容找。
   - **0.1.x 的 settings.json 怎么过渡**（B3 留下，rc.1 之前要定并做完）：0.2.0 只认分节的新形状，0.1.x 的平铺文件会让
     多数命令以退出码 3 结束。现在只有技能 compatibility.md 里的手工对照表。倾向：`install` 换版时把平铺文件迁成新形状
     （原文件留备份），并让 `upgrade_from_0_1_0` 的 CI 测试在升级后跑一条要读 settings 的命令。见计划 B3 记录第 4 条。

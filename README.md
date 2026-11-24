@@ -207,7 +207,7 @@ Codex 的 `stream_idle_timeout_ms` 默认 300000（5 分钟），按 SSE 事件�
 `aproxy desktop` 打开桌面界面。它是一个独立的窗口进程，关掉窗口就退出，实例照常运行，与窗口开没开无关。和其余 aproxy 命令一样，它发现上次的安装没做完时会在后台把安装续完，续作可能逐个重启实例。
 
 - **能做什么**：总览这个 home 下的全部实例（状态、在途请求、重试与救回、近一小时的走势）；查看请求日志与单条请求的详情（请求与响应的正文、每次尝试为什么失败，密钥已打码），把要留着的请求固定下来；启动、停止、重启实例，或只重启某个 format 程序；编辑配置（保存前按 `start` 的规则检查，重启实例后生效）；开关看护者与开机自启；检查并安装更新；切换语言、深浅色、Mica 与吉祥物。界面偏好存在 `~/.aproxy/desktop/desktop.toml`。
-- **主题与扩展**：在设置页可以装主题包（换颜色，可以带样式表、图片与字体）与扩展包（在窗口里运行的 JavaScript，可以加页面与面板、读写实例与配置）。包只从本地装：选一个 .zip 文件，或把 .zip 与解开的目录拖进窗口。扩展不在沙箱里，能做窗口能做的一切，所以安装之前窗口会把适用的风险逐条讲清（闭源、与 GitHub release 的摘要对不上、仓库星数很少、核对不了），每一条都要你确认。拿不准时，先让你的 agent 用随 aProxy 发布的审查 skill（`aproxy-audit-extension`、`aproxy-audit-theme`）审一遍。
+- **主题与扩展**：在设置页可以装主题包（换颜色，可以带样式表、图片与字体）与扩展包（在窗口里运行的 JavaScript，可以加页面与面板、读写实例与配置）。包只从本地装：选一个 .zip 文件，或把 .zip 与解开的目录拖进窗口。扩展不在沙箱里，能做窗口能做的一切，所以安装之前窗口会把适用的风险逐条讲清（闭源、与 GitHub release 的摘要对不上、仓库星数很少、核对不了），每一条都要你确认。拿不准时，先让你的 agent 用随 aProxy 发布的审查 skill（`aproxy-audit-extension`、`aproxy-audit-theme`）审一遍。自己写主题或扩展：见 [docs/extensions.md](docs/extensions.md)（英文）。
 - Windows 需要 Microsoft Edge WebView2 运行时（Windows 11 自带，Windows 10 没有时按提示安装）。从终端运行时命令立即返回，窗口独立运行。
 - Linux 需要图形会话与 WebKitGTK 4.1（2.40 或更新）。带界面的版本动态链接 WebKitGTK，缺这些库时整个程序都起不来（连 `aproxy --version` 也不行），没有图形界面的机器请用无界面的 headless 版本——一键安装脚本与 `aproxy install` 在缺库的机器上会自动装它；musl 构建只有 headless 版本。
 - macOS 的带界面版本只保证编得过，窗口未经真机验证（和整个 macOS 支持一样，见「平台支持」）。

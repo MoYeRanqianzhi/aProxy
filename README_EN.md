@@ -405,7 +405,8 @@ may restart instances one at a time.
   window explains each risk that applies (closed source, a digest that does not match the GitHub
   release, a repository with few stars, nothing to check against) and asks you to confirm each one.
   When in doubt, have your agent review the package first with the audit skills that ship with
-  aProxy (`aproxy-audit-extension`, `aproxy-audit-theme`).
+  aProxy (`aproxy-audit-extension`, `aproxy-audit-theme`). To write your own, see
+  [docs/extensions.md](docs/extensions.md).
 - Windows needs the Microsoft Edge WebView2 runtime (built into Windows 11; on Windows 10, install
   it when told to). Run from a terminal, the command returns at once and the window runs on its
   own.

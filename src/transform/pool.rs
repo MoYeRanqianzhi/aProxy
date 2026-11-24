@@ -690,7 +690,8 @@ impl Pool {
         if let Some(n) = &self.notices {
             let lane = n.lock().unwrap();
             snap["notify_breaker"] = lane.breaker.view();
-            snap["notify_dropped_total"] = json!(lane.dropped);
+            snap["notify_dropped_total"] =
+                json!(lane.dropped.load(std::sync::atomic::Ordering::Relaxed));
         }
         if let Some(h) = self.negotiated.lock().unwrap().as_ref() {
             snap["program"] = json!(self.secrets.replace(&h.name));

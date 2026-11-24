@@ -1,7 +1,10 @@
 //! 完成通知和业务消息共用普通进程，但队列、失败计数与冷却只属于观察方向。
 use super::*;
 use aproxy_envelope::{BodyNeed, Completion, NotifyEvent};
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    sync::atomic::{AtomicU64, Ordering::Relaxed},
+};
 
 /// 内存按实际保留的结构与字符串容量计费，不因状态是 JSON 转义串而漏掉它。
 const QUEUE_BYTES: usize = 16 * 1024 * 1024;
@@ -16,8 +19,8 @@ pub(super) struct Lane {
     queue: VecDeque<(Completion, usize)>,
     /// 只计仍排队的消息；取出时立即归还。
     bytes: usize,
-    /// 累计因容量或打开的熔断器未获派发的消息数。
-    pub(super) dropped: u64,
+    /// 跨代累计因容量、熔断或排空未获派发的消息数。旧队列丢弃时仍写入同一个计数器。
+    pub(super) dropped: Arc<AtomicU64>,
     /// 丢弃可持续很久，每个程序分别限频而不是每条写日志。
     warned: Option<Instant>,
     /// 尚未拿到业务进程的调用数；包括流的 open，与从队列借走进程在同一把锁上排序。
@@ -31,13 +34,13 @@ impl Lane {
         if n == 0 {
             return;
         }
-        self.dropped = self.dropped.saturating_add(n);
+        let total = self.dropped.fetch_add(n, Relaxed) + n;
         if self
             .warned
             .is_none_or(|last| last.elapsed() >= Duration::from_secs(60))
         {
             self.warned = Some(Instant::now());
-            tracing::warn!(format=%pool.secrets.replace(&pool.entry.name),stage="notify",dropped=self.dropped,"format completion notifications dropped");
+            tracing::warn!(format=%pool.secrets.replace(&pool.entry.name),stage="notify",dropped=total,"format completion notifications dropped");
         }
     }
     /// 任一熔断器打开都放弃已排队的旧请求，只在冷却结束后用新通知试探。
@@ -94,9 +97,12 @@ impl Pool {
             Waiting(self)
         })
     }
-    /// 上传原始字节只读一次。按配置与最近一次成功 hello 的交集算摘要，不预测替换进程会更改订阅。
-    /// 从未握手成功的可选项是例外：首次冷却试探可能发生在上传结束后，届时已无法补算原始字节。
+    /// 上传原始字节只读一次。通知在交付结束时才选进程，所以即使当前进程没订阅也为配置的 notify 保留摘要。
+    /// 业务阶段按最近一次成功 hello 准备；尚未握手的可选项可能在上传结束后才首次试探。
     pub(crate) fn may_need_upload_digest(&self, stages: &[crate::config::file::Stage]) -> bool {
+        if self.notices.is_some() && stages.contains(&crate::config::file::Stage::Notify) {
+            return true;
+        }
         let hello = self.negotiated.lock().unwrap();
         stages.iter().any(|&stage| {
             self.entry.has_stage(stage)
@@ -306,13 +312,9 @@ mod tests {
             Path::new("unit.toml"),
         );
         assert!(diags.is_empty());
-        let p = Pool::new(
-            cfg.format.unwrap().pop().unwrap(),
-            PathBuf::new(),
-            Secrets::default(),
-            None,
-            [1024; 2],
-        );
+        let mut entry = cfg.format.unwrap().pop().unwrap();
+        entry.command = crate::transform::format_echo_path().display().to_string();
+        let p = Pool::new(entry, PathBuf::new(), Secrets::default(), None, [1024; 2]);
         let _waiting = p.waiting_data();
         let send = || {
             p.enqueue_notify(Completion::new(
@@ -326,13 +328,21 @@ mod tests {
         send();
         send();
         tokio::task::yield_now().await;
-        p.begin_drain();
+        // 先制造一次已计数丢弃，换代丢弃积压，最后再由仍持有旧代的派发者记一次。
+        p.notices.as_ref().unwrap().lock().unwrap().lost(&p, 1);
+        let slot = FormatSlot::new(p.clone());
+        assert!(matches!(
+            slot.reserve_restart().unwrap().await.unwrap(),
+            aproxy_ipc::wire::RestartOutcome::Restarted { .. }
+        ));
         send();
         let (len, bytes, dropped) = {
             let lane = p.notices.as_ref().unwrap().lock().unwrap();
-            (lane.queue.len(), lane.bytes, lane.dropped)
+            (lane.queue.len(), lane.bytes, lane.dropped.load(Relaxed))
         };
-        assert_eq!((len, bytes, dropped), (0, 0, 3));
+        assert_eq!((len, bytes, dropped), (0, 0, 4));
+        assert_eq!(slot.snapshot().1["notify_dropped_total"], 4);
+        slot.current().shutdown().await;
     }
     /// 不放行业务等待者，检查双重容量按旧到新淘汰；数据熔断清队列而不处罚观察方向。
     #[tokio::test]
@@ -368,7 +378,7 @@ mod tests {
         let notices = p.notices.as_ref().unwrap();
         {
             let lane = notices.lock().unwrap();
-            assert_eq!(lane.dropped, 6);
+            assert_eq!(lane.dropped.load(Relaxed), 6);
             assert_eq!(lane.queue.front().unwrap().0.context.request_id, "6");
         }
         for id in 1030..1330 {
@@ -379,7 +389,7 @@ mod tests {
             assert!(lane.bytes <= QUEUE_BYTES);
             assert!(lane.queue.len() < 256);
             assert_eq!(lane.queue.back().unwrap().0.context.request_id, "1329");
-            assert_eq!(lane.dropped as usize + lane.queue.len(), 1330);
+            assert_eq!(lane.dropped.load(Relaxed) as usize + lane.queue.len(), 1330);
         }
         {
             let mut c = p.circuit.lock().unwrap();
@@ -392,7 +402,7 @@ mod tests {
         let lane = notices.lock().unwrap();
         assert!(!lane.running);
         assert_eq!(lane.bytes, 0);
-        assert_eq!(lane.dropped, 1331);
+        assert_eq!(lane.dropped.load(Relaxed), 1331);
         assert_eq!(lane.breaker.failures, 0);
         assert!(p.ids.lock().unwrap().is_empty());
     }

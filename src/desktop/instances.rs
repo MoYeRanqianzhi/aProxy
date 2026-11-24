@@ -316,8 +316,17 @@ impl InstanceOps for DesktopHome {
                 .map(|mut v| {
                     // 快照的熔断器是结构体；桌面只暴露三种状态，不透传进程配置或后续协议字段。
                     let o = v.as_object_mut().ok_or(Fault::DesktopUnavailable {})?;
+                    let key = if o
+                        .get("stages")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|s| s.len() == 1 && s[0] == "notify")
+                    {
+                        "notify_breaker"
+                    } else {
+                        "breaker"
+                    };
                     let breaker = o
-                        .get("breaker")
+                        .get(key)
                         .and_then(|v| v.get("state"))
                         .cloned()
                         .ok_or(Fault::DesktopUnavailable {})?;

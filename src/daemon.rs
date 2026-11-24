@@ -274,6 +274,8 @@ pub struct IpcStats {
     pub state_changed: Arc<tokio::sync::Notify>,
     /// 控制端点已上线，但格式程序尚未全部协商，或启动记录尚未落盘。
     pub starting: std::sync::atomic::AtomicBool,
+    /// HTTP 排空由所有停止来源共用；IPC 的 shutdown 通知只是其中一种来源。
+    pub(crate) draining_formats: std::sync::atomic::AtomicBool,
     /// 最近一次收到客户端请求的时刻（Unix 毫秒；即 AppState::last_activity_ms，
     /// 同一 Arc 由 serve_forever 组装进来）
     pub last_activity_ms: Arc<std::sync::atomic::AtomicU64>,
@@ -1232,9 +1234,19 @@ async fn format_operation(
     state: &ControlState,
     op: FormatOp,
 ) -> Result<serde_json::Value, Rejection> {
-    if *state.on_shutdown.borrow() {
-        return Err(Rejection::InvalidState("stopping"));
-    }
+    let check_serving = || {
+        if *state.on_shutdown.borrow()
+            || state
+                .stats
+                .draining_formats
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            Err(Rejection::InvalidState("stopping"))
+        } else {
+            Ok(())
+        }
+    };
+    check_serving()?;
     if state
         .stats
         .starting
@@ -1248,38 +1260,48 @@ async fn format_operation(
         .iter()
         .filter_map(std::sync::Weak::upgrade)
         .collect();
+    // 配置名和展示名属于同一选择空间；两个条目都匹配时，不能优先选择其中任何一个。
+    let resolve = |name: &str| {
+        let mut hits = slots.iter().enumerate().filter(|(_, slot)| {
+            let p = slot.current();
+            p.entry.name == name || state.history.secrets().replace(&p.entry.name) == name
+        });
+        match (hits.next(), hits.next()) {
+            (Some((index, _)), None) => Ok(index),
+            _ => Err(Rejection::UnknownFormat(
+                state.history.secrets().replace(name),
+            )),
+        }
+    };
     match op {
         FormatOp::Call {
             name,
             method,
             params,
         } => {
-            let p = slots
-                .iter()
-                .map(|s| s.current())
-                .find(|p| p.entry.name == name)
-                .ok_or_else(|| Rejection::UnknownFormat(state.history.secrets().replace(&name)))?;
+            let p = slots[resolve(&name)?].current();
             p.control_call(&method, params)
                 .await
                 .map(|v| serde_json::json!(v))
                 .map_err(Rejection::FormatControl)
         }
         FormatOp::Restart { names } => {
-            if let Some(names) = &names {
-                for name in names {
-                    if !slots.iter().any(|s| s.current().entry.name == *name) {
-                        return Err(Rejection::UnknownFormat(
-                            state.history.secrets().replace(name),
-                        ));
-                    }
-                }
+            let mut selected = vec![names.is_none(); slots.len()];
+            for name in names.iter().flatten() {
+                selected[resolve(name)?] = true;
             }
-            let selected = slots.iter().filter(|s| {
-                names
-                    .as_ref()
-                    .is_none_or(|names| names.contains(&s.current().entry.name))
-            });
-            let entries = futures_util::future::join_all(selected.map(|s| s.restart())).await;
+            let probes: Vec<_> = slots
+                .iter()
+                .zip(selected)
+                .filter(|(_, wanted)| *wanted)
+                .map(|(s, _)| s.reserve_restart())
+                .collect::<Result<_, _>>()?;
+            // 选区无冲突才启动，探测并行且各有 hello 期限，不排在其他调用的握手后面。
+            check_serving()?;
+            let entries = futures_util::future::join_all(probes)
+                .await
+                .into_iter()
+                .collect::<Result<_, _>>()?;
             Ok(serde_json::json!(RestartReport {
                 config_reloaded: false,
                 entries
@@ -2315,6 +2337,66 @@ mod tests {
         );
     }
 
+    /// 原始请求行和解码后的参数有独立预算；允许的参数仍可能在看到换行前触及读上限。
+    #[tokio::test]
+    async fn escaped_control_params_hit_the_raw_line_limit() {
+        let (state, _rx) = control(sample_info("0"));
+        let line = format!(
+            r#"{{"v":1,"op":"format_control","args":{{"name":"a","method":"echo","params":"{}"}}}}"#,
+            r"\u0061".repeat(25_000)
+        );
+        assert!(
+            matches!(parse_request(&(line.clone()+"\n")), Ok(Parsed::Format(FormatOp::Call{params,..})) if params.as_str().unwrap().len()==25_000)
+        );
+        let (client, server) = tokio::io::duplex(line.len() + 1);
+        let handler = tokio::spawn(handle_conn(server, state));
+        let reply = exchange_over(client, &line).await.unwrap();
+        assert_eq!(reply.trim_end(), Rejection::bad("incomplete_line").reply());
+        handler.await.unwrap().unwrap();
+    }
+    /// 无论由哪个来源开始 HTTP 排空，都不再接纳 format 写操作；重叠选择连空闲条目也不改。
+    #[tokio::test]
+    async fn format_restart_admission_is_atomic_and_stops_at_drain() {
+        let (cfg, diagnostics) = crate::config::file::parse(
+            "[[format]]\nname='a'\ncommand='f'\nstages=['request']\n[[format]]\nname='b'\ncommand='f'\nstages=['request']",
+            std::path::Path::new("unit.toml"),
+        );
+        assert!(diagnostics.is_empty());
+        let app = crate::proxy::AppState::new(crate::config::Config {
+            formats: cfg.format.unwrap(),
+            disk_cache: Some(false),
+            ..Default::default()
+        });
+        let (mut state, _rx) = control(sample_info("0"));
+        Arc::get_mut(&mut state).unwrap().stats = app.stats.clone();
+        let busy = app.formats.0[1].reserve_restart().unwrap();
+        let all = || format_operation(&state, FormatOp::Restart { names: None });
+        assert_eq!(
+            all().await.unwrap_err().reply(),
+            r#"{"v":1,"ok":false,"error":{"code":"invalid_state","message":"a selected format is already restarting","details":{"state":"serving","reason":"restart-in-progress"}}}"#
+        );
+        assert!(app.formats.0[0].snapshot().1["restarted_at"].is_null());
+        drop(app.formats.0[0].reserve_restart().unwrap());
+        drop(busy);
+        app.drain_idle_formats();
+        assert!(!*state.on_shutdown.borrow());
+        assert!(matches!(
+            all().await,
+            Err(Rejection::InvalidState("stopping"))
+        ));
+        assert!(matches!(
+            format_operation(
+                &state,
+                FormatOp::Call {
+                    name: "a".into(),
+                    method: "pid".into(),
+                    params: serde_json::Value::Null
+                }
+            )
+            .await,
+            Err(Rejection::InvalidState("stopping"))
+        ));
+    }
     /// 控制调用的 JSON 参数不解释，错误分类与作者自己的 fail 分属协议的不同层。
     #[test]
     fn format_control_frames_are_pinned() {

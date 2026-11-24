@@ -260,10 +260,14 @@ impl Instance<'_> {
 
 /// 在 `home` 里以 `args` 启动一个后台实例，等它就绪（`aproxy start` 返回即就绪）。
 fn start<'a>(home: &'a TestHome, port: u16, args: &[&str]) -> Instance<'a> {
-    home.stop_on_drop(port);
-    let out = home
-        .cmd()
-        .args(args)
+    let mut cmd = home.cmd();
+    cmd.args(args);
+    if port == 0 {
+        cmd.arg("--json");
+    } else {
+        home.stop_on_drop(port);
+    }
+    let out = cmd
         .env("NO_COLOR", "1")
         .output()
         .report_exit()
@@ -274,6 +278,13 @@ fn start<'a>(home: &'a TestHome, port: u16, args: &[&str]) -> Instance<'a> {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    let port = if port == 0 {
+        let bound = u16::try_from(common::output_document(&out)["port"].as_u64().unwrap()).unwrap();
+        home.stop_on_drop(bound);
+        bound
+    } else {
+        port
+    };
     Instance {
         home,
         port,
@@ -1157,12 +1168,11 @@ fn the_samples_pinned_in_the_modules_are_still_there() {
 #[test]
 fn format_restart_operation_contract() {
     let home = TestHome::new();
-    let port = free_port();
     let cfg = home.path().join("format.toml");
     let role = home.path().join("role");
     std::fs::write(&role, "1").unwrap();
-    std::fs::write(&cfg,format!("base_url='http://127.0.0.1'\nlisten_addr='127.0.0.1:{port}'\n[[format]]\nname='role'\ncommand={}\nargs=['role-version',{}]\nstages=['request']\nrequired=true",json!(common::format_echo_path()),json!(role))).unwrap();
-    let instance = start(&home, port, &["start", cfg.to_str().unwrap()]);
+    std::fs::write(&cfg,format!("base_url='{}'\nlisten_addr='127.0.0.1:0'\n[[format]]\nname='role'\ncommand={}\nargs=['role-version',{}]\nstages=['request']\nprocess='persistent'\nrequired=true",fixed_upstream("still serving"),json!(common::format_echo_path()),json!(role))).unwrap();
+    let instance = start(&home, 0, &["start", cfg.to_str().unwrap()]);
     let ping = "{\"v\":1,\"op\":\"ping\"}\n";
     let before = instance.snapshot(ping);
     assert!(
@@ -1183,6 +1193,7 @@ fn format_restart_operation_contract() {
         instance.snapshot(named),
         json!({"configReloaded":false,"entries":[{"name":"role","program":"format-echo","version":"2","outcome":"restarted"}]})
     );
+    let serving = instance.snapshot(ping)["formats"].clone();
     std::fs::remove_file(role).unwrap();
     assert_eq!(
         instance.snapshot(named),
@@ -1191,7 +1202,8 @@ fn format_restart_operation_contract() {
     let after = instance.snapshot(ping);
     assert_eq!(after["instance"], before["instance"]);
     assert_eq!(after["state"], "serving");
-    assert_eq!(after["formats"][0]["breaker"]["state"], "open");
+    assert_eq!(after["formats"], serving);
+    assert!(post_through(instance.port, "/test", "request").ends_with("still serving"));
 }
 
 /// 模拟只公布 ping 的旧实例。第二条连接已经绑定对端，但不能收到任何更改状态的帧。
@@ -1270,11 +1282,10 @@ async fn older_instance_never_receives_format_restart() {
 #[test]
 fn format_control_operation_contract() {
     let home = TestHome::new();
-    let port = free_port();
     let cfg = home.path().join("control.toml");
     let key = "test-key-control-abcdefg";
-    std::fs::write(&cfg,format!("base_url='http://127.0.0.1'\napi_key='{key}'\nlisten_addr='127.0.0.1:{port}'\n[[format]]\nname='a'\ncommand={0}\nstages=['request']\n[[format]]\nname='b'\ncommand={0}\nargs=['control-role']\nenv={{ECHO_SECRET='{key}'}}\nstages=['request']",json!(common::format_echo_path()))).unwrap();
-    let instance = start(&home, port, &["start", cfg.to_str().unwrap()]);
+    std::fs::write(&cfg,format!("base_url='http://127.0.0.1'\napi_key='{key}'\nlisten_addr='127.0.0.1:0'\n[[format]]\nname='a'\ncommand={0}\nstages=['request']\n[[format]]\nname='b'\ncommand={0}\nargs=['control-role']\nenv={{ECHO_SECRET='{key}'}}\nstages=['request']",json!(common::format_echo_path()))).unwrap();
+    let instance = start(&home, 0, &["start", cfg.to_str().unwrap()]);
     let call = |name: &str, method: &str, params: Value| {
         json!({"v":1,"op":"format_control","args":{"name":name,"method":method,"params":params}})
             .to_string()
@@ -1318,5 +1329,111 @@ fn format_control_operation_contract() {
     instance.rejected(
         &call("b", "echo", json!("x".repeat(65535))),
         &json!({"code":"format_control_error","details":{"reason":"too-large"}}),
+    );
+}
+
+/// 展示名和配置名都可选择，但两者发生碰撞时整个操作失败，不能把控制帧发给另一行。
+#[test]
+fn format_selectors_resolve_exactly_one_entry() {
+    let home = TestHome::new();
+    let cfg = home.path().join("select.toml");
+    let mut config =
+        "base_url='http://127.0.0.1'\nlisten_addr='127.0.0.1:0'\napi_key='profile-east'\n"
+            .to_owned();
+    for name in ["profile-east", "<secret>", "only-profile-east"] {
+        config.push_str(&format!(
+            "[[format]]\nname='{name}'\ncommand={}\nargs=['control-role']\nstages=['request']\n",
+            json!(common::format_echo_path())
+        ));
+    }
+    std::fs::write(&cfg, config).unwrap();
+    let instance = start(&home, 0, &["start", cfg.to_str().unwrap()]);
+    let ping = "{\"v\":1,\"op\":\"ping\"}\n";
+    let before = instance.snapshot(ping)["formats"].clone();
+    assert_eq!(before[0]["name"], "<secret>");
+    assert_eq!(before[1]["name"], "<secret>");
+    let call = |name: &str| {
+        json!({"v":1,"op":"format_control","args":{"name":name,"method":"pid","params":null}})
+            .to_string()
+            + "\n"
+    };
+    let restart = |names: Value| {
+        json!({"v":1,"op":"restart_formats","args":{"names":names}}).to_string() + "\n"
+    };
+    let rejection = json!({"code":"unknown_format","details":{"name":"<secret>"}});
+    instance.rejected(&call("<secret>"), &rejection);
+    instance.rejected(&restart(json!(["only-<secret>", "<secret>"])), &rejection);
+    assert_eq!(instance.snapshot(ping)["formats"], before);
+    assert!(instance.snapshot(&call("profile-east"))["result"].is_u64());
+    assert_eq!(
+        instance.snapshot(&call("only-<secret>")),
+        instance.snapshot(&call("only-profile-east"))
+    );
+    let report = instance.snapshot(&restart(json!(["only-<secret>", "only-profile-east"])));
+    assert_eq!(
+        report["entries"],
+        json!([{"name":"only-<secret>","outcome":"restarted","program":"format-echo","version":"1.0"}])
+    );
+}
+
+/// 请求阻塞于 A 时切换 B；B 的下一条请求消息和完整上传摘要都交给成功握手的新一代。
+#[test]
+fn request_crosses_format_cutover_with_complete_digest() {
+    let h = TestHome::new();
+    let cfg = h.path().join("chain.toml");
+    let gate = h.path().join("release");
+    let digest = h.path().join("digest.enabled");
+    let a = h.path().join("a.events");
+    let b = h.path().join("b.events");
+    let frames = h.path().join("b.frames");
+    std::fs::write(&cfg,format!("base_url='{}'\nlisten_addr='127.0.0.1:0'\n[[format]]\nname='a'\ncommand={exe}\nargs=['gate-request',{}]\nstages=['request']\nprocess='persistent'\nenv={{ECHO_OBSERVE={}}}\n[[format]]\nname='b'\ncommand={exe}\nargs=['digest-on-restart',{}]\nstages=['request','notify']\nrequired=true\nprocess='persistent'\nenv={{ECHO_OBSERVE={},ECHO_RECORD={}}}", fixed_upstream("done"),json!(gate),json!(a),json!(digest),json!(b),json!(frames),exe=json!(common::format_echo_path()))).unwrap();
+    let instance = start(&h, 0, &["start", cfg.to_str().unwrap()]);
+    let port = instance.port;
+    let request = std::thread::spawn(move || post_through(port, "/test", "blocked"));
+    let read = |p: &Path| {
+        std::fs::read_to_string(p)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect::<Vec<_>>()
+    };
+    assert!(wait_for(Duration::from_secs(20), || read(&a)
+        .iter()
+        .any(|e| e["event"] == "request")));
+    std::fs::write(digest, b"").unwrap();
+    let outcome =
+        instance.snapshot("{\"v\":1,\"op\":\"restart_formats\",\"args\":{\"names\":[\"b\"]}}\n");
+    assert_eq!(outcome["entries"][0]["version"], "digest");
+    std::fs::write(gate, b"").unwrap();
+    let response = request.join().unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 200") && response.ends_with("done"),
+        "{response}"
+    );
+    assert!(wait_for(Duration::from_secs(20), || read(&frames)
+        .iter()
+        .any(|f| f["stage"] == "notify")));
+    let activity = instance.snapshot("{\"v\":1,\"op\":\"ping\"}\n")["activity"].clone();
+    assert_eq!(activity["requests_total"], 1);
+    assert_eq!(activity["retries_total"], 0);
+    let events = read(&b);
+    let pids: Vec<_> = events
+        .iter()
+        .filter(|e| e["event"] == "hello")
+        .map(|e| &e["pid"])
+        .collect();
+    assert_eq!(pids.len(), 2);
+    assert_ne!(pids[0], pids[1]);
+    assert_eq!(
+        events.iter().find(|e| e["event"] == "request").unwrap()["pid"],
+        *pids[1]
+    );
+    let notify = read(&frames)
+        .into_iter()
+        .find(|f| f["stage"] == "notify")
+        .unwrap();
+    assert_eq!(
+        notify["digest"],
+        "6973dddd3ef9cb6a2932702f31777faad9c9bf3124d147a84f31aadb6d139546"
     );
 }

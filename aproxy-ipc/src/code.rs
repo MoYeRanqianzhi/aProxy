@@ -514,7 +514,7 @@ pub const TABLE: &[Code] = &[
         "invalid_state",
         IPC,
         "Not allowed in the instance's current state.",
-        &[req("state", T::String)],
+        &[req("state", T::String), opt("reason", T::String)],
     ),
     plain(
         "condition_not_met",

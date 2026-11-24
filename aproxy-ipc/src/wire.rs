@@ -795,6 +795,8 @@ pub enum Rejection {
     UnsupportedArg(Vec<String>),
     /// 此刻的状态不允许这个 op
     InvalidState(&'static str),
+    /// A selected entry is already probing; no restart in this selection was admitted.
+    RestartInProgress,
     /// 实例只闲置了 `idle_ms` 毫秒
     ConditionNotMet {
         idle_ms: u64,
@@ -865,6 +867,11 @@ impl Rejection {
                 error_code::UNSUPPORTED_ARG,
                 text::unknown_arg(Lang::En, &args.join(", ")),
                 json!({ "args": args }),
+            ),
+            Rejection::RestartInProgress => (
+                error_code::INVALID_STATE,
+                text::restart_in_progress(Lang::En).to_owned(),
+                json!({"state":"serving", "reason":"restart-in-progress"}),
             ),
             Rejection::InvalidState(state) => (
                 error_code::INVALID_STATE,

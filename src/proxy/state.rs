@@ -253,6 +253,9 @@ impl AppState {
 
     /// 停机开始先并行退役空闲进程；在途请求仍可使用其余会话。
     pub fn drain_idle_formats(&self) {
+        self.stats
+            .draining_formats
+            .store(true, std::sync::atomic::Ordering::Release);
         for slot in self.formats.0.iter() {
             slot.begin_drain();
         }

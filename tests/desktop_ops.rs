@@ -1122,7 +1122,7 @@ async fn format_window_commands_project_one_selected_run() {
     let h = TestHome::new();
     h.settings(r#"{"watchdog":{"enabled":false}}"#);
     let cfg = h.path().join("config.toml");
-    std::fs::write(&cfg,format!("base_url='http://127.0.0.1'\nlisten_addr='127.0.0.1:0'\n[[format]]\nname='role'\ncommand={}\nargs=['control-role']\nprocess='persistent'\nstages=['request']\nrequired=true",json!(common::format_echo_path()))).unwrap();
+    std::fs::write(&cfg,format!("base_url='http://127.0.0.1'\nlisten_addr='127.0.0.1:0'\n[[format]]\nname='role'\ncommand={}\nargs=['control-role']\nprocess='persistent'\nstages=['request']\nrequired=true\n[[format]]\nname='observer'\ncommand='missing-notify-test-program'\nprocess='persistent'\nstages=['notify']\nrequired=false",json!(common::format_echo_path()))).unwrap();
     let host = DesktopHome::new(h.path().into(), env!("CARGO_BIN_EXE_aproxy").into()).unwrap();
     let choices = host.list_configs().await.unwrap();
     let run = host
@@ -1136,7 +1136,10 @@ async fn format_window_commands_project_one_selected_run() {
         .await
         .unwrap();
     h.stop_on_drop(run.port);
-    let list = host.format_list(run.clone()).await.unwrap();
+    let mut list = host.format_list(run.clone()).await.unwrap();
+    let observer = serde_json::to_value(list.pop().unwrap()).unwrap();
+    assert_eq!(observer["name"], "observer");
+    assert_eq!(observer["breaker"], "open");
     assert_eq!(
         serde_json::to_value(list).unwrap(),
         json!([{"name":"role","program":"format-echo","version":"1.0","process":"persistent","stages":["request"],"required":true,"breaker":"closed","control":true,"restartedAt":null}])
@@ -1159,7 +1162,12 @@ async fn format_window_commands_project_one_selected_run() {
         json!({"code":"desktop_format_fail","details":{"code":"refused","reason":"author declined"}})
     );
     assert_eq!(
-        serde_json::to_value(host.format_restart(run.clone(), None).await.unwrap()).unwrap(),
+        serde_json::to_value(
+            host.format_restart(run.clone(), Some(vec!["role".into()]))
+                .await
+                .unwrap()
+        )
+        .unwrap(),
         json!([{"name":"role","outcome":"restarted","program":"format-echo","version":"1.0"}])
     );
     assert!(

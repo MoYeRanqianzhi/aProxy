@@ -18,7 +18,7 @@ struct RequestTap {
     flag_out: Option<Arc<std::sync::OnceLock<bool>>>,
     /// 超过样本上限时只保留有界的增量语法状态，不等待尚未到达的输入。
     parser: Option<super::live_flag::LiveFlag>,
-    /// 仅完成通知协商摘要时顺手哈希，不把请求体留作重放。
+    /// 配置了完成通知就顺手哈希，不把请求体留作重放。
     digest: Option<(sha2::Sha256, Arc<std::sync::OnceLock<String>>)>,
     /// 上传结束后的解析结果，同时用于程序和请求记录。
     exact: Option<bool>,
@@ -52,12 +52,7 @@ impl RequestTap {
             .and_then(|c| c.live_stream.clone())
             .filter(|_| need_flag);
         let digest = ctx
-            .filter(|_| {
-                state
-                    .formats
-                    .iter()
-                    .any(|p| p.may_need_upload_digest(&[crate::config::file::Stage::Notify]))
-            })
+            .filter(|_| state.has_format(crate::config::file::Stage::Notify))
             .and_then(|c| {
                 use axum::body::HttpBody as _;
                 let hash = sha2::Sha256::default();

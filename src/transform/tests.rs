@@ -1053,7 +1053,7 @@ async fn restarting_preserves_busy_request_and_stream() {
     let mut request = std::pin::pin!(call(&old, "blocked", false));
     tokio::select! {_=&mut request=>panic!("early return"),_=wait_observed(&events,"request",1)=>{}}
     assert!(matches!(
-        slot.restart().await,
+        slot.reserve_restart().unwrap().await.unwrap(),
         aproxy_ipc::wire::RestartOutcome::Restarted { .. }
     ));
     let current = slot.current();
@@ -1076,7 +1076,7 @@ async fn restarting_preserves_busy_request_and_stream() {
     wait_observed(&events, "eof", 2).await;
     current.open_at_startup(Fault::Spawn);
     assert_eq!(slot.snapshot().1["breaker"]["state"], "open");
-    slot.restart().await;
+    slot.reserve_restart().unwrap().await.unwrap();
     assert_eq!(
         slot.snapshot().1["breaker"],
         serde_json::json!({"state":"closed","failures":0})
@@ -1118,7 +1118,7 @@ async fn control_faults_do_not_touch_request_workers() {
         json!({"state":"closed","failures":0})
     );
     let slot = FormatSlot::new(p.clone());
-    slot.restart().await;
+    slot.reserve_restart().unwrap().await.unwrap();
     assert_ne!(
         slot.current()
             .control_call("pid", Value::Null)
@@ -1265,4 +1265,76 @@ async fn oversized_control_hello_reports_size() {
         Err(aproxy_ipc::wire::ControlIssue::TooLarge)
     );
     p.shutdown().await;
+}
+
+/// 一次性候选进程能先给出完全合法的 hello，再在 EOF 时写出杂字节；它不能发布任何能力。
+#[tokio::test]
+async fn rejected_probe_keeps_control_and_breaker_facts() {
+    use serde_json::Value;
+    let d = tempfile::tempdir().unwrap();
+    let broken = d.path().join("stray");
+    let old = pool(Process::Spawn, "control-role", |e| {
+        e.args.push(broken.display().to_string())
+    });
+    old.probe().await.unwrap();
+    let slot = FormatSlot::new(old.clone());
+    let pid = old.control_call("pid", Value::Null).await.unwrap();
+    old.open_at_startup(Fault::Spawn);
+    let before = slot.snapshot();
+    std::fs::write(broken, b"").unwrap();
+    assert!(
+        matches!(slot.reserve_restart().unwrap().await.unwrap(), aproxy_ipc::wire::RestartOutcome::HandshakeFailed {reason,..} if reason=="protocol")
+    );
+    assert!(Arc::ptr_eq(&old, &slot.current()));
+    assert_eq!(slot.snapshot(), before);
+    assert_eq!(
+        slot.current()
+            .control_call("pid", Value::Null)
+            .await
+            .unwrap(),
+        pid
+    );
+    old.shutdown().await;
+}
+/// 一代仍借着进程，下一次候选握手又遇到停机。观察代本身释放与 wait 后登记表清空，而非仅观察 EOF。
+#[tokio::test]
+async fn draining_during_restart_releases_generation_and_child_owners() {
+    let d = tempfile::tempdir().unwrap();
+    let gate = d.path().join("hello");
+    let log = d.path().join("events");
+    std::fs::write(&gate, b"").unwrap();
+    let old = pool(Process::Persistent, "gate-hello", |e| {
+        e.args.push(gate.display().to_string());
+        e.env
+            .insert("ECHO_OBSERVE".into(), log.display().to_string());
+    });
+    let slot = FormatSlot::new(old.clone());
+    let weak = Arc::downgrade(&old);
+    let ids = old.ids.clone();
+    let held = old.turn(false).await.unwrap();
+    assert!(matches!(
+        slot.reserve_restart().unwrap().await.unwrap(),
+        aproxy_ipc::wire::RestartOutcome::Restarted { .. }
+    ));
+    let before = slot.snapshot();
+    std::fs::remove_file(&gate).unwrap();
+    let mut probe = std::pin::pin!(slot.reserve_restart().unwrap());
+    tokio::select! {_=&mut probe=>panic!("ungated hello"),_=wait_observed(&log,"hello",3)=>{}}
+    slot.begin_drain();
+    assert_eq!(
+        worker(held.send(request_frame("held"), 0).await.unwrap().0, "held")
+            .split('/')
+            .count(),
+        2
+    );
+    drop(old);
+    assert!(weak.upgrade().is_none());
+    std::fs::write(gate, b"").unwrap();
+    assert!(matches!(
+        probe.await,
+        Err(aproxy_ipc::wire::Rejection::InvalidState("stopping"))
+    ));
+    assert_eq!(slot.snapshot(), before);
+    slot.current().shutdown().await;
+    assert!(ids.lock().unwrap().is_empty());
 }

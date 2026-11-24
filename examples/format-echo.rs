@@ -150,7 +150,10 @@ fn main() {
                 }
                 wait_gate(std::path::Path::new(arg));
             }
-            if mode == "stray-on-eof" || (mode == "stage-stray-on-eof" && count != 0) {
+            if (mode == "control-role" && std::path::Path::new(arg).is_file())
+                || mode == "stray-on-eof"
+                || (mode == "stage-stray-on-eof" && count != 0)
+            {
                 println!("unexpected diagnostic on stdout");
             }
             if mode == "gated-eof" {
@@ -237,7 +240,13 @@ fn main() {
                 std::thread::sleep(delay);
             }
             r = json!({"v":1,"seq":0,"name":"format-echo","version":"1.0","protocol":1,"features":[],"stages":["request","retry","decide","response","heartbeat","stream","notify"]});
-            if mode == "control-role" {
+            if mode == "digest-on-restart" && std::path::Path::new(arg).is_file() {
+                r["version"] = json!("digest");
+                r["request_body"] = json!({"notify":"digest"});
+            }
+            if mode == "control-role" && std::path::Path::new(arg).is_file() {
+                r["version"] = json!("rejected");
+            } else if mode == "control-role" {
                 r["control"] = json!({"args":["control-peer"]});
             }
             if mode == "control-peer" {

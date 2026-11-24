@@ -64,6 +64,7 @@ crate::message!(unknown_op(op: &str), en: "unknown op: {op}", zh: "未知操作�
 
 crate::message!(unknown_arg(args: &str), en: "unknown arg: {args}", zh: "未知参数：{args}");
 
+crate::message!(restart_in_progress(), en: "a selected format is already restarting", zh: "所选 format 已在重启");
 crate::message!(invalid_state(state: &str), en: "not allowed while the instance is {state}", zh: "实例处于 {state} 状态时不允许此操作");
 
 crate::message!(idle_condition(idle_ms: u64), en: "the instance has been idle for only {idle_ms} ms", zh: "实例只闲置了 {idle_ms} 毫秒");
@@ -208,6 +209,9 @@ pub(crate) fn remote(lang: Lang, code: &str, details: &serde_json::Value) -> Opt
                 .collect::<Option<Vec<_>>>()?
                 .join(", "),
         ),
+        error_code::INVALID_STATE if details["reason"] == "restart-in-progress" => {
+            restart_in_progress(lang).to_owned()
+        }
         error_code::INVALID_STATE => invalid_state(lang, details["state"].as_str()?),
         error_code::CONDITION_NOT_MET => idle_condition(lang, details["idle_ms"].as_u64()?),
         error_code::NOT_FOUND => not_found(

@@ -62,6 +62,9 @@ public static class W {
   [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int a, out RECT r, int s);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, int flags, IntPtr extra);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
   public struct RECT { public int L, T, R, B; }
 }
 "@
@@ -73,7 +76,21 @@ $g = [System.Drawing.Graphics]::FromImage($bmp)
 # 从共享控制台启动时 aproxy desktop 会另起一个独立进程再退出（src/commands/desktop.rs），
 # 所以按「有主窗口的 aproxy 进程」找，而不是用启动的那个 pid
 $p = Get-Process aproxy | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-# 先把窗口切到前台再截：从后台进程调用 SetForegroundWindow 会被前台锁挡住，先按一下 Alt 就放行
+# Windows 11 的 runner 登录后会自己弹出开始菜单，还有一个等着装 WSL 的终端窗口，都盖在窗口上面。
+# 开始菜单在前台时按一下 Esc 收起（只在它在前台时按，否则 Esc 会落到 aProxy 窗口里，关掉场景摆好的命令面板）；
+# 其余窗口一律最小化，再把 aProxy 的窗口还原出来
+$fpid = [uint32]0
+[W]::GetWindowThreadProcessId([W]::GetForegroundWindow(), [ref]$fpid) | Out-Null
+$fname = (Get-Process -Id $fpid -ErrorAction SilentlyContinue).ProcessName
+if ($fname -in 'StartMenuExperienceHost', 'SearchHost', 'ShellExperienceHost') {
+  [W]::keybd_event(0x1B, 0, 0, [IntPtr]::Zero)
+  [W]::keybd_event(0x1B, 0, 2, [IntPtr]::Zero)
+  Start-Sleep -Milliseconds 400
+}
+(New-Object -ComObject Shell.Application).MinimizeAll()
+Start-Sleep -Milliseconds 600
+[W]::ShowWindow($p.MainWindowHandle, 9) | Out-Null
+# 再把窗口切到前台：从后台进程调用 SetForegroundWindow 会被前台锁挡住，先按一下 Alt 就放行
 [W]::keybd_event(0x12, 0, 0, [IntPtr]::Zero)
 [W]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
 [W]::keybd_event(0x12, 0, 2, [IntPtr]::Zero)

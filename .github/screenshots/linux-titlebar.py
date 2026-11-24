@@ -93,7 +93,8 @@ check("no window-manager decorations", "not found" in ext or ext.replace(" ", ""
 x, y, w, h = geom(wid)
 drag(x + 70, y + BAR // 2, 150, 100)
 x2, y2, _, _ = geom(wid)
-check("dragging the bar moves the window", abs(x2 - x - 150) <= 24 and abs(y2 - y - 100) <= 24, f"{x},{y} -> {x2},{y2}")
+# 窗口管理器从收到 _NET_WM_MOVERESIZE 才开始接管指针，之前的第一小段移动不算数：只要求走了大半段路，且没有走过头
+check("dragging the bar moves the window", 100 <= x2 - x <= 174 and 60 <= y2 - y <= 124, f"{x},{y} -> {x2},{y2}")
 shot("01-dragged")
 
 # 双击栏的空白处：最大化，再双击还原
@@ -112,11 +113,12 @@ shot("03-maximize-button")
 click(*button(wid, 1))
 check("restore button restores", "MAXIMIZED" not in state(wid), state(wid))
 
-# 右边缘往外拖 80px：Tauri 在 webview 四边留了 5px 的改大小区
+# 右边缘往里拖 120px：Tauri 在 webview 四边留了 5px 的改大小区（tauri-runtime-wry 的 undecorated_resizing）。
+# 往里而不是往外拖：前面拖动标题栏后窗口的右边可能正贴着屏幕右边，往外拖指针被屏幕边挡住、窗口不会变
 x, y, w, h = geom(wid)
-drag(x + w - 2, y + h // 2, 80, 0)
+drag(x + w - 2, y + h // 2, -120, 0)
 _, _, w2, _ = geom(wid)
-check("dragging the right edge resizes", w2 - w >= 40, f"width {w} -> {w2}")
+check("dragging the right edge resizes", 60 <= w - w2 <= 150, f"width {w} -> {w2}")
 
 # 悬停关闭按钮：截图看珊瑚色的悬停底
 sh("xdotool", "mousemove", *button(wid, 0))

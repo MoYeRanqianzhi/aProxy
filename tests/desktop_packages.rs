@@ -531,24 +531,30 @@ async fn github_repo_and_release_facts_use_only_bounded_anonymous_api_requests()
         .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
         .unwrap();
     let proxy = format!("http://{}", socket.local_addr().unwrap());
+    let started = std::time::Instant::now();
+    let refused = facts(repository, "1.2.0", &directory, api, Some(&proxy), timeout).await;
+    eprintln!("probe: not listening -> {refused:?} after {:?}", started.elapsed());
     assert!(matches!(
-        facts(repository, "1.2.0", &directory, api, Some(&proxy), timeout).await,
+        refused,
         GithubFacts::Unreachable {
             reason: Unreachable::Network,
             ..
         }
     ));
     let _silent = socket.listen(1).unwrap();
+    let started = std::time::Instant::now();
+    let silent = facts(
+        repository,
+        "1.2.0",
+        &directory,
+        api,
+        Some(&proxy),
+        Duration::from_millis(75),
+    )
+    .await;
+    eprintln!("probe: silent listener -> {silent:?} after {:?}", started.elapsed());
     assert!(matches!(
-        facts(
-            repository,
-            "1.2.0",
-            &directory,
-            api,
-            Some(&proxy),
-            Duration::from_millis(75)
-        )
-        .await,
+        silent,
         GithubFacts::Unreachable {
             reason: Unreachable::Timeout,
             ..

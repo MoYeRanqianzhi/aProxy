@@ -1,0 +1,84 @@
+# 只在 probe/macos 分支上存在的排查用工作流：在 macOS 上跑完整测试（不在第一个失败处停下），
+# 把每个失败的实际结果打印出来，并直接验证「绑定但不监听的端口」在 macOS 上的连接行为。
+# 不发布、不写仓库；查清后整个分支删除，不并入 main。
+name: macOS probe
+
+on:
+  push:
+    branches: [probe/macos]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+
+jobs:
+  probe:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Runner facts
+        run: |
+          sw_vers
+          uname -a
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+          echo "HOME=$HOME USER=$USER"
+          env | grep -i proxy || echo "no proxy variables"
+          scutil --proxy || true
+      - name: Connect to a bound but not listening socket (raw OS behavior)
+        run: |
+          python3 - <<'EOF'
+          import socket, time
+          for label, listen in (("bound, not listening", False), ("listening, backlog 1, never accepted", True)):
+              s = socket.socket(); s.bind(("127.0.0.1", 0))
+              if listen: s.listen(1)
+              port = s.getsockname()[1]
+              c = socket.socket(); c.settimeout(5)
+              t = time.monotonic()
+              try:
+                  c.connect(("127.0.0.1", port)); r = "connected"
+              except Exception as e:
+                  r = f"{type(e).__name__}: {e}"
+              print(f"{label}: port {port} -> {r} after {time.monotonic()-t:.3f}s")
+              c.close(); s.close()
+          EOF
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: aproxy-desktop/ui/package-lock.json
+      - name: Build the desktop front end
+        working-directory: aproxy-desktop/ui
+        run: |
+          npm ci
+          npm run build
+      - name: The failing test alone, with output
+        continue-on-error: true
+        run: cargo test --locked --test desktop_packages -- --nocapture github_repo_and_release_facts 2>&1 | tee probe-desktop-packages.log
+      - name: Every test, without stopping at the first failure
+        continue-on-error: true
+        run: cargo test --locked --no-fail-fast 2>&1 | tee probe-all.log
+      - name: Summary of failures
+        if: always()
+        run: |
+          echo "## failing tests"; grep -E "^test .* FAILED$|^    [a-z_:]+$" probe-all.log || true
+          echo "## panics"; grep -E "panicked at" probe-all.log probe-desktop-packages.log || true
+          echo "## binaries"; grep -E "^test result: FAILED|Running " probe-all.log || true
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: macos-probe-logs
+          path: probe-*.log
+          retention-days: 7

@@ -1,0 +1,77 @@
+# 三个平台的桌面窗口截图：各自编出带界面的变体，在临时 home 里用 .github/screenshots/scene.py 摆好场景
+# （两个实例、一批经模拟上游的请求、预设界面语言与深浅色），截全屏并裁出窗口，作为 artifact 上传。
+# 目前只在 probe/screenshots 分支上跑，用来预览；定稿后改成手动触发并自动开 PR 替换 README 的截图。
+name: Screenshots
+
+on:
+  push:
+    branches: [probe/screenshots]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: screenshots-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shoot:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, name: windows, exe: target/debug/aproxy.exe }
+          - { os: macos-latest, name: macos, exe: target/debug/aproxy }
+          - { os: ubuntu-24.04, name: linux, exe: target/debug/aproxy }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: aproxy-desktop/ui/package-lock.json
+      - name: Linux desktop dependencies and a virtual display
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev xvfb openbox xdotool x11-utils imagemagick fonts-noto-cjk dbus-x11
+      - name: Build the desktop front end
+        working-directory: aproxy-desktop/ui
+        run: |
+          npm ci
+          npm run build
+      - run: cargo build --locked --bins
+      - run: python -m pip install --quiet pillow
+      - name: Shoot (Windows, macOS)
+        if: matrix.name != 'linux'
+        shell: bash
+        run: |
+          for scene in "en light" "en dark" "zh-CN light"; do
+            set -- $scene
+            python .github/screenshots/scene.py "${{ matrix.exe }}" "shots/${{ matrix.name }}-$1-$2" "$1" "$2" || true
+          done
+      - name: Shoot (Linux)
+        if: matrix.name == 'linux'
+        run: |
+          Xvfb :99 -screen 0 1440x900x24 &
+          sleep 2
+          export DISPLAY=:99
+          openbox &
+          sleep 1
+          for scene in "en light" "en dark" "zh-CN light"; do
+            set -- $scene
+            dbus-run-session -- python .github/screenshots/scene.py "${{ matrix.exe }}" "shots/${{ matrix.name }}-$1-$2" "$1" "$2" || true
+          done
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: shots-${{ matrix.name }}
+          path: shots/
+          retention-days: 7

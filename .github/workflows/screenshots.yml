@@ -57,6 +57,18 @@ jobs:
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File .github/screenshots/resolution.ps1
           powershell -NoProfile -ExecutionPolicy Bypass -File .github/screenshots/clear-desktop.ps1
+      # macOS runner 的显示器默认 1024×768，窗口按 1200×780 打开会被压到屏幕里（截出来只有 922×607）。
+      # 用 displayplacer 换成模式表里 1920×1080 的那一档（runner 上没有 HiDPI 模式，仍是 1 倍）
+      - name: macOS screen resolution
+        if: matrix.name == 'macos'
+        run: |
+          brew install displayplacer
+          displayplacer list
+          id=$(displayplacer list | awk '/^Persistent screen id:/ {print $4; exit}')
+          mode=$(displayplacer list | grep -m1 'res:1920x1080' | sed -E 's/^ *mode ([0-9]+):.*//')
+          displayplacer "id:$id mode:$mode"
+          sleep 2
+          displayplacer list | grep -i 'resolution:'
       - run: cargo build --locked --bins
       - run: python -m pip install --quiet pillow
       - name: Shoot (Windows, macOS)

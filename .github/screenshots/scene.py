@@ -65,6 +65,7 @@ public static class W {
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
   public struct RECT { public int L, T, R, B; }
 }
 "@
@@ -94,6 +95,9 @@ Start-Sleep -Milliseconds 600
 [W]::keybd_event(0x12, 0, 0, [IntPtr]::Zero)
 [W]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
 [W]::keybd_event(0x12, 0, 2, [IntPtr]::Zero)
+# 再临时置顶（HWND_TOPMOST = -1；SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE = 0x13）：那个等着装 WSL 的终端
+# 会隔一阵自己再弹出来，最小化挡不住它
+[W]::SetWindowPos($p.MainWindowHandle, [IntPtr](-1), 0, 0, 0, 0, 0x13) | Out-Null
 Start-Sleep -Milliseconds 800
 $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
 $bmp.Save($args[0], [System.Drawing.Imaging.ImageFormat]::Png)

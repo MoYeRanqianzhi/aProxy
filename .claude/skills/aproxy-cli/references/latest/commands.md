@@ -1130,6 +1130,22 @@ the cause and the manual way, and does not change adopt's exit code. With `--jso
 `integration.path` and `integration.shortcut`, each with `status` (`changed`, `unchanged`, `skipped`
 or `failed`), `reason` and `touched` (the files or registry value written).
 
+If a step keeps failing (a locked-down profile, an unusual shell, a sandbox), set it up by hand
+instead of retrying: both are ordinary per-user settings, and the result only has to match the table
+above. Read the `reason` first; it usually names the file or key that could not be written.
+
+- `PATH`: add `<home>/bin` to the user's `PATH` the way that shell or system expects. On Windows that
+  is the user-level `Path` environment variable (for example
+  `[Environment]::SetEnvironmentVariable('Path', <old value> + ';<home>\bin', 'User')`, keeping
+  existing entries); elsewhere a line such as `export PATH="<home>/bin:$PATH"` in the profile the
+  user's login shell reads. Then check in a new terminal that `aproxy` resolves to `<home>/bin/`.
+- App menu entry: anything that runs `<home>/bin/aproxy desktop --installed-home` works, because
+  `--installed-home` makes the window use the home of the binary it runs from. On Windows a shortcut
+  with that target and argument; on Linux a `.desktop` file with `Exec=` set to it; on macOS, if the
+  `.app` cannot be created, `aproxy desktop` from a terminal opens the same window.
+
+Tell the user what you changed, since these settings live outside aProxy's home.
+
 There is no uninstall command yet. To undo by hand: remove `<home>\bin` from the user's `Path`
 (Windows: Settings, "Edit environment variables for your account") or the lines ending in `# aProxy`
 from the profile files and `<home>/env`; delete the shortcut, the `.app` or the `.desktop` file and its

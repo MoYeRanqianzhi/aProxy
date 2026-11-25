@@ -52,7 +52,8 @@ instance takes every other session that uses it down too.
   instance uses, and stop it when you are done. `APROXY_HOME` gives the experiment its own configs,
   settings, logs, registry and control channel, so commands run under it cannot reach the user's
   instances; ports are still shared by the whole machine. A 0.1.0 binary does not isolate the
-  control channel on Windows. Details: commands.md, "Experiment in an isolated home".
+  control channel on Windows. Details:
+  [commands/before-you-run.md](references/latest/commands/before-you-run.md), "Experiment in an isolated home".
 
 ## Common tasks
 
@@ -136,11 +137,12 @@ Every other client, the reasoning behind the timeouts, and how to verify the set
 
 `aproxy install` (alias `aproxy upgrade`) installs the newest version into `~/.aproxy/bin/` and
 restarts running instances one at a time, so clients barely notice. Options, channels and
-recovery from an interrupted install are in [commands.md](references/latest/commands.md).
+recovery from an interrupted install are in
+[commands/install.md](references/latest/commands/install.md).
 0.1.x cannot upgrade to 0.2.0 in place: its `aproxy install` stops with `--version 输出无版本号`
 ("no version number in the --version output") before changing anything, and the two lines cannot
 control each other's instances. Move by reinstalling, as
-[compatibility.md](references/latest/compatibility.md) describes.
+[compatibility/from-0.1.md](references/latest/compatibility/from-0.1.md) describes.
 
 0.2.0 also renamed most settings.json and config.toml keys and refuses the old ones, so after the
 reinstall nothing starts until the files are converted. `aproxy migrate --dry-run` shows what will
@@ -149,8 +151,10 @@ change, `aproxy migrate` converts every file the home knows and keeps each origi
 with no upstream named for it, an old key next to its new name) are left untouched with the line to
 settle. Those are the user's decisions, about where a credential goes or which program sees their
 requests, so ask rather than pick, and never delete a key that holds a credential. Show the user the preview before running it; afterwards
-`aproxy doctor` must report no errors. compatibility.md, "Converting the files with aproxy migrate",
-has the procedure, what each review point means, and both rename tables for editing by hand.
+`aproxy doctor` must report no errors.
+[compatibility/migrate.md](references/latest/compatibility/migrate.md) has the procedure and what each
+review point means; [compatibility/renamed-keys.md](references/latest/compatibility/renamed-keys.md)
+has both rename tables for editing by hand.
 When any command reports a key such as `max_body_mb`, `forward_only` or `read_timeout_secs` as
 unknown, or ends its errors with a suggestion to run `aproxy migrate`, this is the situation. The
 command's text follows the user's language; `aproxy migrate --json` is always English.
@@ -175,6 +179,9 @@ own session included. Exit codes 10, 11 and 12 each call for a different next st
 ## Where to look
 
 If you cannot open the files linked below (a sandbox, or the skill installed under another home), read them through the binary instead: `aproxy skill show aproxy-cli --files` lists them and `aproxy skill show aproxy-cli references/latest/commands.md` prints one. The output is the installed copy, checked against its manifest, so it matches the running version.
+
+The larger references are indexes: each lists its parts with the sections they hold. Open the index,
+then only the part the task needs, so the rest stays out of your context.
 
 | You need | Read |
 |---|---|

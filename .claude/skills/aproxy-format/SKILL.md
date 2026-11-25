@@ -66,7 +66,8 @@ do not cover.
    changes to the program itself only need `aproxy restart <port> --format <name>`, which keeps
    the instance and its in-flight requests.
 6. **Optionally offer control methods** that a desktop extension can call, served by a separate
-   process (`control` in [references/protocol.md](references/protocol.md#control)).
+   process (`control` in
+   [references/protocol/control-and-errors.md](references/protocol/control-and-errors.md#control)).
 
 ## The rules that matter most, and why
 
@@ -109,6 +110,9 @@ a program that only improves decisions (`policy`, `adaptive`) optional.
 ## Where to look
 
 If you cannot open the files linked below (a sandbox, or the skill installed under another home), read them through the binary instead: `aproxy skill show aproxy-format --files` lists them and `aproxy skill show aproxy-format references/protocol.md` prints one. The output is the installed copy, checked against its manifest, so it matches the running version.
+
+protocol.md and examples.md are indexes: each lists its parts with the sections they hold. Open the
+index, then only the part the task needs.
 
 | You need | Read |
 |---|---|

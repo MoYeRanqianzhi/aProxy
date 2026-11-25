@@ -1166,7 +1166,7 @@ fn migrate_inventory_reports_stale_references_without_blocking_other_files() {
             assert_eq!(row["issues"][0]["message"], msg);
             assert_eq!(
                 row["issues"][0]["section"],
-                "compatibility.md#converting-the-files-with-aproxy-migrate"
+                "compatibility/migrate.md#converting-the-files-with-aproxy-migrate"
             );
             assert!(!missing.exists());
         }

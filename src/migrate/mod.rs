@@ -70,8 +70,8 @@ pub enum Kind {
 impl Kind {
     fn section(self) -> &'static str {
         match self {
-            Self::Settings => "compatibility.md#settingsjson-keys-renamed-in-020",
-            Self::Config => "compatibility.md#config-keys-renamed-in-020",
+            Self::Settings => "compatibility/renamed-keys.md#settingsjson-keys-renamed-in-020",
+            Self::Config => "compatibility/renamed-keys.md#config-keys-renamed-in-020",
         }
     }
     fn errors(self, src: &str, path: &Path) -> Vec<Diagnostic> {

@@ -351,4 +351,4 @@ control calls, so a slow call cannot hold up traffic.
 Control changes nothing by itself. If a call changes settings that request workers read, decide
 how they learn about it: write a file the workers reread, or tell the user to run
 `aproxy restart <port> --format <name>`. The frames, limits and failure handling are in
-[protocol.md](protocol.md#control).
+[protocol/control-and-errors.md](protocol/control-and-errors.md#control).

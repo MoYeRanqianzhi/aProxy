@@ -301,7 +301,7 @@ fn run_with(
                         report.issues.push(Issue {
                             key: None,
                             line: None,
-                            section: "compatibility.md#converting-the-files-with-aproxy-migrate",
+                            section: "compatibility/migrate.md#converting-the-files-with-aproxy-migrate",
                             message: message.into(),
                         });
                     } else {

@@ -152,7 +152,7 @@ keeps the details.
 control each other's instances, so a 0.1.x `aproxy install` stops before
 changing anything, with an error containing `--version 输出无版本号`. Stop the
 instances with 0.1.x and reinstall, following "Moving from 0.1.x to 0.2.0" in
-the aproxy-cli skill's [compatibility.md](https://github.com/MoYeRanqianzhi/aProxy/blob/main/.claude/skills/aproxy-cli/references/latest/compatibility.md#moving-from-01x-to-020).
+the aproxy-cli skill's [compatibility.md](https://github.com/MoYeRanqianzhi/aProxy/blob/main/.claude/skills/aproxy-cli/references/latest/compatibility/from-0.1.md#moving-from-01x-to-020).
 0.2.0 refuses the 0.1.x settings.json and config keys, so after the reinstall
 run `aproxy migrate --dry-run`, show the user the plan, run `aproxy migrate`,
 and settle with the user whatever it leaves for review (a 0.1.x transformer, a

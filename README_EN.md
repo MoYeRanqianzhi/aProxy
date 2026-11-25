@@ -185,7 +185,7 @@ entry that opens the window; `--no-path` and `--no-shortcut` skip those two step
   other's instances, so a 0.1.x `aproxy install` cannot install 0.2.0 (it exits
   with `--version 输出无版本号` after the download and changes nothing). Stop the
   instances and reinstall, following
-  [Moving from 0.1.x to 0.2.0](.claude/skills/aproxy-cli/references/latest/compatibility.md#moving-from-01x-to-020)
+  [Moving from 0.1.x to 0.2.0](.claude/skills/aproxy-cli/references/latest/compatibility/from-0.1.md#moving-from-01x-to-020)
   (the Chinese version is "从 0.1.x 迁移" in the [CHANGELOG](CHANGELOG.md)), then
   convert settings.json and the config files to the 0.2.0 keys with
   `aproxy migrate` (preview with `--dry-run`; each original is kept as

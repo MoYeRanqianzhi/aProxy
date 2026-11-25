@@ -77,7 +77,7 @@
    - npm 装的：`npm i -g @meowo/aproxy@next`（无界面版装 `@meowo/aproxy-headless@next`；0.2.0 正式版之后用 `@latest`）。
    - cargo 装的：`cargo install aproxy --locked --force --version <版本>`（正式版之后可省略 `--version`）。
 4. 清理 0.1.0 的残留：`~/.aproxy/run/install.state`（如果有）、`~/.aproxy/staging/`，以及 `~/.aproxy/run/*.restore`。本版本只读 `run/<端口>.restore.json`，旧格式的 `.restore` 不会被当作恢复依据（此前崩溃的 0.1.x 实例不会被自动拉回）；删掉它们以免以后误读。第 2 步之前还在运行的实例如果崩了，用新 CLI 重新 `aproxy start` 即可。
-5. 配置文件 `config.toml` 与 `settings.json` 要按上面两张对照表改写：两者都改为严格解析，留着旧键时实例不启动、多数命令以退出码 3 结束。可以用新版本逐项改：`aproxy config unset <旧键>` 与 `aproxy settings unset <旧键>` 能删掉不认识的键，再用 `aproxy config set <键> <值>` 与 `aproxy settings set <键> <值>` 写上新键；也可以直接手工编辑。改完运行 `aproxy config show`（每个配置文件，用 `--config <文件>` 指定）与 `aproxy doctor` 检查。
+5. 配置文件 `config.toml` 与 `settings.json` 要按上面两张对照表转换：两者都改为严格解析，留着旧键时实例不启动、多数命令以退出码 3 结束。用新版本的 `aproxy migrate` 转换：先 `aproxy migrate --dry-run` 看逐项改动，确认后 `aproxy migrate`。它转换 `settings.json` 和 home 知道的每份配置（别名、`default_config`、`config_dirs`、`configs/` 与 home 里的 `*.toml`），每份原文先备份为 `<文件>.0.1.bak`，转换后按 `start` 的规则校验。不能机械转换的文件整份不动，列出要人来定的键与行号：0.1.x 的 `[request_transform]` 一类（协议变了，要换成 `[[format]]` 并选定支持协议 1 的程序）、format 的 `extra`、没有 `defaults.base_url` 的全局 `api_key`（0.2.0 预发布版写的设置）、新旧键同时存在、指向不存在文件的别名。这些改好后再运行一次 `aproxy migrate`，最后 `aproxy doctor` 应当没有错误。也可以手工逐项改：`aproxy config unset <旧键>` 与 `aproxy settings unset <旧键>` 能删掉不认识的键，再用 `aproxy config set` 与 `aproxy settings set` 写上新键。
 6. 用 `aproxy --version` 确认装的是 0.2.0 起的版本（首行形如 `aproxy v0.2.0-alpha.2 (desktop; …)`，0.1.x 的输出是 `aproxy 0.1.0`），再用它逐个启动：`aproxy start <别名|配置路径>`。端口不变，agent 客户端的 base URL 不用改。
 7. 更新 skill 文档：`aproxy install --skills-only`，再确认 agent 的 skills 目录链接或复制的是 `~/.aproxy/skills/` 里的新文档。
 

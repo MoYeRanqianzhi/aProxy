@@ -184,7 +184,10 @@ a local binary, `--adopt` takes over an existing install).
   with `--version 输出无版本号` after the download and changes nothing). Stop the
   instances and reinstall, following
   [Moving from 0.1.x to 0.2.0](.claude/skills/aproxy-cli/references/latest/compatibility.md#moving-from-01x-to-020)
-  (the Chinese version is "从 0.1.x 迁移" in the [CHANGELOG](CHANGELOG.md)). While
+  (the Chinese version is "从 0.1.x 迁移" in the [CHANGELOG](CHANGELOG.md)), then
+  convert settings.json and the config files to the 0.2.0 keys with
+  `aproxy migrate` (preview with `--dry-run`; each original is kept as
+  `<file>.0.1.bak`). While
   0.2.0 is a pre-release, add `--pre` to the install script when reinstalling,
   or it installs 0.1.x again.
 - **Download channels and proxy**: online installs try github → npm →

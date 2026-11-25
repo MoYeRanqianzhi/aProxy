@@ -75,8 +75,6 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] **t19：启动来由与备注**（用户 2026-11-26 定进 0.2.0，Codex 在做）：`start`、`restart`、`restore` 加 `--reason`、`--note`，
   看门狗、登录恢复、升级各记自己的来由；实例记录、日志与 `status` 显示「最近一次启动」。完成后主代理补 skill、README 与桌面实例页。
   设计见 [plan/plugins.md](plan/plugins.md)「指定来由与备注」。
-- [ ] **桌面请求详情显示协议路径**（用户 2026-11-26 定进 0.2.0，主代理做）：把已有报告里的 `protocol_convert` 串成一行，只写事实
-  （转换次数、进出是否相同），不下结论。见 [plan/format-chain-view.md](plan/format-chain-view.md)。
 
 ### 0.2.0 之后紧接着（近期，用户 2026-10-12）
 - [ ] **并发限制与排队**：aproxy 的排队放行 + 官方 aproxy-format 的并发/限速/额度规则（协议形状在 0.2.0 定稿，见计划 W2 的 format 定稿补充）
@@ -92,9 +90,9 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   （插件协议 1：请求一行 JSON，含合成后的完整配置；回复固定四行，末行 success 或 failure；插件压过用户配置，后面的覆盖前面的；
   不应答实例就启动失败；有试运行，数据相同、只是不当真启动；请求带启动来由 `reason` 与备注 `note`，`start`、`restart`、`restore`
   可用 `--reason`、`--note` 指定，这两个选项可早于插件单独做）。整体还只是想法，设计与待定问题见 [plan/plugins.md](plan/plugins.md)。
-- [ ] **format 链路视图与冲突提示**（用户 2026-11-26）：展示合成过程与 format 链，按声明与实际报告找出协议绕圈、多次转换、遮蔽、
-  响应没还原；只作为一个检查命令（`aproxy config check`）与桌面上按需打开的视图，从不阻止启动（用户 2026-11-26）；随插件做完整版，
-  0.2.0 可选先在桌面请求详情显示协议路径。设计见 [plan/format-chain-view.md](plan/format-chain-view.md)。
+- [ ] **format 链路视图**（用户 2026-11-26）：展示合成过程与 format 链，按声明与实际报告列出协议路径、转换次数、遮蔽等事实，
+  不下结论；只在用户或 agent 主动查看时做，从不阻止启动；随插件做完整版（桌面请求详情的协议路径已在 0.2.0 做完，72c887bd）。
+  命令怎么分待用户定。设计见 [plan/format-chain-view.md](plan/format-chain-view.md)。
 - [ ] **官方 format 的 UI 扩展样例**（用户 2026-11-23）：给一个官方角色（倾向 keys：看密钥池与冷却状态、临时停用一个 key、
   重启这个 format）做一个扩展样例，示范扩展与 format 的配对、control 进程与 `formats.*` 接口。前提是 t10c 的 control 与
   format 重启做完，且这个角色实现了 control。版本未定。

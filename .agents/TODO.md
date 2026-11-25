@@ -84,9 +84,11 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   按规范只管理声明了它的配置；settings.json 可声明对全部配置生效的全局插件。启动时检查，防止未知插件被偷偷加上。2026-11-26 用户定：插件命令（如 `aproxy tui`）随插件一起做，由插件自己注册在全局、
   可选；插件可预设整套 format，启动时合并；接入 IPC；看门狗不守护插件；故意几乎不设特殊入口，难写不是 bug；启动时逐个交接
   （插件协议 1：请求一行 JSON，含合成后的完整配置；回复固定四行，末行 success 或 failure；插件压过用户配置，后面的覆盖前面的；
-  不应答实例就启动失败；有试运行，数据相同、只是不当真启动）。整体还只是想法，设计与待定问题见 [plan/plugins.md](plan/plugins.md)。
+  不应答实例就启动失败；有试运行，数据相同、只是不当真启动；请求带启动来由 `reason` 与备注 `note`，`start`、`restart`、`restore`
+  可用 `--reason`、`--note` 指定，这两个选项可早于插件单独做）。整体还只是想法，设计与待定问题见 [plan/plugins.md](plan/plugins.md)。
 - [ ] **format 链路视图与冲突提示**（用户 2026-11-26）：展示合成过程与 format 链，按声明与实际报告找出协议绕圈、多次转换、遮蔽、
-  响应没还原；随插件做完整版，0.2.0 可选先在桌面请求详情显示协议路径。设计见 [plan/format-chain-view.md](plan/format-chain-view.md)。
+  响应没还原；只作为一个检查命令（`aproxy config check`）与桌面上按需打开的视图，从不阻止启动（用户 2026-11-26）；随插件做完整版，
+  0.2.0 可选先在桌面请求详情显示协议路径。设计见 [plan/format-chain-view.md](plan/format-chain-view.md)。
 - [ ] **官方 format 的 UI 扩展样例**（用户 2026-11-23）：给一个官方角色（倾向 keys：看密钥池与冷却状态、临时停用一个 key、
   重启这个 format）做一个扩展样例，示范扩展与 format 的配对、control 进程与 `formats.*` 接口。前提是 t10c 的 control 与
   format 重启做完，且这个角色实现了 control。版本未定。

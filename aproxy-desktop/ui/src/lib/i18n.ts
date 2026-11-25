@@ -418,7 +418,7 @@ const zh = {
   'd.truncated': '这条记录太长，部分内容没有保留。',
   'd.headers': '请求头',
   'd.respHeaders': '响应头',
-  'd.body': 'Body',
+  'd.body': '正文',
   'd.secretNote': '密钥已打码',
   'd.hidden': '已隐藏',
   'd.noHeaders': '没有记录头。',

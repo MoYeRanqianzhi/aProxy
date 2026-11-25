@@ -297,7 +297,13 @@ fn run_with(
                 Err(e) => {
                     let mut report = ResultFile::empty(&path);
                     if let Some(message) = missing.filter(|_| e.kind() == io::ErrorKind::NotFound) {
-                        report.problem(kind, false, message.into());
+                        report.outcome = "needs-review";
+                        report.issues.push(Issue {
+                            key: None,
+                            line: None,
+                            section: "compatibility.md#converting-the-files-with-aproxy-migrate",
+                            message: message.into(),
+                        });
                     } else {
                         report.problem(kind, true, text::io(lang, e.kind()));
                     }

@@ -1164,6 +1164,10 @@ fn migrate_inventory_reports_stale_references_without_blocking_other_files() {
                 .unwrap();
             assert_eq!(row["outcome"], "needs-review");
             assert_eq!(row["issues"][0]["message"], msg);
+            assert_eq!(
+                row["issues"][0]["section"],
+                "compatibility.md#converting-the-files-with-aproxy-migrate"
+            );
             assert!(!missing.exists());
         }
         assert_eq!(

@@ -72,6 +72,7 @@ const MIN_SIZE: (f64, f64) = (900.0, 600.0);
 ///   偏移（tao 的 `inset_traffic_lights`）。在 macOS 26 上实测（2026-11-24，GitHub 的 arm64 runner 截图）：
 ///   y = 15 时按钮中心离窗口顶约 12.5，比页面 44px 标题栏（app.css 的 --titlebar-min）的中线 22 高 9.5，
 ///   所以取 24.5 让按钮上下居中。换 macOS 大版本或改了 --titlebar-min 都要截图重新核对。
+///
 /// 页面左侧为它们让出的宽度（--titlebar-left）在 ui/src/lib/shell.ts，改 x 要一起改。
 #[cfg(target_os = "macos")]
 const TRAFFIC_LIGHTS: (f64, f64) = (15.0, 24.5);

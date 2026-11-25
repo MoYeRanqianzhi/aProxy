@@ -9,8 +9,27 @@ use winreg::{
 
 const USER_PATH: &str = r"HKCU\Environment\Path";
 
-fn same(a: &str, b: &str) -> bool {
-    a.trim_end_matches('\\').to_lowercase() == b.trim_end_matches('\\').to_lowercase()
+/// Shell 读回的路径和 Path 条目都可能使用 8.3 短名或不同大小写。比较已存在文件的
+/// 规范路径，使用文件系统返回的名字，不把区分大小写目录中的不同文件折叠成一个。
+fn same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    // 相对 Path 条目随工作目录变化，不能因为此刻指向 bin 就省略持久的绝对路径。
+    if !a.is_absolute() || !b.is_absolute() {
+        return false;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        // 未建的目录没有可查询的短名。保留对原始 Path 大小写和尾部分隔符的判断，
+        // 不猜短名，也不把「无法访问」当成「不存在」。
+        (Err(x), Err(y)) if x.kind() == io::ErrorKind::NotFound && y.kind() == x.kind() => {
+            a.to_str().zip(b.to_str()).is_some_and(|(a, b)| {
+                a.trim_end_matches('\\').to_lowercase() == b.trim_end_matches('\\').to_lowercase()
+            })
+        }
+        _ => false,
+    }
 }
 
 /// 先比较后写回；把原始值作为输入，测试可以检查原始类型和字节而不打开真实用户的环境键。
@@ -55,7 +74,7 @@ fn append(old: Option<RegValue<'_>>, bin: &str) -> io::Result<Option<RegValue<'s
     } else {
         std::borrow::Cow::Borrowed(raw)
     };
-    if env::split_paths(search.as_ref() as &str).any(|p| p.to_str().is_some_and(|p| same(p, bin))) {
+    if env::split_paths(search.as_ref() as &str).any(|p| same_path(&p, Path::new(bin))) {
         return Ok(None);
     }
     if value.vtype == REG_EXPAND_SZ && bin.contains('%') {
@@ -85,7 +104,7 @@ pub(super) fn path(step: &mut Step, home: &Path) -> io::Result<()> {
     let bin = home.join("bin");
     let bin = bin.to_str().ok_or(io::ErrorKind::InvalidInput)?;
     if env::split_paths(&env::var_os("PATH").unwrap_or_default())
-        .any(|p| p.to_str().is_some_and(|p| same(p, bin)))
+        .any(|p| same_path(&p, Path::new(bin)))
     {
         return Ok(());
     }
@@ -203,7 +222,7 @@ mod link {
                 OsString::from_wide(&b[..b.iter().position(|&u| u == 0).unwrap_or(b.len())])
             };
             link.GetPath(&mut buf, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32)?;
-            if read(&buf) != exe.as_os_str() {
+            if !same_path(Path::new(&read(&buf)), exe) {
                 return Ok(false);
             }
             link.GetArguments(&mut buf)?;
@@ -211,12 +230,12 @@ mod link {
                 return Ok(false);
             }
             link.GetWorkingDirectory(&mut buf)?;
-            if read(&buf) != home.as_os_str() {
+            if !same_path(Path::new(&read(&buf)), home) {
                 return Ok(false);
             }
             let mut index = 0;
             link.GetIconLocation(&mut buf, &mut index)?;
-            if index != 0 || read(&buf) != exe.as_os_str() {
+            if index != 0 || !same_path(Path::new(&read(&buf)), exe) {
                 return Ok(false);
             }
             let store: IPropertyStore = link.cast()?;
@@ -256,6 +275,29 @@ mod link {
         temp.persist(dest)?;
         step.touched.push(dest.display().to_string());
         Ok(())
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn saving_through_case_and_short_names_keeps_the_existing_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("Install Home Long Name");
+        let other = temp.path().join("Install Home Long Name Other");
+        for dir in [&home, &other] {
+            let exe = aproxy::install::swap::bin_path_in(dir);
+            std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+            std::fs::write(exe, []).unwrap();
+        }
+        let dest = temp.path().join("Programs/aProxy.lnk");
+        let save_home = |dir: &Path| Step::run(|s| save(s, dir, &dest));
+        let mixed = temp.path().join("INSTALL home LONG name");
+        assert_eq!(save_home(&mixed).status, "changed");
+        for dir in [&mixed, &home, &super::tests::short_path(&home)] {
+            let step = save_home(dir);
+            assert_eq!(step.status, "unchanged", "{dir:?}: {}", step.reason);
+        }
+        assert_eq!(save_home(&other).status, "changed");
+        assert_eq!(save_home(&other).status, "unchanged");
     }
 
     #[cfg(test)]
@@ -316,6 +358,50 @@ pub(super) fn shortcut(step: &mut Step, home: &Path, profile: &Path) -> io::Resu
 mod tests {
     use super::*;
     use winreg::types::FromRegValue;
+
+    /// 取卷实际分配的 8.3 名；卷未启用短名时系统返回长名，不伪造短名。
+    pub(super) fn short_path(path: &Path) -> std::path::PathBuf {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut buf = vec![0; 32768];
+        let len = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) }
+            as usize;
+        assert!(
+            len > 0 && len < buf.len(),
+            "{path:?}: {}",
+            io::Error::last_os_error()
+        );
+        std::ffi::OsString::from_wide(&buf[..len]).into()
+    }
+
+    #[test]
+    fn registry_path_recognizes_existing_long_and_short_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("Install Home Long Name/bin");
+        let other = temp.path().join("Install Home Long Name Other/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let short = short_path(&bin);
+        for (old, new) in [(&short, &bin), (&bin, &short)] {
+            let existing = old.to_str().unwrap();
+            assert!(
+                append(Some(existing.to_reg_value()), new.to_str().unwrap())
+                    .unwrap()
+                    .is_none(),
+                "{old:?} / {new:?}"
+            );
+        }
+        assert!(
+            append(
+                Some(short_path(&other).to_str().unwrap().to_reg_value()),
+                bin.to_str().unwrap()
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
     #[test]
     fn broadcast_failure_keeps_the_write_in_the_report() {
         let mut saved = String::new();

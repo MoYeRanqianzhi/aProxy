@@ -72,6 +72,12 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
     0.1.x 形状的文件时提示 `aproxy migrate`。`upgrade_from_0_1_0` 的 CI 测试在重装后跑它再跑一条要读 settings 的命令。
     排在 t10d 之后交给 Codex（t13）；用户可以改这个决定。
 
+- [ ] **t19：启动来由与备注**（用户 2026-11-26 定进 0.2.0，Codex 在做）：`start`、`restart`、`restore` 加 `--reason`、`--note`，
+  看门狗、登录恢复、升级各记自己的来由；实例记录、日志与 `status` 显示「最近一次启动」。完成后主代理补 skill、README 与桌面实例页。
+  设计见 [plan/plugins.md](plan/plugins.md)「指定来由与备注」。
+- [ ] **桌面请求详情显示协议路径**（用户 2026-11-26 定进 0.2.0，主代理做）：把已有报告里的 `protocol_convert` 串成一行，只写事实
+  （转换次数、进出是否相同），不下结论。见 [plan/format-chain-view.md](plan/format-chain-view.md)。
+
 ### 0.2.0 之后紧接着（近期，用户 2026-10-12）
 - [ ] **并发限制与排队**：aproxy 的排队放行 + 官方 aproxy-format 的并发/限速/额度规则（协议形状在 0.2.0 定稿，见计划 W2 的 format 定稿补充）
 - [ ] **用量与费用统计**、**按 key 限速**、**预算上限**（建在生命周期通知上）

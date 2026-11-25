@@ -1,7 +1,9 @@
 /*
  * 生成桌面界面的软件图标，写进 aproxy-desktop/icons/：
  *   icon.ico  Windows（16/24/32/48/64/256）：tauri-build 把它编进 exe 的资源，窗口与任务栏的图标取自那里；
- *   icon.png  128×128，Linux 与 macOS 的窗口图标（generate_context! 把它解成 RGBA 嵌进二进制，所以不取更大）。
+ *   icon.png  128×128，Linux 与 macOS 的窗口图标（generate_context! 把它解成 RGBA 嵌进二进制，所以不取更大）；
+ *   icon-256.png、icon-512.png  与 128×128 一起供 Linux 的 hicolor 图标主题使用；
+ *   icon.icns  macOS 应用包图标，包含 16 到 1024 像素的 PNG。
  *
  * 图标就是吉祥物预览页里的「软件图标」：吉祥物的 icon({ px, mood: null }) 拼上一种底（src/lib/mascot/app-icon.ts），
  * 颜色取浅色主题、标准配色强度下的令牌（src/app.css 与 src/lib/mascot/palette-sources.ts）。换形象、换底、改配色
@@ -28,7 +30,9 @@ import { tumbler } from '../src/lib/mascot/tumbler.ts';
 
 const MASCOTS = { tumbler, courier, orb };
 const ICO_SIZES = [16, 24, 32, 48, 64, 256];
-const PNG_SIZE = 128;
+const ICNS_SIZES = [
+  ['icp4', 16], ['icp5', 32], ['icp6', 64], ['ic07', 128], ['ic08', 256], ['ic09', 512], ['ic10', 1024],
+];
 const OUT_DIR = new URL('../../icons/', import.meta.url);
 
 const { values: args } = parseArgs({
@@ -46,8 +50,27 @@ const render = (px) => new Resvg(appIcon(mascot, args.plate, px, palette)).rende
 
 mkdirSync(OUT_DIR, { recursive: true });
 writeFileSync(new URL('icon.ico', OUT_DIR), ico(ICO_SIZES.map((px) => ({ px, image: render(px) }))));
-writeFileSync(new URL('icon.png', OUT_DIR), render(PNG_SIZE).asPng());
-console.log(`icons: ${args.mascot} + ${args.plate} → aproxy-desktop/icons/icon.ico, icon.png`);
+const frames = ICNS_SIZES.map(([type, px]) => {
+  const png = render(px).asPng();
+  if ([128, 256, 512].includes(px)) writeMenuIcon(px === 128 ? 'icon.png' : `icon-${px}.png`, png);
+  return icnsChunk(type, png);
+});
+writeMenuIcon('icon.icns', icnsChunk('icns', Buffer.concat(frames)));
+console.log(`icons: ${args.mascot} + ${args.plate} → icon.ico, icon.png, icon-256.png, icon-512.png, icon.icns`);
+
+// Cargo 不会把嵌套的 aproxy-desktop 包收入根包；两个发布包里的图标由同一份字节生成。
+function writeMenuIcon(name, bytes) {
+  writeFileSync(new URL(name, OUT_DIR), bytes);
+  writeFileSync(new URL(`../../../src/commands/install/integration/${name}`, import.meta.url), bytes);
+}
+
+// ICNS 容器和各个图像块都以四字节类型和大端总长度（含头）开头。
+function icnsChunk(type, payload) {
+  const header = Buffer.alloc(8);
+  header.write(type, 0, 'ascii');
+  header.writeUInt32BE(8 + payload.length, 4);
+  return Buffer.concat([header, payload]);
+}
 
 function fail(message) {
   console.error(message);

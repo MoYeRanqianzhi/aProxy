@@ -109,9 +109,6 @@ fn profiles(step: &mut Step, home: &Path, profile: &Path, zsh: bool, fish: bool)
     Ok(())
 }
 
-#[cfg(feature = "desktop")]
-const ICON: &[u8] = include_bytes!("icon.png");
-
 #[cfg(all(feature = "desktop", not(target_os = "macos")))]
 pub(super) fn shortcut(step: &mut Step, home: &Path, profile: &Path) -> io::Result<()> {
     let data = env::var_os("XDG_DATA_HOME")
@@ -142,7 +139,17 @@ fn desktop_file(step: &mut Step, home: &Path, profile: &Path, data: &Path) -> io
     let entry = format!(
         "[Desktop Entry]\nType=Application\nName=aProxy{suffix}\nExec={token} desktop --installed-home\nIcon=aproxy\nTerminal=false\nCategories=Network;Development;\nStartupWMClass=Aproxy\n"
     );
-    step.write(&data.join("icons/hicolor/128x128/apps/aproxy.png"), ICON)?;
+    // Icon 键不带尺寸；由桌面按缩放倍率从同一主题选最合适的图。
+    for (px, png) in [
+        (128, include_bytes!("icon.png").as_slice()),
+        (256, include_bytes!("icon-256.png").as_slice()),
+        (512, include_bytes!("icon-512.png").as_slice()),
+    ] {
+        step.write(
+            &data.join(format!("icons/hicolor/{px}x{px}/apps/aproxy.png")),
+            png,
+        )?;
+    }
     step.write(
         &data.join(format!("applications/aproxy{suffix}.desktop")),
         entry.as_bytes(),
@@ -171,16 +178,10 @@ pub(super) fn shortcut(step: &mut Step, home: &Path, profile: &Path) -> io::Resu
 </dict></plist>
 "#
     );
-    // ic07 是存放 128×128 PNG 的 ICNS 元素；包头与元素头都以大端字节数计长。
-    let icns = [
-        b"icns".as_slice(),
-        &((ICON.len() + 16) as u32).to_be_bytes(),
-        b"ic07",
-        &((ICON.len() + 8) as u32).to_be_bytes(),
-        ICON,
-    ]
-    .concat();
-    step.write(&contents.join("Resources/aProxy.icns"), &icns)?;
+    step.write(
+        &contents.join("Resources/aProxy.icns"),
+        include_bytes!("icon.icns"),
+    )?;
     let macos = contents.join("MacOS");
     fs::create_dir_all(&macos)?;
     let link = macos.join("aProxy");
@@ -233,6 +234,15 @@ mod tests {
         assert_eq!(step.touched.len(), 1);
         assert!(!bare.path().join(".bashrc").exists());
     }
+    // 不依赖图像解码库：PNG 签名后的首块是 IHDR，宽和高各占四个大端字节。
+    #[cfg(feature = "desktop")]
+    fn check_png_size(png: &[u8], px: u32) {
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(&png[12..16], b"IHDR");
+        assert_eq!(&png[16..20], &px.to_be_bytes());
+        assert_eq!(&png[20..24], &px.to_be_bytes());
+    }
+
     #[cfg(all(feature = "desktop", not(target_os = "macos")))]
     #[test]
     fn xdg_application_entry_and_theme_icon() {
@@ -255,10 +265,10 @@ mod tests {
         ] {
             assert!(text.contains(key));
         }
-        assert_eq!(
-            fs::read(p.join("icons/hicolor/128x128/apps/aproxy.png")).unwrap(),
-            ICON
-        );
+        for px in [128_u32, 256, 512] {
+            let png = fs::read(p.join(format!("icons/hicolor/{px}x{px}/apps/aproxy.png"))).unwrap();
+            check_png_size(&png, px);
+        }
     }
     #[cfg(all(feature = "desktop", target_os = "macos"))]
     #[test]
@@ -274,11 +284,28 @@ mod tests {
             fs::read_link(c.join("MacOS/aProxy")).unwrap(),
             home.join("bin/aproxy")
         );
-        assert!(
-            fs::read(c.join("Resources/aProxy.icns"))
-                .unwrap()
-                .starts_with(b"icns")
+        let icns = fs::read(c.join("Resources/aProxy.icns")).unwrap();
+        assert_eq!(&icns[..4], b"icns");
+        assert_eq!(
+            u32::from_be_bytes(icns[4..8].try_into().unwrap()) as usize,
+            icns.len()
         );
+        let mut frames = &icns[8..];
+        for (kind, px) in [
+            (b"icp4", 16),
+            (b"icp5", 32),
+            (b"icp6", 64),
+            (b"ic07", 128),
+            (b"ic08", 256),
+            (b"ic09", 512),
+            (b"ic10", 1024),
+        ] {
+            assert_eq!(&frames[..4], kind);
+            let len = u32::from_be_bytes(frames[4..8].try_into().unwrap()) as usize;
+            check_png_size(&frames[8..len], px);
+            frames = &frames[len..];
+        }
+        assert!(frames.is_empty());
         let info = fs::read_to_string(c.join("Info.plist")).unwrap();
         for key in ["CFBundleName", "CFBundleDisplayName", "CFBundleExecutable"] {
             assert!(info.contains(&format!("<key>{key}</key><string>aProxy</string>")));

@@ -31,7 +31,7 @@ machine.
   pinned port is discarded. Clients need a fixed address, so use `0` only for throwaway tests.
 - A non-loopback address (`0.0.0.0`, a LAN IP) lets every host that can reach the port use the
   upstream through the proxy, with any key the instance injects. `aproxy start`, the startup log and
-  `aproxy doctor` warn with a message containing `不是回环地址` ("is not a loopback address"). It
+  `aproxy doctor` warn with a message containing `is not a loopback address`. It
   also switches off the default Host check (see [allowed_hosts](storage-and-access.md#allowed_hosts--allowed_origins)).
 
 ## api_key
@@ -63,8 +63,7 @@ override_headers = { "user-agent" = "my-agent/1.0" }
 - An `accept-encoding` entry in `override_headers` reaches the upstream only on requests that get
   no keepalive. Keepalive requests always go upstream with `accept-encoding: identity`, because
   heartbeats cannot be inserted into a compressed stream. When your entry is shadowed this way, the
-  log shows a warn at start: `override_headers 里的 accept-encoding 对保活适用的请求不生效`
-  ("accept-encoding in override_headers does not apply to keepalive requests").
+  log shows a warn at start: `The accept-encoding override does not apply to keepalive requests.`
 - An entry whose name or value is not a legal HTTP header (a space in the name, a line break in the
   value) is skipped without any message; verify the upstream receives a header that matters. Do not
   list one header twice with different capitalization: which entry wins is unspecified.

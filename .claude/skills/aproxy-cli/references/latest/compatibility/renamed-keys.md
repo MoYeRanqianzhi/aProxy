@@ -96,7 +96,11 @@ To edit by hand, changing one key at a time with `aproxy config set KEY VALUE` a
 accepts any key, including one this version does not know. After the renames, `aproxy config show`
 prints the file's values and exits 3 if anything is still wrong.
 
-If the binary was replaced while 0.1.x instances were still running, `aproxy status` lists them
-under `无响应的 aProxy 实例 (<n>)——进程仍在，但不应答控制通道` ("unresponsive instances: the process
-is still there but does not answer the control channel") with version `v0.1.<x>`. Once the user
-agrees, end each with `aproxy stop <port> --force`, then continue from step 4 in [from-0.1.md](from-0.1.md).
+If the binary was replaced while 0.1.x instances were still running (their ports stay busy, and
+`aproxy start` reports the port in use by another program), stop them with the 0.1.x binary they run from, under the same home: get it back (the copy from
+step 2 of [from-0.1.md](from-0.1.md), or the v0.1.0 release asset saved under another name outside
+`<home>/bin/`, so the 0.2.0 binary stays in place) and, once the user agrees, run `<that binary> stop <port>` (or
+`stop all`). The current CLI does not list 0.1.x instances, since their records have another name,
+and cannot reach their control channel, so `aproxy stop --force` and `aproxy install --force` do
+not end them either (`install --force` only lists them as processes it did not stop). Then continue
+from step 5 in [from-0.1.md](from-0.1.md).

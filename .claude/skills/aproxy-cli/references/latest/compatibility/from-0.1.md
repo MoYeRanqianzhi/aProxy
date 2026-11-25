@@ -19,10 +19,20 @@ Move by reinstalling instead. Stopping instances cuts the requests they are serv
 moment with the user first.
 
 1. With the 0.1.x CLI, note what runs: `aproxy status` (ports and config files) and
-   `aproxy alias list`. Back up `settings.json` and the `*.toml` files under `<home>`.
-2. With the 0.1.x CLI, run `aproxy stop all`, then `aproxy status` until it lists no instance. Do
+   `aproxy alias list`. Note how each instance was started, not only its config: 0.1.x keeps each
+   running instance's command line in `<home>/run/<port>.restore` (JSON with an `args` list), which
+   shows the flags given at start (`--listen`, `--baseurl`, `--api-key`, `--proxy` ...). Those flags
+   are not in any config file, and they may hold a key in plain text: do not print it; note which
+   flags each instance uses, and agree with the user where the values will live under 0.2.0 (usually
+   in that instance's config.toml).
+2. Copy what going back would need into a private folder only the user can read: `settings.json`,
+   every config file the instances and aliases use (including those outside `<home>`), the
+   `<home>/run/*.restore` files and the 0.1.x binary from `<home>/bin/`. Keep the folder until the
+   new setup has run without trouble; it holds credentials, so tell the user where it is and delete
+   it together once it is no longer needed.
+3. With the 0.1.x CLI, run `aproxy stop all`, then `aproxy status` until it lists no instance. Do
    this before the binary changes: afterwards no command can stop these instances gracefully.
-3. Replace the binary through the channel that installed it. Every channel picks the newest
+4. Replace the binary through the channel that installed it. Every channel picks the newest
    stable version unless told otherwise, and while 0.2.0 exists only as a pre-release that is
    still 0.1.x, so ask for the pre-release explicitly or you reinstall what you just removed:
    - install script or `aproxy install`: delete `<home>/bin/aproxy` (`aproxy.exe` on Windows, and
@@ -37,20 +47,22 @@ moment with the user first.
      for the release.
    Then run `aproxy --version`: the first line must read `aproxy v0.2…` (0.1.x prints
    `aproxy 0.1.0`).
-4. Delete what 0.1.x leaves behind: `<home>/run/install.state` and `<home>/staging/`, which 0.2.0
-   never reads, and any `<home>/run/*.restore`. 0.2.0 reads only `<home>/run/*.restore.json`, so the
-   old files are ignored rather than acted on; remove them so they do not mislead a later
-   inspection. A crashed 0.1.x instance's record is dead too: if that instance matters, start it
-   again with the new CLI after the upgrade.
-5. Keep `settings.json` and the config files, but convert both: 0.2.0 refuses the 0.1.x shapes, so
+5. Delete what 0.1.x leaves behind: `<home>/run/install.state` and `<home>/staging/`, which 0.2.0
+   never reads, and any `<home>/run/*.restore` (the copies from step 2 are kept). 0.2.0 reads only
+   `<home>/run/*.restore.json`, so the old files are ignored rather than acted on; remove them so
+   they do not mislead a later inspection. A crashed 0.1.x instance's record is dead too: if that
+   instance matters, start it again with the new CLI after the upgrade.
+6. Keep `settings.json` and the config files, but convert both: 0.2.0 refuses the 0.1.x shapes, so
    until they are converted most commands stop with exit 3 and no instance starts. Use
    `aproxy migrate` as [Converting the files with aproxy migrate](migrate.md#converting-the-files-with-aproxy-migrate)
    describes: preview with `aproxy migrate --dry-run`, show the user the planned changes, run
    `aproxy migrate`, then settle with the user whatever it leaves for review. Finish with
    `aproxy doctor`, which must report no errors.
-6. Start each instance with the new CLI: `aproxy start <alias or config path>`. Ports are unchanged,
-   so agent clients need no change.
-7. Refresh these documents with `aproxy install --skills-only`, and check that the agent's skills
+7. Start each instance with the new CLI: `aproxy start <alias or config path>`, with the settings
+   from step 1 now in its config (or given again as `start` flags, which 0.2.0 renamed: table
+   below). Check each port with `aproxy status` against the list from step 1; when every instance
+   is back on its old port, agent clients need no change.
+8. Refresh these documents with `aproxy install --skills-only`, and check that the agent's skills
    directory links to or copies `<home>/skills/aproxy-cli`.
 
 ### Commands changed in 0.2.0
@@ -84,10 +96,13 @@ stdout, so a script can read the output of `--json` directly.
 
 0.2.0 and later never install a version below 0.2.0, whether named or given with `--from`, and
 `--allow-downgrade` does not change that. They stop with
-`目标版本 <v> 低于 0.2.0，不能安装：0.1.x 与 0.2.0 起的版本互不兼容…` ("target version below 0.2.0
-cannot be installed: 0.1.x and 0.2.0 or later are incompatible"). To go back, stop every instance
-with the current CLI (`aproxy stop all`), delete the binary from `<home>/bin/` as in step 3, and
-install 0.1.x with that release's install script, naming its tag, for example
-`curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/v0.1.0/scripts/install.sh | sh -s -- v0.1.0`.
-On Windows, put the release binary from the Releases page at `<home>/bin/aproxy.exe` instead. Then
-start the instances with 0.1.x.
+`Target version <v> is below the minimum 0.2.0. Versions 0.1.x and 0.2.0 or later have incompatible control protocols and disk layouts. …`
+Going back replaces the user's binary and files, so agree on it with the user first. Stop every
+instance with the current CLI (`aproxy stop all`) and delete the binary from `<home>/bin/` as in
+step 4. Put the 0.1.x binary back: the copy from step 2, or install it with that release's install
+script, naming its tag, for example
+`curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/v0.1.0/scripts/install.sh | sh -s -- v0.1.0`
+(on Windows, put the release binary from the Releases page at `<home>/bin/aproxy.exe`). 0.1.x cannot
+read the converted files, so restore the originals before starting anything: the copies from step 2,
+or the `<file>.0.1.bak` that `aproxy migrate` left next to each file it converted. Then start the
+instances with 0.1.x, using the flags noted in step 1.

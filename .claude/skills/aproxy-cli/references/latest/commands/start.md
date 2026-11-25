@@ -42,8 +42,8 @@ Only `start` takes start options; each other command lists its own options with 
 `default_config` from settings.json, else `<home>/config.toml`. `config …` uses its own `--config`
 (an alias or a path), else `default_config`, else `<home>/config.toml`. If `default_config` points
 to a file that no longer exists, the commands that need the config exit 4 with
-`settings.json 指定的默认配置文件不存在: <path>` ("the default config named in settings.json does
-not exist"): `aproxy start` without a target and `aproxy config …` without `--config`. Every other
+`Default configuration file in settings.json does not exist: <path>`:
+`aproxy start` without a target and `aproxy config …` without `--config`. Every other
 command is unaffected; repair the setting with `aproxy settings set default_config PATH` or
 `aproxy settings unset default_config`.
 
@@ -64,7 +64,7 @@ What `start` checks, in order:
 
 1. **Config.** The file is loaded strictly; a TOML syntax error, an unknown key (including every
    old 0.1.x name), an invalid value or a `listen_addr` without a valid port stops here with exit
-   3, printing `配置错误: …` ("config error") followed by one `file:line:col: key: message [code]`
+   3, printing `Configuration errors:` followed by one `file:line:col: key: message [code]`
    line per problem; the codes are listed in config-toml.md, "Checks at start". A fresh install has no `base_url`, so
    run `aproxy config set base_url URL` and `aproxy config set api_key KEY` before the first start.
    Field rules: config-toml.md. When `start` is given neither `--config` nor a positional target and
@@ -72,30 +72,30 @@ What `start` checks, in order:
    and settings.json `defaults` supply everything, and `base_url` must come from one of them. Such
    an instance can still be restarted and restored.
 2. **Same port.** If an aProxy instance already answers on the port with the same listen address,
-   `start` prints `此端口已有 aProxy 在运行，无需重复启动：` ("already running on this port") and
+   `start` prints `aProxy is already running on this port:` and
    exits 0, so repeating `start` is safe. With a different listen address it refuses
-   (`…两者不能并存。`, "the two cannot coexist"): instances are identified by port alone.
+   (`Port <port> is in use by an aProxy instance listening on <addr>. …`): instances are identified by port alone.
 3. **Bind.** A trial bind distinguishes a port taken by another program from one the system
    reserves; the messages and fixes are in troubleshooting.md.
 4. **Launch.** The instance is started from a launch spec and detaches from the launching terminal
    (on Unix it gets its own session, so Ctrl+C in that terminal does not reach it; on Windows it
    tries to leave the launcher's job object, and startup.log warns when it cannot). `start` waits
    up to 30 s for it to answer over IPC; an early exit is reported at once. Success prints pid,
-   listen address, upstream, config and `日志: <path>` ("log"). A timeout prints
-   `新实例（pid <pid>）未在预期时间内就绪（进程存活）` ("new instance not ready in time"; the parenthesis
-   says `进程状态不可判` when liveness cannot be determined) and the reason is usually in
+   listen address, upstream, config and `Log: <path>`. A timeout prints
+   `The new instance (pid <pid>) did not become ready in time (process is running)` (the parenthesis
+   says `process state unknown` when liveness cannot be determined) and the reason is usually in
    `<home>/logs/startup.log`.
 
 - A listen port of `0` lets the OS choose. `start` waits for the instance and reports the actual
   address; that port is pinned in the instance's desired-state record, so `restart`, `restore` and
   a watchdog respawn return to it while the config still says `0`. Once the config names a fixed
   port, the config wins and the pinned port is discarded.
-- A non-loopback listen address prints `警告: 监听地址 <addr> 不是回环地址…` ("not a loopback
-  address") but does not block the start.
+- A non-loopback listen address prints `Warning: Listening address <addr> is not a loopback address. …`
+  but does not block the start.
 - After a successful background start, aProxy makes sure a watchdog is running when
   `watchdog.enabled` is true in settings.json (the default).
 - `--foreground` keeps the instance in the console: logs print there and Ctrl+C stops it. It is
   still registered, so `status` and `stop` work, but it has no desired-state record: closing the
   console ends it for good, `aproxy restore` does not bring it back, and `aproxy restart` refuses
-  it with `…没有可用来重新拉起它的记录（前台运行的实例要在它自己的终端里重启）`. Start it again
+  it with `…this instance has no launch record. Restart foreground instances in their own terminal.` Start it again
   to bring it back.

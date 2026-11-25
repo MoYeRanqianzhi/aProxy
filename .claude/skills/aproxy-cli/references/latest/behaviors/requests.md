@@ -59,8 +59,8 @@ Otherwise retries are unlimited: the request ends when an attempt succeeds or th
 Retrying every 4xx is deliberate. Rate limits (429) and transient auth failures are common on real
 upstreams, and while aProxy retries, the client sees a slow answer rather than an error. The price is
 that a deterministic error (wrong key, wrong path, unknown model) is retried forever too, and the
-client waits indefinitely. The log shows it as repeated `上游返回可重试状态码，重试` ("upstream returned a
-retryable status, retrying") lines, each followed by `错误响应预览` ("error response preview") with the
+client waits indefinitely. The log shows it as repeated `Upstream returned a retryable status; retrying`
+lines, each followed by `Error response preview` with the
 upstream's own error body; fix the configuration, or add a retry rule.
 
 When a request has to stop after a keepalive response was already committed, the client gets a
@@ -97,8 +97,7 @@ program), `status` (a list of HTTP status codes), or both; `max_attempts` is req
   the whole rule, because a rule with a matcher silently removed is wider than written. A `body`
   matcher is reserved and reports `config_not_supported`.
 
-The log says `重试规则给的尝试次数用完，不再重试` ("the attempt count given by the retry rule is used
-up; not retrying"). Use rules for endpoints a particular upstream never supports; troubleshooting.md
+The log says `retry attempt limit reached`. Use rules for endpoints a particular upstream never supports; troubleshooting.md
 has the Claude Code `count_tokens` case.
 
 The settings.json `defaults.retry.rules` global default is used as the rule list when config.toml has

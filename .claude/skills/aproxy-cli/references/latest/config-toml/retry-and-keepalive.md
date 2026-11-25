@@ -124,8 +124,7 @@ status = [400, 404, 410]
 max_attempts = 2
 ```
 
-When a rule stops a request, the log says `重试规则给的尝试次数用完，不再重试` ("the attempt count
-given by the retry rule is used up; not retrying"), with the rule's index and the last failure
+When a rule stops a request, the log says `retry attempt limit reached`, with the rule's index and the last failure
 code. Look for it to confirm a rule matched. Runtime details: behaviors.md, "Retry rules".
 
 ## delivery
@@ -169,6 +168,6 @@ Forward mode and `[[format]]` can be combined:
 - Only 2xx responses go through `response` and `stream`; other statuses pass through as they are.
 
 Set it with `aproxy config set delivery "forward"`. When it is on, `aproxy start` prints
-`仅转发模式：不缓冲、不重试` ("forward-only mode: no buffering, no retries").
+`Forward-only mode: no buffering or retries`.
 
 Runtime details: behaviors.md, "Forward-only mode".

@@ -68,9 +68,8 @@ the skill files), `{target}` (the Rust target triple) and `{variant}` (the CPU s
 empty; it says nothing about desktop or headless, which `{asset}` already carries). A mirror should
 host both builds of a release: an install can fall back from the desktop build to the headless one
 when the desktop build does not run. When
-`<url>.sha256` exists the download is checked against it; otherwise it is accepted with
-`[警告] 来源为非官方镜像（url 模板），产物未经独立校验` ("warning: unofficial mirror (URL template);
-artifact not independently verified").
+`<url>.sha256` exists the download is checked against it; otherwise it is accepted with the warning
+`unofficial URL-template source: artifact not independently verified`.
 
 ```json
 {

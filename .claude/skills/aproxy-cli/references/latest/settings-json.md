@@ -61,7 +61,7 @@ means running instances keep the old value until `aproxy restart PORT|ALIAS`.
 | Key | Type | Default | When it takes effect |
 |---|---|---|---|
 | `schema` | integer, `1` | `1` | next command |
-| `language` | `"system"`, `"en"` or `"zh-CN"` | `"system"` | next command; this version only validates it and keeps printing Chinese |
+| `language` | `"system"`, `"en"` or `"zh-CN"` | `"system"` | next command; picks the language of what the CLI prints for people when `APROXY_LANG` is not set (troubleshooting.md explains the order). Logs, `--json` and error codes stay English |
 | `aliases` | object, name to path | `{}` | next command |
 | `default_config` | string or `null` | `null` | next command |
 | `config_dirs` | array of paths | `[]` | next `find` / `doctor` |

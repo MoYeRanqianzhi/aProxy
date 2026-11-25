@@ -23,7 +23,7 @@ Part of [behaviors.md](../behaviors.md), which lists the other parts. Crash and 
   answer, waits up to 30 s for each start, and reports the actual port. If the config file named by
   a record is missing, it keeps the record and says so, so a file that comes back later (a network
   drive that mounts late) can still be restored. With nothing to do it prints
-  `没有需要恢复的实例。` ("no instances to restore") and exits 0, so it is safe as a logon task for
+  `No instances to restore.` and exits 0, so it is safe as a logon task for
   recovery after a reboot or power loss.
 - A restored or respawned instance reuses the spec but reads its config file as it is now: unapplied
   edits take effect, and a changed port moves the instance (the old port's record is replaced by the
@@ -36,8 +36,7 @@ Part of [behaviors.md](../behaviors.md), which lists the other parts. Crash and 
 One background process watches every instance: the same executable started as
 `aproxy __watchdog --home <dir>` (no public subcommand), a few MB of memory regardless of instance
 count. It is on by default; the switch and tuning fields are in settings-json.md
-(`watchdog.enabled` and the other `watchdog` keys). It works on Windows and Linux and is not
-supported on macOS.
+(`watchdog.enabled` and the other `watchdog` keys). It runs on Windows, Linux and macOS.
 
 - **Death** (crash, kill by PID): the watchdog sees the process exit at once and acts on it at once,
   so the instance is back within its startup time (typically under a second). With a desired-state
@@ -89,18 +88,18 @@ one at a time, so at most one instance is restarting at any moment. Flags and mo
 commands.md. During the run:
 
 - Before the swap it asks each instance over the control channel to enter the binary-swap phase.
-  `aproxy status` then shows `二进制更换中（install 滚动重启阶段，请勿手动干预此实例）` ("binary swap in
-  progress; do not intervene"). Do not stop, restart or kill such an instance: install is about to
+  `aproxy status` then shows `Replacing the binary during a rolling install. Do not stop or restart this instance.`
+  Do not stop, restart or kill such an instance: install is about to
   restart it, and interfering makes the two fight.
 - An instance that does not acknowledge (it is in a faulty state) is restarted onto the installer's
-  version, for up to three rounds. If it still fails, install aborts with `实例未表达（已按重试/restart 收敛）`
-  ("instances did not acknowledge after retries and restarts") or `实例 <port> 收敛重启失败` ("restarting
-  instance <port> failed") and kills nothing. Ask the user whether that instance may be stopped, stop
+  version, for up to three rounds. If it still fails, install aborts with `Instances still have not acknowledged after retries and restarts: …`
+  or `Restarting the instance on port <port> to obtain its acknowledgment failed: …`
+  and kills nothing. Ask the user whether that instance may be stopped, stop
   it, and run install again.
 - If the new binary cannot bring an instance up (stricter validation of the existing config,
   antivirus, not ready within 30 s), install restarts that instance from the old binary with the
   same launch spec, halts the rollout (remaining instances stay on the old version), prints
-  `滚动已中止，不会自动重试：…` ("rollout halted, will not retry automatically") and exits non-zero. The
+  `Rolling restarts stopped and will not retry automatically. …` and exits non-zero. The
   binary in `bin/` and the install phase are not rolled back: `<home>/install/state.json` holds phase
   `failed` and the cause in `last_error`. Read startup.log, fix the cause, run `aproxy install` again.
   If the old binary cannot start the instance either, it is down but its desired-state record is
@@ -111,10 +110,12 @@ commands.md. During the run:
   `<home>/install/lock`.
 - After the download is verified, the installer hands the install to the downloaded binary and waits
   for it (a downgrade is run by the installer itself). If that wait times out
-  (`… 秒内未确认安装完成（可能仍在后台进行）…`, "completion not confirmed in time; may still be running"),
+  (`Installation did not finish within N seconds. It may still be running. …`),
   check instance versions with `aproxy status`.
-- An interrupted install (crash, power loss) resumes by itself: any later `aproxy` command, or the
-  watchdog, starts `install --continue` when `<home>/install/state.json` is left over.
+- An interrupted install (crash, power loss) resumes by itself when `<home>/install/state.json` is
+  left over: the watchdog, `aproxy desktop`, and every command that changes instances or settings
+  start `install --continue`; commands that only look (`status`, `logs`, `doctor` ...) do not.
+  commands/install.md lists them.
 - Inside the swap window the watchdog gives a dying instance up to 5 × 3 s to come back on its own
   before respawning it, and instances do not relaunch a missing watchdog.
 
@@ -123,12 +124,20 @@ the binary and then restores the instances (commands.md, Force install).
 
 ### Skill documentation
 
-Alongside the binary, install downloads the skill bundle (aproxy-cli and aproxy-format) of the same
-version into `<home>/skills/<name>/`, replacing each directory atomically. A failed download does not
+Alongside the binary, install downloads the skill bundle of the same version (every skill aProxy
+ships: aproxy-cli, aproxy-format, the aproxy-audit-* skills and the others) into
+`<home>/skills/<name>/`, replacing each directory atomically. A failed download does not
 fail the install; its result is in the `skill` field of `<home>/install/state.json`, `aproxy install --skills-only`
 retries it, and `install --continue` does not. `--no-skills`, or `update.skill_auto_update = false` in
 settings.json, skips it. Install never writes into an agent's own skills directory; link or copy
 `<home>/skills/aproxy-cli` there yourself, for example to `~/.claude/skills/aproxy-cli` for Claude Code.
+
+`aproxy skill` works with that bundle: `skill install` (alias `upgrade`) installs the skills of the
+running version, with `--download-proxy URL` and `--json`; `skill list [--json]` shows each installed
+skill with its version, `matches_binary` (whether that version is the running binary's), location and
+files; `skill show NAME [FILE]` prints one file after checking it against the bundle's manifest
+(`SKILL.md` by default), and `skill show NAME --files` lists the files. A matching manifest proves
+the file is the installed copy, not that it matches the binary: check `matches_binary` for that.
 
 ## Download proxy versus request proxy
 

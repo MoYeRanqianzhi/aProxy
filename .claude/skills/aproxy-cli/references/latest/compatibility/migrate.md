@@ -6,15 +6,23 @@ Part of [compatibility.md](../compatibility.md), which lists the other parts. Co
 
 `aproxy migrate` rewrites 0.1.x files into the 0.2.0 shape using the two rename tables in [renamed-keys.md](renamed-keys.md)
 ("settings.json keys renamed in 0.2.0" and "Config keys renamed in 0.2.0"). Only 0.2.0 and later
-have it, so run it with the new CLI after step 3 of [from-0.1.md](from-0.1.md). It changes only what has one mechanical answer and
-leaves alone any file that needs a decision, so it never guesses on the user's behalf.
+have it, so run it with the new CLI after step 4 of [from-0.1.md](from-0.1.md). It changes only what has one mechanical answer and
+leaves alone any file that needs a decision, so it never guesses on the user's behalf. That
+decision is made per file: in one run some files can be converted while others are left for review,
+and a review point about a path (an alias whose file is gone) is reported on its own, so the
+settings file itself may already be converted when that point is still open. Read the report file by
+file.
 
 **Which files.** Without arguments it takes `<home>/settings.json` and every config file the home
 knows: alias targets, `default_config`, and the `*.toml` files in each `config_dirs` entry, in
 `<home>/configs/` and in `<home>` itself, the same set `aproxy doctor` checks. It reads that list from the 0.1.x settings.json even though 0.2.0 otherwise refuses
-the file, so no alias is missed. `aproxy migrate PATH...` converts only the named config files, each
-once even when two paths lead to the same file; settings.json is converted only by the form without
-paths. Backups, files under `<home>/run/` and files already in the 0.2.0 shape are not rewritten.
+the file, so no alias is missed. `aproxy migrate PATH...` converts only the named config files;
+settings.json is converted only by the form without paths, but is still read, because each config is
+checked against the settings it will run with. A file reached by two paths is converted once (paths
+are compared after resolving links and `..`). Backups, files under `<home>/run/` and files already in
+the 0.2.0 shape are not rewritten. On Unix a file with other hard links is left for review
+("This file has other hard links; migrating it would separate them."), because replacing it would
+leave the other names pointing at the old content.
 
 **What happens to each file.**
 
@@ -66,8 +74,8 @@ which program sees the user's requests, or which of two values wins. Then run
 file has no key or line and prints as `: message (section)`). Secrets are masked in the report, not
 in the files. The last line reminds that running instances keep the configuration they loaded.
 
-The text follows the user's language, so on a Chinese system the headings and messages are Chinese
-(`将迁移`, `未改动，需要人工确认` …). To match messages against the table above, use `--json`: it
+The text follows the user's language, so on a Chinese system the headings and messages are Chinese.
+To match messages against the table above, use `--json`: it
 prints the same report as one document, always in English, with `files[]` (`path`, `outcome` =
 `migrated`, `current`, `needs-review` or `failed`, `changes`, `issues` with `key`, `line`, `message`,
 `section`) and a `summary` with the counts.
@@ -83,7 +91,7 @@ A file edited by someone else while migrate ran, or one whose written text faile
 and was put back from its backup, is left for review (exit 5 or 3), not a failure: run migrate again.
 
 **What it leaves alone.** Running instances, until they restart; desired-state records; the 0.1.x
-leftovers of step 4 in [from-0.1.md](from-0.1.md); the programs that format entries run.
+leftovers of step 5 in [from-0.1.md](from-0.1.md); the programs that format entries run.
 
 Elsewhere 0.2.0 points at migrate when it meets a 0.1.x file. Most commands end their error list
 with ``Preview the 0.1.x changes with `aproxy migrate --dry-run`, then run `aproxy migrate`.``,

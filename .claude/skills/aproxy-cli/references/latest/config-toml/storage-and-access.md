@@ -53,7 +53,7 @@ allowed_origins = ["http://localhost:5173"]
 
 A refused request returns `403` with `x-aproxy-error: inbound_host_rejected`
 (`details.host`) or `inbound_origin_rejected` (`details.origin`), and is logged as warn with
-`入站请求被拒绝…` ("inbound request rejected"); it is never forwarded, never gets a key injected and
+`Inbound request rejected: …`; it is never forwarded, never gets a key injected and
 is never retried. The error body is the standard error JSON (behaviors.md, After the commit).
 
 ## log_file

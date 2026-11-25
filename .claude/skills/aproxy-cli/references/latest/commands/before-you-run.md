@@ -54,8 +54,8 @@ experiment its own configs, settings, registry, logs, watchdog and control chann
 there cannot stop the user's instance on 12345.
 
 **The port is still shared.** Ports belong to the whole machine, so a test instance on a port
-another instance listens on fails to start with `端口 <port> 被其他程序占用` ("port in use by
-another program"). Pick a port nothing uses.
+another instance listens on fails to start with `Another program is using <addr>. The instance cannot start.`
+Pick a port nothing uses.
 
 With a 0.1.0 binary the control channel is not isolated on Windows: its pipe is named after the
 port alone, so under a test home `stop 12345`, `restart 12345` and `logs 12345` reach the user's
@@ -82,8 +82,8 @@ reaches only one of them; use ports.
 
 ### Output and exit codes
 
-- Messages are in Chinese; this file quotes them verbatim with an English gloss. Results go to
-  stdout, errors to stderr. The Windows console is switched to UTF-8 at startup.
+- Messages follow the user's language, English or Chinese (troubleshooting.md explains how it is
+  chosen); this file quotes the English text. Results go to stdout, errors to stderr. The Windows console is switched to UTF-8 at startup.
 - Log lines go to stderr too, warnings and errors only by default; set `RUST_LOG=info` (or
   `debug`) to see more. stdout carries only results, so `--json` output stays one parseable
   document whatever `RUST_LOG` says. The exception is `start --foreground`, whose instance writes
@@ -93,18 +93,19 @@ reaches only one of them; use ports.
   `--json` prints `{"secret":true}` with a `"hint"` field in the same form. URLs lose their
   userinfo (`***@`) and query values (`?key=***`).
 - Every command checks `<home>/settings.json` at startup, before doing anything else. When it is
-  invalid, `settings …` and `doctor` work normally, `status`, `stop` and `install`/`upgrade` run on
-  built-in defaults with `[WARN]` lines (aliases unavailable), and every other command prints the
-  errors as `[ERROR]` lines with repair hints and exits 3. settings-json.md, "When settings.json is
+  invalid, `settings …` and `doctor` work normally, `status`, `stop`, `install`/`upgrade` and
+  `skill` run on built-in defaults with `[WARN]` lines (aliases unavailable), `migrate` and
+  `desktop` are dispatched before the check, and every other command prints the errors as `[ERROR]`
+  lines with repair hints and exits 3. settings-json.md, "When settings.json is
   invalid", lists which command falls in which group.
-- Argument errors exit 2. `aproxy <command> --help` prints the options (in Chinese). A bare
+- Argument errors exit 2. `aproxy <command> --help` prints the options in the same language. A bare
   `aproxy` with no command prints the help and exits 2; write `aproxy start` to start an instance.
 
 Exit codes mean the same thing in every command: 0 done (or the requested state already holds),
 1 failed, 2 usage error, 3 invalid configuration, 4 target or file not found, 5 partly done. The
 table gives each command's cases, assuming a valid settings.json; the startup check above can end
 a command with exit 3 before it runs (except the tolerated commands). Decide from the exit code and
-the `--json` codes, not from the Chinese text.
+the `--json` codes, not from the message text.
 
 | Command | 0 | 1 | 2 | 3 | 4 | 5 |
 |---|---|---|---|---|---|---|

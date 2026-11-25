@@ -59,40 +59,41 @@ for a command that meets them depends on what the command is for:
 | Command | Behavior with an invalid settings.json |
 |---|---|
 | `aproxy settings …`, `aproxy doctor` | Run normally: they are how the file is inspected and repaired. `doctor` lists the errors; `settings show` still prints the effective values, then the errors, and exits 3 |
-| `aproxy status`, `aproxy stop`, `aproxy install` / `upgrade` | Run on built-in defaults and print the errors as `[WARN]` lines. Aliases are unavailable: address instances by port or `all`. Exit with the command's normal code |
-| every other command: `start`, `restart`, `logs`, `find`, `restore`, `config`, `alias`, `desktop` | Print the errors as `[ERROR]` lines with repair hints and exit 3, without doing anything. A started instance never runs with settings it did not get |
+| `aproxy status`, `aproxy stop`, `aproxy install` / `upgrade`, `aproxy skill …` | Run on built-in defaults and print the errors as `[WARN]` lines. Aliases are unavailable: address instances by port or `all`. Exit with the command's normal code |
+| `aproxy migrate`, `aproxy install --force`, `aproxy desktop` | Dispatched before this check, so they print none of these lines. `migrate` reads the files itself, because converting them is its job; `install --force` never reads settings.json, so a broken file cannot block the repair; `desktop` opens the window, which reads the home on its own and shows the problem there |
+| every other command: `start`, `restart`, `logs`, `find`, `restore`, `config`, `alias` | Print the errors as `[ERROR]` lines with repair hints and exit 3, without doing anything. A started instance never runs with settings it did not get |
 
 The warning form ends with:
 
 ```
-[WARN] 本次按内置默认运行（别名不可用，请按端口或 all 指定实例）。用 aproxy settings show 查看、aproxy settings unset <键> 修复
+[WARN] Using built-in defaults for this command. Aliases are unavailable; select instances by port or all. Inspect with aproxy settings show and repair with aproxy settings unset <key>.
 ```
-
-("running on built-in defaults this time; aliases are unavailable, address instances by port or all.
-Inspect with aproxy settings show and repair with aproxy settings unset KEY").
 
 The error form adds a repair command for each bad key and one way out of the whole file:
 
 ```
-settings.json 有错误:
+settings.json has errors:
   <file>: watchdog: watchdog must be an object [config_type]
   <file>: max_body_mb: unknown key max_body_mb [config_unknown_key]
 
-逐项修复（删掉出问题的键，或用 aproxy settings set <键> <值> 改对）:
+Remove the invalid keys below or correct their values with aproxy settings set <key> <value>:
   aproxy settings unset 'watchdog'
   aproxy settings unset 'max_body_mb'
-也可以删除整个文件回到内置默认（别名与全局默认会一并丢失）: <file>
+To return to built-in defaults, delete the file. This also removes aliases and global defaults: <file>
 ```
 
-("settings.json has errors; fix them one by one by removing the key or setting it correctly with
-aproxy settings set; or delete the whole file to return to the built-in defaults, losing aliases and
-global defaults"). Deleting the file is the crude repair: it also loses `aliases`, `default_config`
-and `defaults`, so tell the user before you do it, and prefer `settings unset` for each bad key.
+Prefer the narrowest repair: `settings set` to correct a value, `settings unset` for a key that has
+no place in this version. Before unsetting, look at what the key holds. A key under `defaults` or an
+old 0.1.x key may carry a credential (an API key, a proxy password) the user still needs; do not
+print its value, tell the user which key it is and ask where it belongs (`aproxy migrate` does this
+for the 0.1.x keys). Deleting the whole file loses `aliases`, `default_config` and `defaults` along
+with any credential in them: do it only when the user agrees, and first copy the file somewhere
+private (only the user can read it) so it can be recovered.
 
 - **A file that cannot be parsed at all** — a JSON syntax error, or content that is not a JSON object
   — can only be repaired by hand or deleted. `settings show` prints
-  `settings.json 不是合法的 JSON 对象，只能手工修复（或删除它，回到内置默认）:` ("not a valid JSON object;
-  repair it by hand or delete it to return to the built-in defaults") and exits 3, and every write
+  `settings.json is not a valid JSON object. Repair it manually or delete it to return to built-in defaults:`
+  and exits 3, and every write
   command refuses and leaves the file untouched (never "rewrite it with the defaults", which would
   lose the aliases).
 - A file that is valid JSON with bad keys is repaired one key at a time; `settings unset` accepts

@@ -20,8 +20,12 @@ aproxy install --force --from PATH [--variant desktop|headless] [--yes]
 `aproxy upgrade` is the same command. `install` downloads (or copies) the binary into
 `<home>/install/staging/`, checks that it runs and reports the expected version, swaps it into
 `<home>/bin/`, restarts running instances one at a time on the new binary, verifies that each
-reports the new version, and cleans up; each instance is restarted once, one at a time. How the
-swap and rollback work: behaviors.md, "Upgrades with aproxy install". Only `--adopt` (and the install
+reports the new version, and cleans up; each instance is restarted once, one at a time. Each
+restart cuts what that instance still carries after 10 seconds (long streams, requests waiting to
+retry), possibly including your own session, so before running an install that will replace the
+binary, tell the user the home, the instances `aproxy status` lists and that they will restart, and
+wait for agreement unless they asked for exactly this. `--check` and `--skills-only` restart nothing.
+How the swap and rollback work: behaviors.md, "Upgrades with aproxy install". Only `--adopt` (and the install
 scripts' first install, which runs the same step) edits `PATH`; after any other install check that
 `aproxy` resolves to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running another
 copy.
@@ -57,17 +61,16 @@ copy.
   for a stable release, name the version.
 - Versions come from GitHub releases, or npm dist-tags when GitHub is unreachable. Only tags of the
   form `vX.Y.Z` or `vX.Y.Z-(alpha|beta|rc).N` with this platform's binary attached count.
-- Nothing newer: `已是最新：当前 <v>，<channel> 通道最新为 <v>，无需安装。` ("already up to date"),
-  exit 0, nothing restarted. Empty channel: `<channel> 通道暂无可用的 <variant> 版本，保持当前 <v> 不变。`
-  ("no <variant> version in this channel; keeping the current one"), exit 0. With `--variant`
+- Nothing newer: `Up to date: current version <v>, latest in <channel>: <v>. No installation needed.`,
+  exit 0, nothing restarted. Empty channel: `No <variant> release is available in the <channel> channel. Keeping <v>.`,
+  exit 0. With `--variant`
   naming the other build, neither message appears: the current version is reinstalled in that
   variant ("Choosing the variant" below).
 - An explicit VERSION below the running CLI's version stops with
-  `目标版本 <v> 低于当前 <v>。确认要降级请加 --allow-downgrade。` ("target below current; add
-  --allow-downgrade to confirm").
+  `Target version <v> is older than the current version <v>. Use --allow-downgrade to downgrade.`
 - Nothing below 0.2.0 is installed, `--allow-downgrade` and `--from` included:
-  `目标版本 <v> 低于 0.2.0，不能安装：0.1.x 与 0.2.0 起的版本互不兼容…` ("target below 0.2.0
-  cannot be installed: 0.1.x and 0.2.0 or later are incompatible"). compatibility.md, "Going back to
+  `Target version <v> is below the minimum 0.2.0. Versions 0.1.x and 0.2.0 or later have incompatible control protocols and disk layouts. …`
+  compatibility.md, "Going back to
   0.1.x", explains the way back. Likewise a 0.1.x `aproxy install` cannot reach 0.2.0; see
   "Moving from 0.1.x to 0.2.0" there.
 - Downloads try the channels in `update.download_chain` (settings-json.md), by default github, npm,
@@ -83,13 +86,11 @@ copy.
 **Checking for an update.** `aproxy install --check` asks the same sources in the same channel as
 `install latest` and prints one of:
 
-- `有新版本 <latest>（当前 <current>，<channel> 通道）。执行 aproxy install 升级。` ("version <latest>
-  is available; run aproxy install to upgrade");
-- `已是最新：当前 <current>，<channel> 通道最新为 <latest>。` ("up to date");
-- `<channel> 通道暂无可用版本，当前 <current>。` ("no version in this channel").
+- `Version <latest> is available (current: <current>, channel: <channel>). Run aproxy install to upgrade.`;
+- `Up to date: current version <current>, latest in <channel>: <latest>.`;
+- `No release is available in the <channel> channel. Current version: <current>.`
 
-In the stable channel the last two add `（如需预发布版本，可加 --pre）` ("add --pre for
-pre-releases"). It exits 0 whenever the sources answered, update or not, and 1 when they did not
+In the stable channel the last two add `Use --pre to include pre-releases.` It exits 0 whenever the sources answered, update or not, and 1 when they did not
 (`install_download_failed`; `--download-proxy` may help). It takes no lock and starts nothing, so it
 is safe to run at any time. With `--json`:
 
@@ -110,11 +111,11 @@ On Linux the desktop build links GTK and WebKitGTK and cannot even print `--vers
 aproxy does not inspect the machine beforehand; the downloaded binary's own `--version` decides,
 because what a build needs changes from release to release. Without `--variant`, a desktop build
 that does not run is replaced by the headless build of the same target, and the output says
-`改装的是无界面的 headless 版本…` ("installing the headless build instead") with how to switch
+`Installing the headless variant. …` with how to switch
 back once the libraries are there. With `--variant desktop` nothing is replaced: the install stops,
 exit 1, after the loader's error and, when the system loader refused the binary,
-`带桌面界面的版本在本机起不来：动态加载器的报错见上…` ("the desktop build cannot start here; see
-the loader's error above"). The loader's error names what is missing: a library such as
+`The desktop build cannot run on this system. See the dynamic loader error above. …`
+The loader's error names what is missing: a library such as
 `libwebkit2gtk-4.1.so.0` (Debian and Ubuntu ship it in `libwebkit2gtk-4.1-0`), an undefined symbol
 (the library is too old), or `GLIBC_2.xx not found` (glibc is too old, which only a newer system
 fixes). Install what it names and run the command again, or use `--variant headless`.
@@ -125,29 +126,27 @@ writes anything (exit 1) when it cannot:
 
 - An instance started by an older version whose records this version cannot read (`status` lists it
   among the other aproxy processes):
-  `[ERROR] 这个 home 里有旧版本启动、本次安装管不了的实例还在运行（pid <pids>）。…`
-  ("instances started by an older version, which this install cannot manage, are running"), code
+  `[ERROR] live instances started by an older version are in this home (pid <pids>); …`, code
   `install_unmanaged_instances`. Stop them with the version that started them (its `aproxy stop all`),
   then install; or use `install --force`, which stops every aproxy process of the home.
   compatibility.md has the steps for the 0.2.0 alphas.
 - A foreground instance (`start --foreground`), which has no record to restart it from:
-  `[ERROR] 端口 <port> 上的实例在前台运行，安装无法替它重启。…` ("the instance on port <port> runs in
-  the foreground; the install cannot restart it"), code `install_foreground_instances` with
+  `[ERROR] The instance on port <port> is running in the foreground. The installer cannot restart it. …`,
+  code `install_foreground_instances` with
   `details.ports`. Stop it (Ctrl+C in its terminal, `aproxy stop <port>`, or the service manager that
   runs it), install, then start it again the way it was started.
 - Online installs and `--from` also refuse while a running instance's binary lives outside
-  `<home>/bin/` (`实例 <port> 的二进制不在安装管辖目录（…）下`, "instance binary outside the managed
-  directory"). Upgrade that copy through its own channel (npm, cargo, a package manager) or run
+  `<home>/bin/` (`The binary for the instance on port <port> is outside the installation directory (…)`).
+  Upgrade that copy through its own channel (npm, cargo, a package manager) or run
   `aproxy install --adopt`, which moves every running instance onto `<home>/bin/`.
 
 Right before it touches the first instance, after the download, the install checks the first two
 points again (an instance may have started meanwhile) and prechecks every instance it will restart:
 the instance's start spec, resolved by the new version against the current settings.json. When an
 instance fails it, nothing is changed and the command prints
-`[ERROR] 安装前的预检没有通过：端口 <port> 的实例按新版本解析配置时出错。什么都没有改动：实例照常运行，二进制没换。`
-("the precheck failed: the new version cannot resolve the configuration of the instance on port
-<port>; nothing was changed"), the diagnostics, and `修正上面的问题后重新执行 aproxy install。` ("fix
-the problems above and run aproxy install again"), exit 3, code `install_precheck_failed` with
+`[ERROR] Precheck failed for the instance on port <port>: the target version cannot load its configuration. Nothing was changed. The instance is still running and the binary was not replaced. …`,
+the diagnostics, and `Correct the problems above and run aproxy install again.`,
+exit 3, code `install_precheck_failed` with
 `details.port` and `details.diagnostics`. An invalid settings.json is only a warning for an install
 with no running instance, but fails this precheck when one runs. A failure at this point leaves
 `<home>/install/state.json` marked as halted, which nothing resumes in the background; fix the cause
@@ -155,41 +154,41 @@ and run `aproxy install` again. An instance you stop while the install runs is s
 
 **Reading the result.**
 
-- Exit 0 with `安装完成：<path>（二进制已落位，实例已滚动到新版本）` ("installed; binary in place,
-  instances rolled to the new version") means every running instance was verified on the new
-  version. Before it, `新版本进程已接手安装（广播、交换、滚动重启、终验），等待其完成...` ("the new
-  version's process has taken over the install; waiting for it") appears: once the download is
+- Exit 0 with `Installation complete: <path>. The binary is in place and the instances are running the target version.`
+  means every running instance was verified on the new
+  version. Before it, `The target version has taken over the installation. Waiting for broadcast, binary replacement, rolling restarts and verification...`
+  appears: once the download is
   verified, the downloaded binary runs the rest in a separate process while the command waits (up
   to 600 s) and then reports. A downgrade is run by the command itself and skips this line.
   `<home>/install/state.json` may linger a moment afterwards while the old binary and the staging
   copy are deleted.
-- While instances roll, `status` marks them `二进制更换中…`; do not stop or restart those.
+- While instances roll, `status` marks them `Replacing the binary during a rolling install. …`; do not stop or restart those.
 - Skill documents are updated alongside into `<home>/skills/<name>/`; a skill failure does not
   fail the install. They are not linked into any agent's skill directory.
-- `已有安装进行中（…）` ("an install is already running"): wait for it; a record whose installer died
+- `Installation is already in progress (…)`: wait for it; a record whose installer died
   is taken over, a live one only after 600 s without progress.
 
-**When it fails.** `[ERROR] 安装失败: …` is followed by one of two hints:
+**When it fails.** `[ERROR] Installation failed: …` is followed by one of two hints:
 
-- `滚动已中止，不会自动重试…` ("rolling aborted, no automatic retry"): an instance did not start on
+- `Rolling restarts stopped and will not retry automatically. …`: an instance did not start on
   the new version (`install_restart_failed`, with `details.port`). It was brought back on the old binary (if that also failed, its desired-state
   record was kept for `aproxy restore`), and the remaining instances were not touched. Usually the new
   version rejects the existing config: fix the reported cause and run `aproxy install` again, or
   stay on the old version with `aproxy install <old version> --allow-downgrade`. The new binary is
   already in `<home>/bin/` at this point, so the CLI and some instances run different versions
   until you finish.
-- `现场已保留：重新执行同一条命令即可接着装完…` ("state kept; rerun the same command to finish"):
-  run the same command again. When the error reads `目标版本没有接手安装（…）`
-  ("the target version did not take over"), the downloaded binary exited or hung before starting;
+- `Installation state was retained. Rerun the same command to resume. …`:
+  run the same command again. When the error reads `The target version did not take over the installation (…)`,
+  the downloaded binary exited or hung before starting;
   no instance and no file in `<home>/bin/` was changed.
 
 An install interrupted by a crash, kill or power loss leaves `<home>/install/state.json`. The
-watchdog resumes it in the background, and so does any command that changes instances or settings
-(`start`, `stop`, `restart`, `restore`, `alias add|remove`, `config set|unset`, `settings set|unset`);
-commands that only look (`status`, `logs`, `find`, `doctor`, `alias list`, `config show|get`,
-`settings show|get`) never do, and nothing resumes a failure marked halted. Do not delete that file
+watchdog resumes it in the background, and so do `aproxy desktop` and any command that changes
+instances or settings (`start`, `stop`, `restart`, `restore`, `restore-at-login`, `alias add|remove`,
+`config set|unset`, `settings set|unset`); commands that only look (`status`, `logs`, `find`,
+`doctor`, `skill`, `migrate`, `alias list`, `config show|get`, `settings show|get`) never do, and nothing resumes a failure marked halted. Do not delete that file
 by hand: it is what lets the install finish. `--abort` works only before the swap
-(`安装已中止，现场已清理（二进制与实例未受影响）。`, "aborted; binary and instances untouched");
+(`Installation aborted. Temporary files were removed. The binary and instances were not changed.`);
 after it, the install can only be completed. When none of this gets the install through, use
 [Force install](force-install.md#force-install).
 
@@ -248,8 +247,14 @@ already right. The install scripts run the same step at the end of a first insta
 | macOS | writes `<home>/env` and adds `. <home>/env # aProxy` to `~/.profile`, to `~/.bashrc` / `~/.bash_profile` when they exist, to `~/.zshenv`, and a `~/.config/fish/conf.d/aproxy.fish` when fish is installed | `~/Applications/aProxy.app`, whose executable links to `<home>/bin/aproxy`, so it keeps working after `aproxy install` replaces the binary |
 | Linux | the same profile lines as macOS (`~/.zshenv` when zsh is the login shell or `~/.zshrc` exists) | `~/.local/share/applications/aproxy.desktop` (under `XDG_DATA_HOME` when set) and icons under `icons/hicolor/` |
 
-When `<home>/bin` is already on `PATH` nothing is written. Terminals that are already open keep their
-old `PATH`; open a new one. An entry always opens the home it was made for: for a home other than the
+The `PATH` step looks at the `PATH` of the process running adopt: when `<home>/bin` is already on
+it, nothing is written and the step reports `unchanged`, even if that entry came only from the
+current shell (an `export` typed in this terminal, a tool's temporary environment) and new terminals
+will not have it. And on Windows an appended entry comes after any earlier one, so another `aproxy`
+(an npm shim, an older copy) can still win. So after adopt, check in a fresh terminal of the shell
+the user works in that `aproxy` resolves to `<home>/bin/` first: `Get-Command aproxy -All` or
+`where.exe aproxy` on Windows, `command -v aproxy` (and `type -a aproxy`) elsewhere. Terminals that
+are already open keep their old `PATH`. An entry always opens the home it was made for: for a home other than the
 default, its name carries a short id (`aProxy-<id>`), so entries for several homes can coexist.
 
 The binary install is the result that counts: a `PATH` or entry step that fails prints a warning with
@@ -268,10 +273,15 @@ above. Read the `reason` first; it usually names the file or key that could not 
   user's login shell reads. Then check in a new terminal that `aproxy` resolves to `<home>/bin/`.
 - App menu entry: anything that runs `<home>/bin/aproxy desktop --installed-home` works, because
   `--installed-home` makes the window use the home of the binary it runs from. On Windows a shortcut
-  with that target and argument; on Linux a `.desktop` file with `Exec=` set to it; on macOS, if the
-  `.app` cannot be created, `aproxy desktop` from a terminal opens the same window.
+  with that target and argument; on Linux a `.desktop` file with `Exec=` set to it, both with the
+  absolute path of the installed binary. On macOS, if the `.app` cannot be created,
+  `<home>/bin/aproxy desktop --installed-home` from a terminal opens the same window; a bare
+  `aproxy desktop` opens the home of whichever `aproxy` comes first on `PATH`, under `APROXY_HOME` or
+  `~/.aproxy`, which may be another home.
 
-Tell the user what you changed, since these settings live outside aProxy's home.
+These are changes to the user's shell profiles, registry or app menu, outside aProxy's home: describe
+the exact change and get the user's agreement before making it by hand, unless they already asked for
+exactly that.
 
 There is no uninstall command yet. To undo by hand: remove `<home>\bin` from the user's `Path`
 (Windows: Settings, "Edit environment variables for your account") or the lines ending in `# aProxy`

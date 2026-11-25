@@ -12,7 +12,7 @@ Those alphas keep their runtime records under other names and shapes: the instan
 those alphas is out of reach for this version's CLI:
 
 - `aproxy status` lists it only among the other aproxy processes, and `aproxy stop <port>` answers
-  `端口 <port> 上没有运行中的 aProxy 实例。` ("no running aProxy instance on port"), although the
+  `No running aProxy instance on port <port>.`, although the
   process is still serving.
 - Neither `aproxy restore` nor the watchdog brings it back after a crash.
 

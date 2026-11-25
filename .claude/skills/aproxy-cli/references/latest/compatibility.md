@@ -37,8 +37,7 @@ process, so it is safe to run at any time, even in the middle of an install.
 
 - A running instance keeps its version until it restarts; replacing the binary on disk changes
   only the CLI. `status` then adds
-  `注意: 实例版本 v<x> 与当前 CLI v<y> 不同，替换二进制后执行 aproxy restart <port> 可完成升级`
-  ("instance version differs from this CLI; restart it to finish the upgrade").
+  `Instance v<x> differs from CLI v<y>. After replacing the binary, run aproxy restart <port> to finish the upgrade.`
 - Judge runtime behavior (retries, heartbeats, log messages) by the instance's version, and
   command syntax by the CLI's.
 - Several copies may be installed: `aproxy install` manages `<home>/bin/` (`<home>` is

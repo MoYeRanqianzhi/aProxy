@@ -21,8 +21,8 @@ to read.)
 - Not allowed as names: a port number (0 to 65535), and the reserved words `all`, `idle`, `default`
   and its misspelling `defult`, in any case, because `start`/`stop` would read them as a port or a
   reserved target. `alias add` refuses them; one written by hand is an error on every run.
-- An alias whose file has gone is reported as `别名 "NAME" 指向的配置文件不存在` ("alias NAME points to a
-  config file that does not exist"). That is the state of the home, not a file error: commands still
+- An alias whose file has gone is reported as `Alias "NAME" points to a missing configuration file: …`.
+  That is the state of the home, not a file error: commands still
   run, and `doctor` lists it.
 - `aproxy alias list` prints the names and paths; `settings get aliases` prints the whole table.
 
@@ -35,8 +35,8 @@ make another file your everyday config.
 
 If the file it names is deleted or moved, the commands that would read it (`aproxy start` without a
 target, and `aproxy config` when showing or editing the toml) exit with
-`settings.json 指定的默认配置文件不存在: <path>` ("the default config named in settings.json does not
-exist") instead of silently using a different file. Other commands are unaffected. Restore the file,
+`Default configuration file in settings.json does not exist: <path>`
+instead of silently using a different file. Other commands are unaffected. Restore the file,
 point the setting elsewhere with `aproxy settings set default_config PATH`, or remove it with
 `aproxy settings unset default_config`.
 
@@ -45,7 +45,7 @@ point the setting elsewhere with `aproxy settings set default_config PATH`, or r
 Extra directories that `aproxy find` and `aproxy doctor` scan for `*.toml` files (top level only,
 not subdirectories). `<APROXY_HOME>` and `<APROXY_HOME>/configs/` are always scanned; listing them
 again is harmless. `~` is expanded. A listed directory that does not exist is a `doctor` warning,
-`配置目录不存在` ("config directory does not exist").
+`config directory <path> does not exist`.
 
 ## defaults: global defaults for config.toml
 
@@ -80,8 +80,8 @@ keeps the values it loaded until it restarts.
   start. A default that is wrong therefore stops instances that were fine before; check a new global
   default with `aproxy config show --effective` on one instance before relying on it.
 - **`aproxy config show --effective` names this layer.** A value inherited from here prints
-  `（settings.json 全局默认）` ("settings.json global default"); one from the file prints `（config.toml）`,
-  and one nothing set prints `（内置默认）` ("built-in default"). Read `show --effective` first when
+  `(settings.json global default)`; one from the file prints `(config.toml)`,
+  and one nothing set prints `(built-in default)`. Read `show --effective` first when
   you need to know which layer a value comes from.
 - In JSON, double every backslash: the regex `\?` is written `"\\?"`.
 
@@ -103,12 +103,11 @@ A credential must not reach an upstream it was not meant for, so `defaults` is n
 When an instance's target differs, `aproxy config show --effective` lists each withheld item after the values:
 
 ```
-全局默认里的这些凭据没有继承（它们属于另一个目标）:
-  api_key  默认值属于 https://api.example.com，这份配置指向 https://relay.b.example
+These credentials were not inherited from global defaults because they belong to another target:
+  api_key  default target: https://api.example.com; configuration target: https://relay.b.example
 ```
 
-("these credentials in the global defaults were not inherited: they belong to another target"). If
-the instance also has no credential of its own, the command adds a warning with code
+If the instance also has no credential of its own, the command adds a warning with code
 `default_credential_withheld` naming the key to set, because otherwise the upstream would answer 401
 and nothing would say why.
 

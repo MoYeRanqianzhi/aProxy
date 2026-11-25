@@ -21,8 +21,7 @@ Part of [behaviors.md](../behaviors.md), which lists the other parts. Several in
   launcher's job object (`CREATE_BREAKAWAY_FROM_JOB`) and, when the job does not allow that, stays
   in it and appends a warning to `startup.log`. It also gets no console and inherits no handles.
 - Two instances on one port with different listen addresses cannot coexist; the second refuses with
-  `端口 <port> 已被监听地址 <addr> 的 aProxy 实例使用（本进程将监听 <addr>），两者不能并存。` ("port already
-  used by an aProxy instance listening on another address; the two cannot coexist").
+  `Port <port> is in use by an aProxy instance listening on <addr>. This instance would listen on <addr>. …`.
 - An alias resolves to a config file path and finds the running instance by that path, so it keeps
   working after the port changes. A port target goes straight to that port's control endpoint and
   works even if the registry is lost.
@@ -31,7 +30,7 @@ Part of [behaviors.md](../behaviors.md), which lists the other parts. Several in
   belongs to one home: commands find only instances started under the same home. `status`, `stop`,
   `restart`, `logs` and `install` use it and never touch the proxy port, which carries only proxied
   traffic. An instance creates its channel before it registers, and refuses to start if it cannot:
-  startup.log gets `控制通道 <endpoint> 创建失败：…` ("control channel could not be created"). So a
+  startup.log gets `Cannot create control channel <endpoint>: …`. So a
   registered instance is always reachable unless it hung.
 - `aproxy status` lists instances that answer on their control channel and lists separately those
   whose process is alive but does not answer (hung). It deletes nothing: a record whose process is
@@ -41,7 +40,7 @@ Part of [behaviors.md](../behaviors.md), which lists the other parts. Several in
 ### Stopping
 
 - `aproxy stop` asks the instance to shut down. Requests still open after 10 s are cut
-  (`10 秒后强制退出（在途请求将中断）`, "forcing exit in 10 s; in-flight requests will be interrupted"), so a
+  (`Forcing exit after 10 seconds; in-flight requests will be interrupted`), so a
   long stream or a request still in retry is cut. `aproxy restart` stops the same way before starting
   again.
 - That includes your own requests if you reach your model through the instance. Before stopping or
@@ -64,8 +63,8 @@ Part of [behaviors.md](../behaviors.md), which lists the other parts. Several in
 `logs/`, `spool/`, `bin/`, `install/`, `ledger/`, `desktop/` and `skills/`. It is the only root:
 there is no separate variable for the run directory. The control channel
 follows the home, so commands under an isolated home cannot reach the user's instances.
-Neither isolates ports: a test instance on a port a real instance listens on fails to start as
-`被其他程序占用` ("in use by another program"). Run `aproxy status` without the override first and
+Neither isolates ports: a test instance on a port a real instance listens on fails to start with
+`Another program is using <addr>. The instance cannot start.` Run `aproxy status` without the override first and
 pick a port nothing uses. An isolated home also gets its own watchdog, which exits by itself some
 minutes after its last instance stops.
 
@@ -73,8 +72,8 @@ minutes after its last instance stops.
 
 - A daemon instance logs to `<home>/logs/<hex-timestamp>-<hex-pid>.log`, a new file at every start
   (restart, restore and watchdog respawns included). The name carries no port, so do not guess it:
-  `aproxy logs <port|alias>` prints it as `日志文件: …` ("log file"), and `aproxy start` printed it as
-  `日志: …`. A `--foreground` instance logs only to its console.
+  `aproxy logs <port|alias>` prints it as `Log file: …`, and `aproxy start` printed it as
+  `Log: …`. A `--foreground` instance logs only to its console.
 - A custom path comes from `log_file` in config.toml or `--log-file` (a `start` option; the flag wins); a relative path is
   resolved against `<home>`.
 - `<home>/logs/startup.log` collects what happens before an instance has its own log or without a
@@ -100,15 +99,18 @@ minutes after its last instance stops.
 - Secrets: logs do not contain `api_key` or header values. Every URL (base_url, proxy, upstream target,
   request path) is masked: userinfo becomes `***@`, query values become `***` with keys kept
   (`?beta=true` shows as `?beta=***`), and a fragment becomes `***`. `aproxy status` follows the same
-  rules, so both can be shared as they are. A retry rule's `path` still matches the real query string.
-- Each failed attempt that is retried logs `本次尝试失败，重试` ("this attempt failed; retrying") with
-  `attempt`, `code`, `details` and `reason`. Decision lines such as `上游返回可重试状态码，重试` carry a
+  rules. A retry rule's `path` still matches the real query string. That masking covers URLs,
+  credential headers and the keys aProxy knows, not content: the error-response preview below logs
+  up to 1000 bytes of each upstream error body as it arrived, and an upstream can echo a prompt, an
+  account detail or a key aProxy never saw. So treat a log and `status` output as the user's private
+  data, and before any of it leaves the machine, cut it to the lines needed, read them, and ask.
+- Each failed attempt that is retried logs `Upstream attempt failed; retrying` with
+  `attempt`, `code`, `details` and `reason`. Decision lines such as `Upstream returned a retryable status; retrying` carry a
   `code` field too.
-- Each failed attempt logs `错误响应预览` ("error response preview") with `content_type`,
+- Each failed attempt logs `Error response preview` with `content_type`,
   `content_encoding` and the body, decoded first when compressed. A preview of the form
-  `（二进制/压缩内容，共 N 字节，hex 前 48: …）` ("binary/compressed content, N bytes, first 48 bytes in hex")
+  `(binary or compressed, N bytes; first 48 in hex: …)`
   means the body is binary or could not be decoded (unknown encoding, corrupt data, or over 8 MiB once
   decoded).
-- An instance listening on a non-loopback address warns `监听地址 … 不是回环地址…` ("listen address is not
-  a loopback address") in the start output, the daemon log, startup.log and `aproxy doctor`, more
+- An instance listening on a non-loopback address warns `… is not a loopback address…` in the start output, the daemon log, startup.log and `aproxy doctor`, more
   strongly when it injects credentials: any host that reaches the port can then spend the user's key.

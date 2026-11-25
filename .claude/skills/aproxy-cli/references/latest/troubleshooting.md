@@ -1,10 +1,17 @@
 # Troubleshooting
 
 Symptom, cause and fix for aProxy problems. Find the row by the message you see or by the behavior.
-aProxy prints its messages in Chinese; they are quoted verbatim so you can match real output, each with
-an English gloss. The semantics behind the fixes are in behaviors.md, client settings in clients.md,
+The semantics behind the fixes are in behaviors.md, client settings in clients.md,
 fields in config-toml.md and settings-json.md. Errors produced inside a format program are covered by
 the aproxy-format skill's troubleshooting.md.
+
+The CLI prints its messages in the user's language, English or Chinese: `APROXY_LANG` decides when
+set (a value starting with `zh` selects Chinese, any other English, `system` defers), then `language`
+in settings.json (`en` or `zh-CN`), then the system's display language or locale, and English
+otherwise. `aproxy install --force` is the exception: its own messages are always Chinese and are
+quoted that way (commands.md, Force install). These references quote the English text. Logs,
+`--json` output and error codes are always English, so match on codes (`port_in_use`,
+`[config_type]`) and JSON fields where possible, not on message text.
 
 `<home>` means `~/.aproxy`, or the directory named by `APROXY_HOME`.
 
@@ -24,12 +31,12 @@ This reference is split by topic into the files below (paths relative to this fi
 ## Before you change anything
 
 - Run `aproxy status`. It lists each running instance with port, upstream, config file, the counts
-  `请求` (requests), `在途` (in flight), `重试` (retries) and `救回` (succeeded after a retry), and
-  `最近错误` ("latest error"), which reads `<code>: <English message>`, for example
+  `Requests`, `in flight`, `retries` and `rescued` (succeeded after a retry), and
+  `last error`, which reads `<code>: <message>`, for example
   `upstream_status: the upstream returned 503`. Identify the instance the user means, and whether your
   own session runs through it, before stopping or restarting anything: a stop or restart cuts every
   in-flight request on that instance.
-- Instance log: `aproxy logs <port|alias>` prints the file path (`日志文件: …`, on stderr) and the
+- Instance log: `aproxy logs <port|alias>` prints the file path (`Log file: …`, on stderr) and the
   most recent 200 lines, then exits. Add `-f` to keep following until Ctrl+C or until the instance
   stops; in a non-interactive shell, run `aproxy logs -f …` under a timeout, or take the path and read
   the file directly.
@@ -37,4 +44,6 @@ This reference is split by topic into the files below (paths relative to this fi
 - Configuration: `aproxy doctor` checks settings.json, aliased configs and port conflicts;
   `aproxy config show --effective` (add `--config <path>` for another file) prints every effective value with
   secrets masked and the layer it comes from, and exits 3 with diagnostics when the config is broken.
-- Logs and `status` mask URL credentials and query values (`?beta=***`) and are safe to share.
+- Logs and `status` mask URL credentials and query values (`?beta=***`) and the keys aProxy knows,
+  but logs also hold previews of upstream error bodies, which can contain anything the upstream sent
+  back. Share only the lines a problem needs, after reading them, and with the user's agreement.

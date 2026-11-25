@@ -7,8 +7,8 @@ behaviors.md; symptoms are in troubleshooting.md.
 
 ## Setup checklist
 
-1. **Find the instance.** Run `aproxy status` and note the port (`监听 http://…`, "listening on") and the
-   upstream (`上游 …`). If the user names an instance, use that one. An instance forwards to a single
+1. **Find the instance.** Run `aproxy status` and note the port (`Listen http://…`) and the
+   upstream (`upstream …`). If the user names an instance, use that one. An instance forwards to a single
    upstream, so clients that speak different protocols (Claude Code speaks Anthropic Messages, Codex
    speaks OpenAI Responses) can share it only if that upstream serves both, as many relays do. When
    you cannot tell, set the clients up as the user asked, say what would break if the upstream lacks a
@@ -54,8 +54,8 @@ head and SSE comment heartbeats, `: keepalive`, once per `keepalive.interval_sec
   starts the new one from scratch, and once the client's resend budget is spent the turn fails.
 
 Set the event-level timeout longer than any outage you want to ride out, or disable it. The sign that
-this is missing is the log warning `客户端在只收到心跳的等待中断开（已等约 N 秒）…` ("client disconnected
-while receiving only heartbeats, after about N s"); N approximates the client's effective timeout.
+this is missing is the log warning `Client disconnected after receiving only heartbeats for about N seconds. …`;
+N approximates the client's effective timeout.
 
 Two more client-side effects to plan for:
 
@@ -191,19 +191,19 @@ disconnect warning in the log and check the client's current source.
 They send an `Origin` header, which aProxy rejects by default with a local `403` that has
 `x-aproxy-error: inbound_origin_rejected` and `details.origin`; it is never forwarded. The check
 stops a web page from spending the user's key through the local proxy. If the user trusts the
-client, add the exact Origin from `details.origin` (or from the request's `入站请求被拒绝…` log
+client, add the exact Origin from `details.origin` (or from the request's `Inbound request rejected…` log
 line) to `allowed_origins` (config-toml.md) and restart the instance.
 
 ## Verify the setup
 
-1. Send one request from the client, then run `aproxy status`: the instance's `请求 N` ("requests")
+1. Send one request from the client, then run `aproxy status`: the instance's `Requests N`
    count rises. If it does not, the client is not using aProxy: its settings did not load (restart the
    client), the port is wrong, or Codex is still on a built-in provider.
 2. Read the instance's log (troubleshooting.md, Before you change anything, explains how). Each
-   request logs `代理请求` ("proxied request") with a `target=` field holding the full upstream URL. A
+   request logs `Proxy request` with a `target=` field holding the full upstream URL. A
    doubled prefix such as `/v1/v1/` means the prefix is set on both sides.
-3. Repeated `上游返回可重试状态码，重试` lines with an `错误响应预览` preview mean the upstream rejects the
+3. Repeated `Upstream returned a retryable status; retrying` lines with an `Error response preview` preview mean the upstream rejects the
    request (key, model, path). aProxy keeps retrying such errors, so fix the cause instead of waiting.
 4. The idle-timeout setting is only exercised by a long outage or generation. If
-   `客户端在只收到心跳的等待中断开（已等约 N 秒）` appears in the log later, the client's event-level timeout
+   `Client disconnected after receiving only heartbeats for about N seconds` appears in the log later, the client's event-level timeout
    is still active.

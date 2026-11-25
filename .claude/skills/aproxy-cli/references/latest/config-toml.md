@@ -3,7 +3,7 @@
 Every field of an instance's `config.toml`: type, default, what 0 or an empty value means, and how
 to choose a value; then how values combine with `start` override flags and `settings.json`, what is checked at
 start, and how values are normalized. Read it before writing or editing a config, or when a start
-fails with `配置错误` ("configuration error"). How each feature works at runtime is in
+fails with `Configuration errors:`. How each feature works at runtime is in
 behaviors.md; this file keeps only what you need to pick a value.
 
 ## Parts

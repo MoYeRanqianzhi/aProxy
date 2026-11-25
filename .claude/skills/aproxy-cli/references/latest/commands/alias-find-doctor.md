@@ -15,8 +15,8 @@ can address an instance by name even after its port changes.
 
 - `add`: PATH defaults to `<home>/config.toml` (not `default_config`); `~` is expanded and the
   path stored absolute. The file must exist; its content is not checked (run `doctor`). Adding an
-  existing name repoints it (`已更新别名`, "alias updated").
-- Rejected names (`别名无效: …`, "invalid alias"): empty, a number from 0 to 65535, and `all`,
+  existing name repoints it (`Updated alias <name> -> <path>`).
+- Rejected names (`Invalid alias: …`): empty, a number from 0 to 65535, and `all`,
   `idle`, `default`, `defult` in any case. Lookup is case-sensitive.
 - `remove` deletes the name only; a running instance keeps running. An unknown name exits 1.
 - `list --json` prints `{"schema":1,"aliases":[{"name","path","exists"}]}`, sorted by name, with
@@ -28,7 +28,7 @@ settings.json through the same writer as `aproxy settings`: the rest of the file
 and any `ui` content, is kept, and a key this version does not know stays in the file (it is an
 error, not something the write may drop). A change that would introduce an error is refused and
 nothing is written. When settings.json is invalid, these commands do not run at all: every command
-outside the tolerated group exits 3 with the `[ERROR] settings.json 有错误` block and repair hints
+outside the tolerated group exits 3 with the `[ERROR] settings.json has errors:` block and repair hints
 before it reaches them (settings-json.md, "When settings.json is invalid"). Repair the file first
 with `aproxy settings unset KEY` (that command does run), then add the alias.
 
@@ -40,8 +40,8 @@ aproxy find [QUERY] [--aliased | --unaliased] [--port PORT] [--json]
 
 Lists `*.toml` files directly inside the config directories (`config_dirs` from settings.json plus
 `<home>` and `<home>/configs/`; subdirectories are not searched). Each line shows path, port,
-masked upstream, aliases and `[默认]` ("default") for the default config; files that do not parse
-are flagged `（无法解析为有效 aProxy 配置）`. A config outside these directories is not listed even
+masked upstream, aliases and `[default]` for the default config; files that do not parse
+are flagged `(not a valid aProxy configuration)`. A config outside these directories is not listed even
 when an alias points to it; add its directory to `config_dirs`. QUERY matches a path fragment or
 alias name, case-insensitively; `--port` matches the configured listen port.
 
@@ -66,10 +66,10 @@ or `status` report something you cannot explain.
 
 Each finding is one line, `[ERROR]`, `[WARN]` or `[INFO]` followed by
 `file:line:col: key: message [code]` (line, column and key appear when known; the message is in
-English). An unknown key gets a second line with the command that deletes it, `删除这个键: aproxy
-settings unset '<key>'` or `删除这个键: aproxy config --config '<file>' unset '<key>'` ("delete this
-key"). The last line is `检查结果: <n> error, <m> warning, <k> info` ("result"); with nothing to
-report the output is `全部配置正常，未发现问题。` ("all configuration fine").
+English). An unknown key gets a second line with the command that deletes it, `Remove this key: aproxy
+settings unset '<key>'` or `Remove this key: aproxy config --config '<file>' unset '<key>'`.
+The last line is `Results: <n> error, <m> warning, <k> info`; with nothing to
+report the output is `All configurations passed. No problems found.`
 
 **Exit 3 when there is at least one error, 0 otherwise**: warnings and infos never fail it. An error
 in a config means `start` refuses that config; an error in settings.json means most commands refuse

@@ -8,10 +8,13 @@ Part of [commands.md](../commands.md), which lists the other parts. Opening the 
 aproxy desktop
 ```
 
-Opens the desktop window. It is a separate process that runs until its window is closed; opening
-or closing it never affects running instances, and like every other `aproxy` command it resumes an
-install that was interrupted (see install / upgrade). It opens on the user's screen, so run it only
-when the user asks for the window.
+Opens the desktop window. It is a separate process that runs until its window is closed. Opening
+or closing the window does not touch running instances, with one exception: when an interrupted
+install left `<home>/install/state.json`, opening it starts `install --continue` in the background,
+like the commands that change instances, and finishing that install restarts the instances
+(install.md, "When it fails", has the resume rules). To diagnose a pending install, look
+with `aproxy status` first. The window opens on the user's screen, so run it only when the user
+asks for the window.
 
 The window shows this home's real instances, request history and configs, and lets the user start,
 stop and restart instances, restart single format programs, edit configs, switch the watchdog and
@@ -27,20 +30,19 @@ each risk that applies and asks the user to confirm each one. When the user asks
 is safe, review it with the aproxy-audit-extension or aproxy-audit-theme skill rather than judging
 from its description.
 
-- **Windows, from a terminal:** the command returns at once with `已打开 aProxy 桌面界面（pid <pid>）。`
-  ("desktop window opened") and the window runs on its own. Exit code 0 here only means the window
+- **Windows, from a terminal:** the command returns at once with `Opened the aProxy desktop interface (PID <pid>).`
+  and the window runs on its own. Exit code 0 here only means the window
   process was started: anything that goes wrong after that is shown in a dialog box on the user's
   screen, never in your terminal, so ask the user whether the window appeared before you rely on
   it. Started from a shortcut, Explorer or a process without a console, its messages appear in a
   dialog box instead.
-- **Linux and macOS:** the command stays in the foreground until the window is closed (on macOS
-  the window has not been tried on real hardware). When you open the window for the user, start it
+- **Linux and macOS:** the command stays in the foreground until the window is closed (on macOS it
+  has been used on Apple Silicon; the Intel build is cross-compiled and has not been run). When you open the window for the user, start it
   in the background (for example `aproxy desktop &`, or your tool's background option); waiting for
   it would block you until the user closes the window.
 - **One window per home.** A second `aproxy desktop` under the same `<home>` prints
-  `aProxy 桌面界面已经在运行（pid <pid>）。这个版本还不会把它切到前台，请在任务栏里找到它。`
-  ("already running; this version cannot bring it to the front, find it in the taskbar") and exits
-  0. Under another `APROXY_HOME` it opens a separate window, with its own web view data in that
+  `The aProxy desktop interface is already running (PID <pid>). Select its window on the taskbar; this version cannot bring it to the foreground.`
+  and exits 0. Under another `APROXY_HOME` it opens a separate window, with its own web view data in that
   home's `desktop/`.
 - **When it cannot open**, it prints `[ERROR] …` on stderr and exits 1 without a window: no
   Microsoft Edge WebView2 runtime on Windows (Windows 11 ships it; Windows 10 may need it

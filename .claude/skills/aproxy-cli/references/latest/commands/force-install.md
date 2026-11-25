@@ -27,7 +27,7 @@ the new version or restart instances one at a time. It:
    desired-state records, and checks the ledger for an instance of the new version on each of their
    ports;
 7. lists processes that run from `<home>/bin/` but are not in the ledger, without stopping them
-   (not on macOS, where the paths of other processes cannot be read).
+   (processes of other users, whose paths cannot be read, are left out).
 
 **Before you run it.** It cuts every request in flight through aProxy at once, including your own
 when your client points at one of these instances, and it stops instances the user may be using in

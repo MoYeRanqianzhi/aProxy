@@ -31,10 +31,11 @@ Part of [config-toml.md](../config-toml.md), which lists the other parts. Where 
 - **Apply a change with a restart.** An instance reads its config only when it starts. Run
   `aproxy restart PORT|ALIAS`: it checks the edited config first and leaves the old instance
   running if the check fails, so a typo does not take the instance down.
-- **Check without applying.** `aproxy doctor` validates every config an alias points to and every
-  other `*.toml` in the config directories, but not the default config unless an alias points to
-  it. For the default config, `aproxy restart` or `aproxy start` is the check, and `aproxy config
-  show --effective` reports its diagnostics without starting anything.
+- **Check without applying.** `aproxy doctor` validates the default config, every config an alias
+  points to and every other `*.toml` in the config directories; `aproxy config show --effective`
+  (add `--config <path>` for another file) reports one file's diagnostics. Both read the files only:
+  they do not start format programs, so a `[[format]]` entry that passes them can still fail its
+  handshake at start. Do not restart a running instance just to check its TOML.
 
 ## Example
 
@@ -101,10 +102,10 @@ credential of its own; settings-json.md, "Credentials in defaults follow their t
 comparison and which header names are recognized as secrets.
 
 `aproxy config show --effective` prints each effective value with its source layer: `config.toml`,
-`settings.json 全局默认` (settings.json global default), `环境变量` (environment, `proxy` only),
-`内置默认` (built-in default) or `未设置` (unset). `start` override flags are not visible to it; they
+`settings.json global default`, `environment` (`proxy` only),
+`built-in default` or `not set`. `start` override flags are not visible to it; they
 are described in step 1 above.
 
 `proxy` has one extra source: with no `proxy` in either layer, the HTTP client reads the usual
 environment variables (`HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`, `ALL_PROXY`,
-`all_proxy`), and `show --effective` reports the source as `环境变量`.
+`all_proxy`), and `show --effective` reports the source as `environment`.

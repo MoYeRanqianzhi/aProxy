@@ -44,9 +44,8 @@ retries still gets the upstream's real head.
 - Status and headers can no longer change. The successful attempt's complete, validated body is
   written into the committed response; bytes of failed attempts never appear.
 - A successful body that is not SSE is still written, since dropping a good result would be worse, and
-  the log warns `已以 text/event-stream 提交的保活响应里回放的是非 SSE 的成功响应体（响应头已发出，无法撤回）…`
-  ("a non-SSE success body was replayed into a keepalive response already committed as
-  text/event-stream"). For an upstream that answers `"stream": true` with NDJSON and often needs
+  the log warns `Replaying a successful non-SSE body on an already committed text/event-stream response; headers cannot be changed. …`
+  For an upstream that answers `"stream": true` with NDJSON and often needs
   retries, set `keepalive.trigger = "accept"` on that instance.
 - A request that has to stop after the commit ends with one SSE frame: a line `event: error`, then
   `data: <error JSON>` on one line, then a blank line. Before the commit the same JSON is the whole
@@ -105,17 +104,17 @@ a successful attempt as failed). The full table is `docs/error-codes.md` in the 
 For requests that get heartbeats, aProxy sends `accept-encoding: identity` upstream, because plain-text
 heartbeats cannot be inserted into a gzip or brotli stream. This overrides the client's value, a
 request-side format's value and `override_headers`; when `override_headers` sets another
-`accept-encoding`, startup logs `override_headers 里的 accept-encoding 对保活适用的请求不生效…`
-("accept-encoding in override_headers does not apply to keepalive requests"). If the upstream
+`accept-encoding`, startup logs `The accept-encoding override does not apply to keepalive requests. …`
+If the upstream
 compresses anyway, its head is not committed, the skeleton goes out at the interval, and the
 successful body is fully decoded before it is written. Requests without heartbeats keep the client's
 `accept-encoding` and get the upstream's compressed bytes unchanged.
 
 ### Disconnects
 
-Every disconnect on this path logs `客户端已断开，中止上游请求（保活通道）` ("client disconnected; aborting
-the upstream request"). When the client drops after waiting at least 60 s on a committed response that
-has carried only heartbeats, aProxy also warns `客户端在只收到心跳的等待中断开（已等约 N 秒）…` ("client
-disconnected while receiving only heartbeats, after about N s"). Unless the user cancelled, that is
+Every disconnect on this path logs `Client disconnected; aborting upstream request on the keepalive channel`.
+When the client drops after waiting at least 60 s on a committed response that
+has carried only heartbeats, aProxy also warns `Client disconnected after receiving only heartbeats for about N seconds. …`
+Unless the user cancelled, that is
 the client's own stream idle timeout: many clients time SSE events rather than bytes, and comments are
 not events. The fix is on the client side; see clients.md.

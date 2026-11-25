@@ -6,7 +6,7 @@ Part of [config-toml.md](../config-toml.md), which lists the other parts. What `
 
 `aproxy start`, and the precheck of `aproxy restart`, load the file strictly, apply `start` override
 flags and settings.json defaults, and check the result. On failure the instance does not start and the error
-reads `配置错误:` ("configuration error") followed by one line per error:
+reads `Configuration errors:` followed by one line per error:
 
 ```
 <file>:<line>:<column>: <key>: <message> [<code>]
@@ -28,7 +28,8 @@ show` prints the same diagnostics on stderr and exits 3.
 | `config_not_supported` | A shape this version parses but does not implement: the retry-rule `body` matcher, or the format stage `admit`. |
 
 Other start checks that are not file diagnostics: the file named by `--config` must exist
-(`指定的配置文件不存在`), and the listen address must bind. Both exit 1.
+(`Configuration file not found: <path>`, code `target_not_found`, exit 4), and the listen address
+must bind (exit 1). commands/start.md has the full list.
 
 ## Normalization
 

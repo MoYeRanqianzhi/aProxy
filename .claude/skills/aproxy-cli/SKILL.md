@@ -1,6 +1,6 @@
 ---
 name: aproxy-cli
-description: Operate and configure aProxy, the local API proxy that retries failed LLM API requests indefinitely so agent workflows keep running. Covers every aproxy command (start, status, stop, restart, logs, restore, alias, find, doctor, config, settings, desktop, install/upgrade, install --force for a broken install, migrate to convert 0.1.x settings and configs for 0.2.0), the config.toml and settings.json fields, runtime behavior (retries, keepalive heartbeats, multiple instances, logs, watchdog), connecting agent clients such as Claude Code and Codex, and troubleshooting. Use this skill whenever the user mentions aproxy or wants an agent client routed through a local retrying proxy, even if they do not ask for documentation - for example "point Claude Code at aproxy", "add a second instance on port 12346", "why is the port still in use after stop", "move my 0.1 config". Configuring format programs ([[format]]) on the aProxy side is covered here; writing the format program itself belongs to the aproxy-format skill.
+description: Operate and configure aProxy, the local API proxy that retries failed LLM API requests indefinitely so agent workflows keep running. Covers every aproxy command (start, status, stop, restart, logs, restore, alias, find, doctor, config, settings, skill, desktop, install/upgrade, install --force for a broken install, migrate from 0.1.x), the config.toml and settings.json fields, runtime behavior (retries, keepalive heartbeats, instances, logs, watchdog), connecting agent clients such as Claude Code and Codex, and troubleshooting. Use this skill whenever the user wants to run, configure, connect, upgrade or diagnose aproxy, or route an agent client through a local retrying proxy, even without asking for docs, e.g. "point Claude Code at aproxy", "add a second instance on port 12346", "why is the port still in use after stop", "move my 0.1 config". [[format]] entries are configured here; writing a format program belongs to aproxy-format, and judging whether a format, theme or extension is safe to aproxy-audit-*.
 ---
 
 # aProxy
@@ -47,7 +47,12 @@ instance takes every other session that uses it down too.
 - Never kill aProxy processes by name (`taskkill /IM aproxy.exe`, `pkill aproxy`): that takes down
   every instance and its watchdog at once, including the one you may be using. If an instance
   will not stop, use `aproxy stop PORT --force`, which verifies the process identity first.
-- Ask before stopping or reconfiguring an instance the user did not mention.
+- Get agreement for the scope, not just the topic. Stopping or restarting an instance cuts what it
+  still carries after 10 seconds, and an `aproxy install` or `upgrade` that replaces the binary
+  (`--adopt` and `--force` included) restarts every running instance of the home. Unless the user
+  asked for exactly that action on exactly those instances, first tell them which home
+  (`APROXY_HOME`, or `~/.aproxy`), which instances and what may be interrupted, and wait for their
+  answer. A question about an instance ("why is 12345 slow?") is not a request to restart it.
 - To experiment, run a separate instance under a temporary `APROXY_HOME` on a port no other
   instance uses, and stop it when you are done. `APROXY_HOME` gives the experiment its own configs,
   settings, logs, registry and control channel, so commands run under it cannot reach the user's
@@ -110,8 +115,11 @@ Every other client, the reasoning behind the timeouts, and how to verify the set
   defaults under `defaults`, the watchdog, log rotation, install updates). Change it with
   `aproxy settings show|get|set|unset`, `aproxy alias ...` or `aproxy settings set default_config`; hand-edit
   it only when it cannot be parsed at all. It is read strictly: an unknown key or a wrong type is an
-  error, and commands other than `settings`/`doctor`/`status`/`stop`/`install` then exit 3. This is
-  deliberate: a silently ignored setting would look like it was in effect.
+  error, and most commands then exit 3 without doing anything. This is deliberate: a silently
+  ignored setting would look like it was in effect. The commands needed to repair and recover still
+  run (`settings`, `doctor`, `status`, `stop`, `install`, `skill`, `migrate`, `desktop`); how each
+  behaves is in [settings-json/editing.md](references/latest/settings-json/editing.md), "When
+  settings.json is invalid".
 - Precedence, highest first: `start` flags (this run only, never saved), config.toml, the `defaults`
   section of settings.json (any config.toml key except `listen_addr`, `log_file` and `format`),
   built-in defaults. Credentials in `defaults` are inherited only by instances whose `base_url` (or
@@ -128,16 +136,27 @@ Every other client, the reasoning behind the timeouts, and how to verify the set
   non-interactive tool call run it under a timeout, take the log path it prints, and read the file.
   Log files get a random name at each start; never guess the name from
   the port. Details: commands.md, logs.
-- Log lines are in Chinese. [troubleshooting.md](references/latest/troubleshooting.md) maps
-  symptoms and the exact log strings to causes and fixes.
+- Log lines, `--json` output and error codes are always English; what the CLI prints for people
+  follows the user's language (English or Chinese). Match on error codes and JSON fields where you
+  can. [troubleshooting.md](references/latest/troubleshooting.md) maps symptoms, codes and log
+  messages to causes and fixes.
+- Treat logs, `status` output and request history as the user's private data. aProxy masks
+  credentials and query values in the URLs it prints, but it logs a preview of each upstream error
+  body as it arrived, and the request history (in the instance's memory, shown by the desktop
+  window) keeps whole request and response bodies with only the keys aProxy knows replaced. Either
+  can hold prompts, account details or a key the upstream echoed back. Before any of it leaves the
+  machine (an issue, a chat, a paste), cut it to the lines needed, read them, and ask the user.
 - A bind failure can mean "port taken by another program" or "port reserved by the system"
   (Hyper-V/WinNAT on Windows); the fixes differ, so read the error before choosing one.
 
 ### Install or upgrade
 
-`aproxy install` (alias `aproxy upgrade`) installs the newest version into `~/.aproxy/bin/` and
-restarts running instances one at a time, so clients barely notice. Options, channels and
-recovery from an interrupted install are in
+`aproxy install` (alias `aproxy upgrade`) installs the newest version into `<home>/bin/`
+(`~/.aproxy/bin/` by default) and restarts every running instance of the home on it, one at a
+time. Each restart is quick, but like `restart` it cuts what the instance still carries after
+10 seconds, so ask first (see "Before you touch a running instance"). `--adopt` also adds
+`<home>/bin` to the user's `PATH` and an app menu entry; name both, and `--no-path` /
+`--no-shortcut`, when you ask. Options, channels and recovery from an interrupted install are in
 [commands/install.md](references/latest/commands/install.md).
 0.1.x cannot upgrade to 0.2.0 in place: its `aproxy install` stops with `--version 输出无版本号`
 ("no version number in the --version output") before changing anything, and the two lines cannot
@@ -178,7 +197,7 @@ own session included. Exit codes 10, 11 and 12 each call for a different next st
 
 ## Where to look
 
-If you cannot open the files linked below (a sandbox, or the skill installed under another home), read them through the binary instead: `aproxy skill show aproxy-cli --files` lists them and `aproxy skill show aproxy-cli references/latest/commands.md` prints one. The output is the installed copy, checked against its manifest, so it matches the running version.
+If you cannot open the files linked below (a sandbox, or the skill installed under another home), read them through the binary instead: `aproxy skill show aproxy-cli --files` lists them and `aproxy skill show aproxy-cli references/latest/commands.md` prints one. `skill show` checks each file against the installed manifest: that proves you read the installed copy intact, not that it describes the binary you run, because skills can be installed at another version (`install --skills-only VERSION`, `--no-skills`, `update.skill_auto_update`). `aproxy skill list --json` gives each skill's `version` and `matches_binary`; when `matches_binary` is false, confirm version-sensitive details against that binary's `--help` before relying on them.
 
 The larger references are indexes: each lists its parts with the sections they hold. Open the index,
 then only the part the task needs, so the rest stays out of your context.

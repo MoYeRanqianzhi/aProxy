@@ -43,8 +43,8 @@ absent before the first configuration).
 
 - **`show`** prints the values written in the file, with secrets masked. `--effective` also fills in
   the keys the file does not write from the settings.json global defaults and the built-in
-  defaults, marks each value's source (`config.toml`, `settings.json 全局默认`, `环境变量`,
-  `内置默认` or `未设置`), and lists credentials withheld from a global default. If the file has
+  defaults, marks each value's source (`config.toml`, `settings.json global default`, `environment`,
+  `built-in default` or `not set`), and lists credentials withheld from a global default. If the file has
   errors, `show` still prints the values, then lists the diagnostics on stderr as
   `file:line:col: key: message [code]` and exits 3.
 - **`get KEY`** prints one key's effective value, with the layer it comes from.
@@ -87,8 +87,8 @@ The keys the CLI most often writes, as spelled in config.toml:
   or more, `<secret sk-a…f3a9>`; `--json` prints `{"secret":true}` with a `"hint"`. Writing that
   placeholder back through `set` keeps the stored value. Credentials in settings.json `defaults`
   are inherited only by an instance whose final `base_url` (or `proxy`) points at the same target as
-  the default's. When it does not, `show --effective` prints a `全局默认里的这些凭据没有继承…`
-  ("these credentials in the global defaults were not inherited") block naming each withheld key
+  the default's. When it does not, `show --effective` prints a `These credentials were not inherited from global defaults…`
+  block naming each withheld key
   and both targets, and warns with `default_credential_withheld` when the instance has no credential
   of its own. settings-json.md, "Credentials in defaults follow their target", explains the
   comparison and which header names count as credentials.
@@ -138,13 +138,13 @@ one value as JSON, or `null` for a key that is neither stored nor built in.
   version knows can be set; `unset` accepts any key, including an unknown one.
 - **Secrets are write-only.** `show` and `get` print a secret as `{"secret": true, "hint": "sk-a…f3a9"}`
   and mask URL credentials. Writing the placeholder back keeps the stored value.
-- **Results and exit codes.** `已保存到 <path>` ("saved to") after a change, `没有变化: <path>`
-  ("no change") when the value was already there. Exit 0 for those and for a successful `show`/`get`;
+- **Results and exit codes.** `Saved to <path>` after a change, `No changes: <path>`
+  when the value was already there. Exit 0 for those and for a successful `show`/`get`;
   2 for a malformed key path or a value that is not valid JSON; 3 when the file cannot be read or the
   change would make it invalid (nothing is written); 1 when the file cannot be written.
 - **Running instances read settings.json only when they start.** After a change under `defaults`,
-  `set` and `unset` list every running instance on stderr (`运行中的实例要重启才用上这次改动:`,
-  "running instances need a restart to use this change", then one `aproxy restart <port>` line each).
+  `set` and `unset` list every running instance on stderr (`Restart these running instances to apply the change:`,
+  then one `aproxy restart <port>` line each).
   Changes outside `defaults` need no restart.
 - **`--json`** prints one document on stdout: `show` gives
   `{"schema":1,"file","values","diagnostics"}` (the document comes first even when the file has

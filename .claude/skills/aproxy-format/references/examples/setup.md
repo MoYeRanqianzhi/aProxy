@@ -32,8 +32,10 @@ same for every role and worth knowing before reading the examples:
   from the instance's environment or from the entry's `env` table.
 
 Entry order is the request direction, client side first. The rule that shapes most chains: once
-an entry declares `retry`, every entry after it must declare `retry` too, because a retry reruns
-the chain from the first `retry` entry and what follows has to be redone for the new destination.
+an entry declares `retry`, every later entry that declares `request` must declare `retry` too,
+because a retry reruns the request side of the chain from the first `retry` entry and every later
+request rewrite has to be redone for the new destination. Entries that only see responses,
+decisions or notifications (`policy`, `heartbeat`) are not bound by it.
 
 ## Starter scenarios (`init`)
 

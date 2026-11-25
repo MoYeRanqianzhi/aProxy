@@ -262,10 +262,19 @@ growable buffer in any language.
 
 ## Test without aProxy
 
-`scripts/test_format.py` plays aProxy's side of the pipe. It sends `hello`, checks the reply,
-sends a realistic message for each stage the program declared, checks every reply (one line,
-`seq`, field shapes, patch rules, vote ranges), threads `state` from reply to message as aProxy
-does, then closes stdin and checks that the program exits.
+`scripts/test_format.py`, in this skill's directory (write its full path where the commands below
+say `scripts/`), plays aProxy's side of the pipe. It sends `hello`, checks the reply, sends one
+representative message for each data-plane stage the program declared, checks every reply (one
+line, `seq`, field shapes, patch rules, vote ranges), threads `state` from reply to message as
+aProxy does, then closes stdin and checks that the program exits. It does not call control methods
+and does not try every legal exchange, so a pass shows the program speaks the protocol, not that it
+handles every request.
+
+The harness starts the program the way you name it, with your environment. Run it only on code you
+trust (judge an unknown program with the aproxy-audit-format skill first, without running it), and
+give it made-up keys and payloads. Its output shows the command line, the program's stderr and,
+with `-v`, every frame, so it can repeat whatever arguments, keys and bodies you passed: read it
+before you paste any of it elsewhere.
 
 ```bash
 # every stage the program declares; arguments after -- go to the program

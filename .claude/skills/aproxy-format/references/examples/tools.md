@@ -18,11 +18,13 @@ fail the handshake for a structural reason. It never runs a configured command a
 network connection. Exit code 0 means valid; the output says exactly what that covers:
 
 ```text
-format 链与官方角色配置有效（7 个程序）。
-没有检查：
-  - 环境变量 OPENAI_KEY、RELAY_KEY_A、RELAY_KEY_B 是否已设置（启动密钥角色或选用渠道时需要）
-  - 实例的其余配置（监听地址、超时等），由 aproxy doctor 检查
+The format chain and official role configuration are valid (7 programs).
+Not checked:
+  - Whether OPENAI_KEY, RELAY_KEY_A, RELAY_KEY_B are set in the environment (needed when starting a key role or selecting a channel)
+  - Other instance settings, including the listen address and timeouts. Run aproxy doctor to check them.
 ```
+
+The tools print in the user's language (English or Chinese); the meaning is the same.
 
 So after a clean `check`, still make sure the listed variables are set for the instance, and run
 `aproxy doctor` for the rest of config.toml. Pass `--home <dir>` (the instance's home) so that
@@ -82,8 +84,8 @@ What to rely on and what not:
   anything with them, network included. Use it only for programs the user trusts.
 - **The trace shows what the instance would do, or `try` stops.** Where it does not simulate a
   situation (a worker failing mid-rehearsal, a failure inside a stream with several stream
-  layers) it prints `未模拟：…`, says what the real instance does, and exits with code 2 rather
-  than printing a guess.
+  layers) it prints `Not simulated: …`, says what the real instance does, and exits with code 2
+  rather than printing a guess.
 - When the sample runs out of attempts while the chain still wants to retry, the last line is
   `"changed":["more_attempts_needed"]`: add attempts to see further.
 - Roles that read credentials need their environment variables set for the `try` run (any

@@ -72,8 +72,10 @@ About `request_body`:
   same request sent again has the same digest.
 - With `none` or `digest`, the `request` object has no `body`; the reply may still patch the
   URL and headers.
-- It is a performance contract and a privacy one: a program that only votes never sees the
-  conversation.
+- It is a performance contract and a privacy one, for the client's request body only. With `none`
+  a program never receives what the client sent, but responses still reach it: `decide` carries the
+  upstream response body (up to 1 MiB; on a success too, with `decide.success`), and `response` and
+  `stream` carry the whole answer.
 
 If a line your reply must fit in one frame cannot fit under `limits` (a stream ending that
 repeats all output, for example), end with an in-protocol error for the client instead of
@@ -133,8 +135,10 @@ an empty piece); only replies may omit both.
 - `state` is private to one program and one request. Programs cannot read each other's state.
 - Messages of one request, and of different requests, may reach different workers. A stream is
   the exception: one worker handles it from `open` to `close` or `abort`.
-- **Retries.** Programs that declare `retry` must form the tail of the chain. When the retry
-  segment reruns, it starts at the first program that declared `retry`, which receives
+- **Retries.** Among the programs that serve `request`, those that declare `retry` must form the
+  tail: once an entry declares `retry`, every later entry that declares `request` must declare
+  `retry` too. Entries without `request` (response, stream, decide, heartbeat or notify only) are
+  not bound by this. When the retry segment reruns, it starts at the first program that declared `retry`, which receives
   `stage: "retry"` with the cached output of the layer before it. Programs before that point
   handle each request once. Whether the segment reruns is decided by `reroute` in `decide`; when
   nobody votes, it reruns whenever some program declared `retry`. With `reroute: false`, aProxy

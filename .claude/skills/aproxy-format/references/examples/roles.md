@@ -117,10 +117,16 @@ model = "small"                    # matched against the model the client sent
 - **Failover:** on a retry that reruns the chain, the next channel of the same group is tried in
   configuration order, then the next priority group; it wraps around only after every matching
   channel had its turn.
-- **Credentials never cross destinations.** When the destination changes, `route` strips every
-  credential header and cookie, then applies the channel's own `credential_env` (sent in
-  `auth_header`, which must be a credential header) or leaves the slot for a `keys` entry later
-  in the chain.
+- **Credential headers do not follow the request to a new channel.** On every request `route`
+  removes the headers aProxy treats as credentials, the same set it masks in request history:
+  `authorization`, `proxy-authorization`, `cookie`, and any header whose name contains `key`,
+  `token`, `secret`, `auth`, `session` or `signature`. It then applies the channel's own
+  `credential_env` (sent in `auth_header`, which must be a credential header) or leaves the slot
+  for a `keys` entry later in the chain. That rule goes by header name only. A credential in a
+  header named otherwise (`x-org-id`, say), in the body, or in a query parameter listed in
+  `carry_query` reaches whichever channel is chosen. When channels belong to different providers,
+  remove such values with a `rewrite` entry or keep them out of the request, and never list a
+  credential-bearing parameter in `carry_query`.
 - **URL:** the channel's `url` is used as written. `preserve_path = true` appends the client's
   original path instead. The query string is kept within one origin and dropped across origins
   except for the names listed in `carry_query`.

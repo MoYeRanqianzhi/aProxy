@@ -43,24 +43,32 @@ network traffic, `translate` converts one request body. The binary is a separate
 its own version line. Installation, every role's configuration and complete chains are in
 [references/examples.md](references/examples.md).
 
-Start there: `aproxy-format init <scenario> --output <dir>`, edit the generated files, run
-`aproxy-format check`, then `aproxy-format try`. Write your own program only for what the roles
-do not cover.
+Start there: `aproxy-format init <scenario> --output <dir>` writes `<dir>/config.toml` and the
+role files. Edit them, then validate with `aproxy-format check <dir>/config.toml --home <home>` and
+rehearse with `aproxy-format try <dir>/config.toml --request sample.json --home <home>`, where
+`<home>` is the instance's aProxy home and `sample.json` a request you write
+([references/examples/tools.md](references/examples/tools.md) has the sample format and what each
+tool does not cover). Write your own program only for what the roles do not cover.
 
 ## Writing your own
 
 1. **Decide which stages you need and how much of the request body.** Ask for as little as the
    job needs: a program that only edits headers or only votes should request body `none`, so
-   megabytes of conversation never cross its pipe. The stage table in
-   [references/protocol.md](references/protocol.md) says what each stage receives.
+   megabytes of conversation never cross its pipe. `request_body` in the
+   [hello](references/protocol/transport.md#hello) reply sets this per stage; each stage's section
+   in [references/protocol.md](references/protocol.md) lists what else it receives (`decide`, for
+   one, gets the upstream response body whatever you choose).
 2. **Pick a process model.** `process = "spawn"` (the default) starts a process per message;
    `process = "persistent"` keeps workers that loop over lines, which is faster and is required
    for `stream` and `notify`.
 3. **Start from the template** in [references/guide.md](references/guide.md): read a line,
    answer the `hello`, then answer every message with one line that echoes its `seq`.
-4. **Test it without aProxy:** `python scripts/test_format.py --command <program> -- <args>`
-   plays aProxy's side, sends a realistic message for every stage the program declares and
-   checks each reply against the protocol.
+4. **Test it without aProxy:**
+   `python <this skill's directory>/scripts/test_format.py --command <program> -- <args>` plays
+   aProxy's side: `hello`, then one representative message for each data-plane stage the program
+   declares, each reply checked against the protocol. It runs the program with your environment and
+   prints its stderr, so use it on code you trust, with made-up keys and payloads
+   ([references/guide.md](references/guide.md), "Test without aProxy").
 5. **Configure it** as a `[[format]]` entry (keys in the aproxy-cli skill,
    `references/latest/config-toml.md`), run `aproxy doctor`, and restart the instance. Later
    changes to the program itself only need `aproxy restart <port> --format <name>`, which keeps
@@ -109,7 +117,7 @@ a program that only improves decisions (`policy`, `adaptive`) optional.
 
 ## Where to look
 
-If you cannot open the files linked below (a sandbox, or the skill installed under another home), read them through the binary instead: `aproxy skill show aproxy-format --files` lists them and `aproxy skill show aproxy-format references/protocol.md` prints one. The output is the installed copy, checked against its manifest, so it matches the running version.
+If you cannot open the files linked below (a sandbox, or the skill installed under another home), read them through the binary instead: `aproxy skill show aproxy-format --files` lists them and `aproxy skill show aproxy-format references/protocol.md` prints one. `skill show` checks each file against the installed manifest: that proves you read the installed copy intact, not that it matches the aProxy you run, because skills can be installed at another version. `aproxy skill list --json` gives each skill's `version` and `matches_binary`; when `matches_binary` is false, check version-sensitive details against that binary's `--help`. The official `aproxy-format` binary has its own version, independent of both.
 
 protocol.md and examples.md are indexes: each lists its parts with the sections they hold. Open the
 index, then only the part the task needs.

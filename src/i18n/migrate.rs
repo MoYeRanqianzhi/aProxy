@@ -15,3 +15,5 @@ message!(duplicate(), en: "This member occurs more than once; choose which value
 #[cfg(unix)]
 message!(linked(), en: "This file has other hard links; migrating it would separate them.", zh: "此文件还有其他硬链接，迁移会把它们分开。");
 message!(settings_target(), en: "To migrate settings.json, run migrate without paths.", zh: "要迁移 settings.json，请运行不带路径的 migrate。");
+message!(missing_target(), en: "This alias or default_config points to a file that does not exist; remove the alias or restore the file.", zh: "这个别名或 default_config 指向的文件不存在；请删除别名或恢复文件。");
+message!(missing_dir(), en: "This config_dirs entry does not exist; remove it from settings.json or create it.", zh: "config_dirs 中的这个目录不存在；请从 settings.json 删除它或创建这个目录。");

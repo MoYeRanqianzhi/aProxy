@@ -228,12 +228,18 @@ fn run_with(
         .then(|| fs::canonicalize(&sp).ok())
         .flatten();
     let run_dir = fs::canonicalize(home.join("run")).unwrap_or_else(|_| home.join("run"));
+    // 同样是 NotFound，设置里留下的旧引用需要人工清理，命令行点名的文件则是读取失败。
+    enum Target {
+        File,
+        Reference,
+        DirectoryError(io::Error),
+    }
     // 发现路径时只用 settings 中可读的别名和目录；旧键出错不应让目录变成空集。
     let mut targets = BTreeMap::new();
     for kind in [Kind::Settings, Kind::Config] {
         if kind == Kind::Settings {
             if paths.is_empty() {
-                targets.insert(sp.clone(), Ok(()));
+                targets.insert(sp.clone(), Target::File);
             } else {
                 // 明确给出的配置不扩展为整座 home；只为启动校验读取生效的设置层。
                 settings_layer = startup_settings(&sp).map(|(layer, valid)| {
@@ -242,7 +248,7 @@ fn run_with(
                 });
             }
         } else if !paths.is_empty() {
-            targets.extend(paths.iter().cloned().map(|p| (p, Ok(()))));
+            targets.extend(paths.iter().cloned().map(|p| (p, Target::File)));
         } else {
             settings_layer = Ok(reports
                 .iter()
@@ -252,24 +258,33 @@ fn run_with(
                 .values()
                 .chain(inventory.default_config.iter())
             {
-                targets.insert(settings::expand_path(raw), Ok(()));
+                targets.insert(settings::expand_path(raw), Target::Reference);
             }
-            let dirs = inventory
-                .config_dirs
-                .iter()
-                .map(|s| settings::expand_path(s))
-                .chain(std::iter::once(home.to_owned()));
-            find::scan(dirs, |p, r| {
-                if !(p == home
-                    && r.as_ref()
-                        .is_err_and(|e| e.kind() == io::ErrorKind::NotFound))
-                {
-                    targets.insert(p, r);
+            let dirs = settings::effective_config_dirs_in(&inventory, home);
+            find::scan(dirs, |path, result| match result {
+                Ok(()) => {
+                    targets.entry(path).or_insert(Target::File);
+                }
+                Err(e) => {
+                    // 默认目录本来就可以不存在；只有用户在 config_dirs 里写下的目录才需要修复。
+                    // 生效目录按用户项优先去重，保留的是该项展开后的路径。
+                    if e.kind() != io::ErrorKind::NotFound
+                        || inventory
+                            .config_dirs
+                            .iter()
+                            .any(|raw| settings::expand_path(raw) == path)
+                    {
+                        targets.insert(path, Target::DirectoryError(e));
+                    }
                 }
             });
         }
-        for (path, found) in std::mem::take(&mut targets) {
-            let resolved = found.and_then(|_| fs::canonicalize(&path));
+        for (path, target) in std::mem::take(&mut targets) {
+            let (resolved, missing) = match target {
+                Target::File => (fs::canonicalize(&path), None),
+                Target::Reference => (fs::canonicalize(&path), Some(text::missing_target(lang))),
+                Target::DirectoryError(e) => (Err(e), Some(text::missing_dir(lang))),
+            };
             let path = match resolved {
                 Ok(path) => path,
                 Err(e)
@@ -281,7 +296,11 @@ fn run_with(
                 }
                 Err(e) => {
                     let mut report = ResultFile::empty(&path);
-                    report.problem(kind, true, text::io(lang, e.kind()));
+                    if let Some(message) = missing.filter(|_| e.kind() == io::ErrorKind::NotFound) {
+                        report.problem(kind, false, message.into());
+                    } else {
+                        report.problem(kind, true, text::io(lang, e.kind()));
+                    }
                     reports.push(report);
                     continue;
                 }

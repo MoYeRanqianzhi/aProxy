@@ -1086,9 +1086,108 @@ fn migrate_never_overwrites_a_different_backup() {
     let doc = document(&run(&missing, &["migrate", "--dry-run", "--json"]));
     assert_eq!(doc["files"], json!([]));
     assert!(!missing.path().exists());
-    h.settings(&json!({"aliases":{"missing":h.path().join("gone.cfg")}}).to_string());
+    // 命令行点名了一个不存在的文件，不是 settings 里需要人工清理的登记项。
+    let missing = h.path().join("gone.cfg");
+    let (doc, _) = failed_document(&h, &["migrate", "--json", missing.to_str().unwrap()], 1);
+    assert_eq!(doc["summary"]["failed"], 1);
+}
+
+/// 不登记目录或别名，体检能发现的默认 configs/ 里的旧文件也应被无参数迁移处理。
+#[test]
+fn migrate_inventory_includes_the_builtin_configs_directory() {
+    let h = TestHome::new();
+    let dir = h.path().join("configs");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("client.toml");
+    let backup = dir.join("client.toml.0.1.bak");
+    let old = "base_url='http://localhost'\nmax_body_mb=7\n";
+    fs::write(&path, old).unwrap();
+    for args in [
+        &["migrate", "--dry-run", "--json"][..],
+        &["migrate", "--json"],
+    ] {
+        let doc = document(&run(&h, args));
+        assert_eq!(doc["summary"]["migrated"], 1);
+        if args.contains(&"--dry-run") {
+            assert_eq!(fs::read_to_string(&path).unwrap(), old);
+            assert!(!backup.exists());
+        } else {
+            assert_eq!(fs::read_to_string(&backup).unwrap(), old);
+            assert!(
+                fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("max_request_mb")
+            );
+        }
+    }
+}
+
+/// 丢失的登记项需要使用者取舍，但不应妨碍本次迁移其他文件。仅真正的读取错误优先退出 1。
+#[test]
+fn migrate_inventory_reports_stale_references_without_blocking_other_files() {
+    let h = TestHome::new();
+    let home = h.path();
+    let alias = home.join("missing-alias.cfg");
+    let default = home.join("missing-default.cfg");
+    let dir = home.join("missing-dir");
+    let settings =
+        json!({"aliases":{"old":alias},"default_config":default,"config_dirs":[dir]}).to_string();
+    h.settings(&settings);
+    let good = home.join("good.toml");
+    let old = "base_url='http://localhost'\nmax_body_mb=9\n";
+    fs::write(&good, old).unwrap();
+    let target_msg = "This alias or default_config points to a file that does not exist; remove the alias or restore the file.";
+    let dir_msg =
+        "This config_dirs entry does not exist; remove it from settings.json or create it.";
+    for (args, code, migrated) in [
+        (&["migrate", "--dry-run", "--json"][..], 5, 1),
+        (&["migrate", "--json"], 5, 1),
+        (&["migrate", "--json"], 3, 0),
+    ] {
+        let (doc, _) = failed_document(&h, args, code);
+        assert_eq!(doc["summary"]["migrated"], migrated);
+        assert_eq!(doc["summary"]["needs_review"], 3);
+        assert_eq!(doc["summary"]["failed"], 0);
+        for (missing, msg) in [
+            (&alias, target_msg),
+            (&default, target_msg),
+            (&dir, dir_msg),
+        ] {
+            let row = doc["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| {
+                    std::path::Path::new(f["path"].as_str().unwrap()).file_name()
+                        == missing.file_name()
+                })
+                .unwrap();
+            assert_eq!(row["outcome"], "needs-review");
+            assert_eq!(row["issues"][0]["message"], msg);
+            assert!(!missing.exists());
+        }
+        assert_eq!(
+            fs::read_to_string(home.join("settings.json")).unwrap(),
+            settings
+        );
+        if args.contains(&"--dry-run") {
+            assert_eq!(fs::read_to_string(&good).unwrap(), old);
+        } else {
+            assert!(
+                fs::read_to_string(&good)
+                    .unwrap()
+                    .contains("max_request_mb")
+            );
+            assert_eq!(
+                fs::read_to_string(home.join("good.toml.0.1.bak")).unwrap(),
+                old
+            );
+        }
+    }
+    fs::write(&alias, [0xff]).unwrap();
     let (doc, _) = failed_document(&h, &["migrate", "--json"], 1);
     assert_eq!(doc["summary"]["failed"], 1);
+    assert_eq!(doc["summary"]["needs_review"], 2);
 }
 
 /// 同一份严格解析既给体检定专用码，也决定何时能建议迁移而不是手工修复。

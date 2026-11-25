@@ -1310,13 +1310,21 @@ fn migrate_keeps_linked_files_together() {
     let old = "base_url='http://localhost'\nforward_only=true";
     fs::write(&path, old).unwrap();
     fs::hard_link(&path, &link).unwrap();
+    let actual = fs::canonicalize(&path).unwrap();
     for flags in [
         vec!["migrate", "--dry-run", "--json"],
         vec!["migrate", "--json"],
     ] {
         let (doc, _) = failed_document(&h, &flags, 3);
+        let row = doc["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| fs::canonicalize(f["path"].as_str().unwrap()).unwrap() == actual)
+            .expect("missing a.toml in migration report");
+        assert_eq!(row["outcome"], "needs-review");
         assert_eq!(
-            doc["files"][0]["issues"][0]["message"],
+            row["issues"][0]["message"],
             "This file has other hard links; migrating it would separate them."
         );
         assert_eq!(

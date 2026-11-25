@@ -52,3 +52,4 @@
 - [Desktop screenshots](memory/desktop-screenshots.md) -- 截图用演示数据、每个细节页都截；完整图集放专门分支（单提交强推），README 典型图经 PR；Windows 要 Windows 11；截图链路不许缩放，托管 runner 都是 1 倍显示。
 - [Legacy migration validation](memory/migration-validation-boundary.md) -- Why identifying a legacy file, inventorying its paths and certifying a rewrite use different readers.
 - [Parallel Codex tasks](memory/parallel-codex-tasks.md) -- 用户允许没有冲突的任务并行：各用独立 worktree、分支与 CARGO_TARGET_DIR；改同一批文件的仍排队（2026-11-26）。
+- [Launch provenance](memory/launch-provenance.md) -- Why one-start evidence belongs outside the spec even when an older binary receives it.

@@ -493,3 +493,7 @@ type FormatCommands = {
 | `desktop_format` | Window `{reason}`: the six host-side control reasons above, `unknown-format`, or `unsupported` (older instance). |
 | `desktop_format_fail` | Window `{code,reason}`: valid program-level refusal. Neither value is a host enum. |
 | `desktop_bad_input`, `desktop_changed`, `desktop_busy`, `desktop_unavailable` | Existing window faults for invalid arguments, stale selection, state change in progress, or unavailable transport/response respectively. The usual run-selection faults also apply. |
+
+### Instance launch provenance
+
+Window starts and whole-instance restarts record `start` and `restart`, respectively. Restarting formats does not start an instance: it leaves `instance.launch_reason` and `instance.launch_note` unchanged. The CLI flags for an instance launch do not attach metadata to a format process.

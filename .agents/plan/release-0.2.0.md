@@ -1340,3 +1340,4 @@
     is omitted. Its lossy input can conflate non-Unicode directory names on filesystems that permit them;
     this affects reporting, not which processes are killed. Ordinary install compares native path components.
   - **Boundary:** workflow changes are proposals, not evidence of a hosted CI gate or an interactive desktop test.
+- **Instance launch provenance.** `start`, `restart` and `restore` accept `--reason` and `--note`. Status, the instance record and the log show the most recent launch; login, watchdog and rolling install carry their own reasons. The restore record and cross-version `__serve` arguments stay unchanged. This covers instance starts, not plugin execution.

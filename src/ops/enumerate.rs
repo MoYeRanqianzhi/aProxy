@@ -16,6 +16,8 @@ mod tests {
     use std::path::Path;
     fn record(port: u16, pid: u32, start: &str) -> InstanceRecord {
         InstanceRecord {
+            launch_reason: "unknown".into(),
+            launch_note: String::new(),
             pid,
             start: start.to_string(),
             instance_id: "19ac3f2e8b5d1a2b".into(),

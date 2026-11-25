@@ -287,6 +287,8 @@ fn hung_instance(home: &TestHome) -> (ChildGuard, u16) {
     let pid = dummy.0.id();
     let start = aproxy_ipc::ledger::start_marker(pid).expect("读不到哑进程的启动标记");
     let info = aproxy::daemon::InstanceRecord {
+        launch_reason: "unknown".into(),
+        launch_note: String::new(),
         pid,
         start,
         instance_id: "19ac3f2e8b5d1a2b".into(),

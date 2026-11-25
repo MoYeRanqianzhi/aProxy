@@ -39,6 +39,12 @@ pub struct InstanceRecord {
     pub log_path: Option<String>,
     /// 前台实例：占着启动它的终端，没有日志文件，也没有期望状态记录
     pub foreground: bool,
+    /// 本次启动的来由；旧记录的空值显示为未知，更新版本的拼写原样显示。
+    #[serde(default)]
+    pub launch_reason: String,
+    /// 已经按本实例的已知密钥脱敏的单行备注；未提供备注时为空串。
+    #[serde(default)]
+    pub launch_note: String,
 }
 
 /// IPC 状态快照：v1 每个成功应答的 `result`，所有 op 都回它。

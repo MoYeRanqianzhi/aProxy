@@ -142,8 +142,9 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) -> u8 {
         }
     }
 
+    let launch_info = args.launch.resolve("start");
     if args.foreground {
-        return match serve_forever(cfg, cfg_file, None).await {
+        return match serve_forever(cfg, cfg_file, None, launch_info).await {
             Ok(()) => 0,
             Err(ServeFailure::Launch(reason)) => {
                 report_launch(reason, None);
@@ -160,7 +161,7 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) -> u8 {
     let exe = std::env::current_exe().expect("cannot locate the current executable");
     let log_path = crate::server::resolve_daemon_log_path(cfg.log_file.as_deref());
     let spec = spec::capture(cfg_file, overrides, &log_path);
-    let info = match launch(&exe, &spec).await {
+    let info = match launch(&exe, &spec, &launch_info).await {
         Ok(info) => info,
         Err(e) => {
             return super::spawn_failure(&e, |lang| {
@@ -249,7 +250,7 @@ pub(crate) fn config_failure(error: &ConfigError) -> Failure {
 /// 这个进程没有控制台：在日志初始化之前出的错（规格读不出来）与配置错误都写进
 /// startup.log，拉起方在子进程退出后从那里摘录原因。
 pub(crate) async fn handle_serve_cmd(spec_path: &Path) -> u8 {
-    let mut spec = match spec::read_spec_file(spec_path) {
+    let (mut spec, launch_info) = match spec::read_spec_file(spec_path) {
         Ok(spec) => spec,
         Err(e) => {
             report_launch(
@@ -299,7 +300,7 @@ pub(crate) async fn handle_serve_cmd(spec_path: &Path) -> u8 {
             true,
         );
     }
-    if let Err(failure) = serve_forever(cfg, cfg_file, Some(spec)).await {
+    if let Err(failure) = serve_forever(cfg, cfg_file, Some(spec), launch_info).await {
         let e = match failure {
             ServeFailure::Launch(reason) => {
                 report_launch(reason, Some(spec_path));

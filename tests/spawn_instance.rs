@@ -29,9 +29,15 @@ async fn spawn_from_spec_reports_an_early_exit_at_once_and_waits_for_a_healthy_i
     let log_path = home.path().join("logs").join("spawn-test.log");
     let spec = spec::capture(Some(&missing), Overrides::default(), &log_path);
     let started = Instant::now();
-    let err = spawn_from_spec(home.path(), exe, &spec, READY_TIMEOUT)
-        .await
-        .expect_err("配置文件不存在，实例应起不来");
+    let err = spawn_from_spec(
+        home.path(),
+        exe,
+        &spec,
+        &spec::Launch::new("start"),
+        READY_TIMEOUT,
+    )
+    .await
+    .expect_err("配置文件不存在，实例应起不来");
     let elapsed = started.elapsed();
     assert!(
         err.excerpt(aproxy_ipc::i18n::Lang::Zh)
@@ -71,9 +77,15 @@ async fn spawn_from_spec_reports_an_early_exit_at_once_and_waits_for_a_healthy_i
         ..Overrides::default()
     };
     let spec = spec::capture(Some(&cfg), overrides, &log_path);
-    let live = spawn_from_spec(home.path(), exe, &spec, READY_TIMEOUT)
-        .await
-        .expect("正常的配置应能就绪");
+    let live = spawn_from_spec(
+        home.path(),
+        exe,
+        &spec,
+        &spec::Launch::new("start"),
+        READY_TIMEOUT,
+    )
+    .await
+    .expect("正常的配置应能就绪");
     let port: u16 = aproxy::daemon::port_of(&live.instance.listen_addr)
         .parse()
         .unwrap();

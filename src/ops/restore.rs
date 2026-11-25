@@ -8,7 +8,7 @@ use std::path::Path;
 
 use crate::daemon;
 use crate::spawn::{self, SpawnError};
-use crate::spec::RestoreEntry;
+use crate::spec::{Launch, RestoreEntry};
 
 /// 一条期望状态记录的处理结果。
 #[derive(Debug)]
@@ -28,25 +28,37 @@ pub enum Restore {
 /// 按一条期望状态记录拉起实例。幂等：已在运行的跳过，可重复执行。`exe` 是用来拉起实例的
 /// 二进制。
 pub async fn restore_entry(entry: &RestoreEntry, exe: &Path) -> Restore {
-    restore_entry_in(&aproxy_ipc::home::home(), entry, exe).await
+    restore_entry_in(
+        &aproxy_ipc::home::home(),
+        entry,
+        exe,
+        &Launch::new("restore"),
+    )
+    .await
 }
 
 /// 从同一个主目录检查、拉起并交接端口记录，避免操作启动者环境里的另一套实例。
-pub async fn restore_entry_in(home: &Path, entry: &RestoreEntry, exe: &Path) -> Restore {
-    restore_current(home, entry, exe, false)
+pub async fn restore_entry_in(
+    home: &Path,
+    entry: &RestoreEntry,
+    exe: &Path,
+    launch: &Launch,
+) -> Restore {
+    restore_current(home, entry, exe, false, launch)
         .await
         .expect("restoring by port does not require an observation token")
 }
 
 /// 根据一次观察恢复，ping 之后、启动之前重读期望记录；等待期间发生的换代不是这次操作的目标。
 pub async fn restore_observed_in(home: &Path, entry: &RestoreEntry, exe: &Path) -> Option<Restore> {
-    restore_current(home, entry, exe, true).await
+    restore_current(home, entry, exe, true, &Launch::new("restore")).await
 }
 async fn restore_current(
     home: &Path,
     entry: &RestoreEntry,
     exe: &Path,
     compare: bool,
+    launch: &Launch,
 ) -> Option<Restore> {
     let run_dir = home.join("run");
     // 幂等：记录存在而实例已在运行时，不重复启动
@@ -70,7 +82,7 @@ async fn restore_current(
     // 端口：实例监听哪个端口由它此刻读到的配置决定——用户改了 config.toml 的端口却没
     // restart，新实例就落在别的端口，ping 原端口只会误报「未就绪」
     Some(
-        match spawn::spawn_from_spec(home, exe, &entry.spec, spawn::READY_TIMEOUT).await {
+        match spawn::spawn_from_spec(home, exe, &entry.spec, launch, spawn::READY_TIMEOUT).await {
             Ok(live) => {
                 let port = daemon::port_of(&live.instance.listen_addr).to_string();
                 // 实例落在新端口：它已按实际端口写了自己的记录，原端口那份被接替。不删的话

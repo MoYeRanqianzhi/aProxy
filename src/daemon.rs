@@ -1955,6 +1955,8 @@ mod tests {
 
     fn sample_info(port: &str) -> InstanceRecord {
         InstanceRecord {
+            launch_reason: "unknown".into(),
+            launch_note: String::new(),
             pid: 42,
             start: String::new(),
             instance_id: "19ac3f2e8b5d1a2b".into(),
@@ -3109,7 +3111,7 @@ mod tests {
             reply.replace(&["0"; BUCKET_COUNT].join(","), "ZEROS"),
             concat!(
                 r#"{"v":1,"ok":true,"result":{"#,
-                r#""instance":{"pid":42,"start":"","instance_id":"19ac3f2e8b5d1a2b","version":"0.0.0-test","listen_addr":"127.0.0.1:12345","config_path":"C:/tmp/config.toml","base_url":"https://api.example.com","started_at":1700000000000,"log_path":null,"foreground":false},"#,
+                r#""instance":{"pid":42,"start":"","instance_id":"19ac3f2e8b5d1a2b","version":"0.0.0-test","listen_addr":"127.0.0.1:12345","config_path":"C:/tmp/config.toml","base_url":"https://api.example.com","started_at":1700000000000,"log_path":null,"foreground":false,"launch_reason":"unknown","launch_note":""},"#,
                 r#""state":"serving","#,
                 r#""behavior":{"delivery":"retry","disk_cache":true,"keepalive":{"trigger":"any","interval_secs":15},"retry_rules":1,"history":{"body_budget_mb":64}},"#,
                 r#""activity":{"last_request_at":1700000000000,"requests_total":120,"retries_total":7,"rescued_total":0,"upgraded_total":0,"in_flight":0,"retrying":0,"by_code":{},"#,
@@ -3200,6 +3202,8 @@ mod tests {
     #[test]
     fn instance_record_shape_is_pinned() {
         let record = InstanceRecord {
+            launch_reason: "unknown".into(),
+            launch_note: String::new(),
             pid: 4321,
             start: "w:133712345678901234".into(),
             instance_id: "19ac3f2e8b5d1a2b".into(),
@@ -3211,7 +3215,7 @@ mod tests {
             log_path: Some("/home/u/.aproxy/logs/19ac3f2e8b5d-1a2b.log".into()),
             foreground: false,
         };
-        let in_snapshot = r#"{"pid":4321,"start":"w:133712345678901234","instance_id":"19ac3f2e8b5d1a2b","version":"0.2.0","listen_addr":"127.0.0.1:12345","config_path":"/home/u/.aproxy/config.toml","base_url":"https://api.example.com","started_at":1760190000123,"log_path":"/home/u/.aproxy/logs/19ac3f2e8b5d-1a2b.log","foreground":false}"#;
+        let in_snapshot = r#"{"pid":4321,"start":"w:133712345678901234","instance_id":"19ac3f2e8b5d1a2b","version":"0.2.0","listen_addr":"127.0.0.1:12345","config_path":"/home/u/.aproxy/config.toml","base_url":"https://api.example.com","started_at":1760190000123,"log_path":"/home/u/.aproxy/logs/19ac3f2e8b5d-1a2b.log","foreground":false,"launch_reason":"unknown","launch_note":""}"#;
         assert_eq!(serde_json::to_string(&record).unwrap(), in_snapshot);
 
         let dir = tempfile::tempdir().unwrap();
@@ -3234,6 +3238,7 @@ mod tests {
         )
         .expect("以后追加的字段读得过去");
         assert!(foreground.foreground);
+        assert!(foreground.launch_reason.is_empty() && foreground.launch_note.is_empty());
         assert_eq!((foreground.config_path, foreground.log_path), (None, None));
         // schema 更高的记录不解读；旧版本的形状读不懂
         assert_eq!(

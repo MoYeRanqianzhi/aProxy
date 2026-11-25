@@ -733,8 +733,12 @@ fn watchdog_respawn_with_port_zero_returns_to_the_same_port() {
         read_text(&wd_log)
     );
 
+    // 直接 __serve 的交接文件不带启动说明，与旧拉起方相同。
+    let direct = ipc_ping_in_dir(&rt, port_1, home).unwrap().instance;
+    assert_eq!(direct.launch_reason, "unknown");
+    assert!(direct.launch_note.is_empty());
     daemon.0.kill().unwrap();
-    daemon.0.wait().report_exit().unwrap();
+    let exit = daemon.0.wait().report_exit().unwrap();
     let mut port_2 = 0u16;
     assert!(
         wait_for(Duration::from_secs(20), || {
@@ -750,6 +754,14 @@ fn watchdog_respawn_with_port_zero_returns_to_the_same_port() {
         read_text(&wd_log)
     );
     test_home.stop_on_drop(port_2);
+    let relaunched = ipc_ping_in_dir(&rt, port_2, home).unwrap().instance;
+    assert_eq!(relaunched.launch_reason, "watchdog");
+    let expected = if cfg!(windows) {
+        format!("previous process exited with code {}", exit.code().unwrap())
+    } else {
+        "previous process exited".into()
+    };
+    assert_eq!(relaunched.launch_note, expected);
     assert_eq!(port_1, port_2, "端口 0 的实例重拉后应回到钉住的端口");
     assert_eq!(
         restore_ports(home),

@@ -318,8 +318,12 @@ pub async fn preflight_in(home: &Path, listen_addr: &str) -> Result<Preflight, P
 /// 后台拉起实例并等它就绪（见 [`crate::spawn`]：按新 pid 定位实际端口，监听端口 0 由
 /// 系统分配时同样等到就绪、报出实际地址；子进程提前退出时立即报告，附上 startup.log 本次
 /// 新增的内容）。实例就绪后顺带确保看护者在任。
-pub async fn launch(exe: &Path, spec: &InstanceSpec) -> Result<InstanceStatus, SpawnError> {
-    launch_in(&aproxy_ipc::home::home(), exe, spec).await
+pub async fn launch(
+    exe: &Path,
+    spec: &InstanceSpec,
+    launch: &crate::spec::Launch,
+) -> Result<InstanceStatus, SpawnError> {
+    launch_in(&aproxy_ipc::home::home(), exe, spec, launch).await
 }
 
 /// 实例和看护者都显式绑定同一主目录；子进程不依赖界面进程的工作目录。
@@ -327,8 +331,9 @@ pub async fn launch_in(
     home: &Path,
     exe: &Path,
     spec: &InstanceSpec,
+    launch: &crate::spec::Launch,
 ) -> Result<InstanceStatus, SpawnError> {
-    let live = spawn::spawn_from_spec(home, exe, spec, spawn::READY_TIMEOUT).await?;
+    let live = spawn::spawn_from_spec(home, exe, spec, launch, spawn::READY_TIMEOUT).await?;
     // 看护者出簇（watchdog 总开关，settings 层）：实例就绪后确保存在看护者。
     // 选举规范防止多实例并发 start 时的重复拉起：claim 有效让位；缺席时仅
     // 存活实例 PID 最小者有权 spawn；claim 原子接管最终裁决唯一性。

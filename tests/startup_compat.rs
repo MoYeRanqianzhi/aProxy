@@ -25,7 +25,7 @@ async fn launch_slot_and_fallback_are_compatible_across_writers() {
             &home.path().join("instance.log"),
         );
         // 先保留一次真实交接文件，确认失败来源：不能因为某一端完全没写结果而误判兼容。
-        let path = spec::write_spec_file(&run, &spec).unwrap();
+        let path = spec::write_spec_file(&run, &spec, None).unwrap();
         let out = home
             .cmd_with(&writer)
             .env("APROXY_LANG", "zh-CN")
@@ -50,9 +50,15 @@ async fn launch_slot_and_fallback_are_compatible_across_writers() {
             assert!(payload.get("render").is_none());
             "配置文件不存在:"
         };
-        let err = spawn_from_spec(home.path(), &writer, &spec, READY_TIMEOUT)
-            .await
-            .unwrap_err();
+        let err = spawn_from_spec(
+            home.path(),
+            &writer,
+            &spec,
+            &spec::Launch::new("start"),
+            READY_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
         let SpawnError::Exited {
             format: None,
             startup_log,

@@ -208,6 +208,7 @@ async fn restart_stale_selection() {
         &selected,
         StopMode::Graceful,
         std::path::Path::new("missing-fixture.exe"),
+        &aproxy::spec::Launch::new("restart"),
     )
     .await
     .err()

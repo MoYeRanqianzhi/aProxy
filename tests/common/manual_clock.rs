@@ -188,6 +188,8 @@ async fn serve() {
     let (stop, mut stopped) = tokio::sync::watch::channel(false);
     let control = Arc::new(daemon::ControlState {
         record: daemon::InstanceRecord {
+            launch_reason: "unknown".into(),
+            launch_note: String::new(),
             pid: std::process::id(),
             start: aproxy_ipc::ledger::start_marker(std::process::id()).unwrap_or_default(),
             instance_id: state.instance_id.to_string(),

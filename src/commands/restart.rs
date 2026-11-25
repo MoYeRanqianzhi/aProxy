@@ -38,6 +38,7 @@ pub(crate) async fn handle_restart_cmd(
     threshold: Option<u64>,
     force: bool,
     formats: Vec<String>,
+    launch: aproxy::spec::Launch,
     json: bool,
 ) -> u8 {
     let format_op = if formats.is_empty() {
@@ -127,7 +128,7 @@ pub(crate) async fn handle_restart_cmd(
     let mut failed: Vec<(String, &'static str)> = Vec::new();
     for info in &selection.instances {
         let port = daemon::port_of(&info.listen_addr).to_string();
-        match restart_instance(info, mode, &exe).await {
+        match restart_instance(info, mode, &exe, &launch).await {
             Ok(done) => {
                 say(json, stopped_line(info, done.stopped));
                 // 这一项的端口是新实例实际监听的：配置改了端口时它与旧实例的不同

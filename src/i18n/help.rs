@@ -4,6 +4,14 @@ use aproxy_ipc::message;
 
 message!(version(), en: "Print the version as `aproxy v<version> (<variant>; <target>…)`", zh: "打印版本（`aproxy v<版本> (<变体>; <目标三元组>…)`）");
 
+message!(launch_reason(), en: "Why this start happens, recorded in the instance log and status: start, restart, restore or plugin. Defaults to the command itself", zh: "这次启动的来由，记进实例日志与状态：start、restart、restore 或 plugin。默认按命令本身");
+
+message!(launch_note(), en: "A one-line note recorded with this start in the instance log and status, such as who started it and why (at most 512 bytes; do not include secrets)", zh: "随这次启动记进实例日志与状态的一行备注，例如谁、为什么启动它（至多 512 字节；不要写密钥）");
+
+message!(invalid_launch_reason(values: &str), en: "Choose one of: {values}", zh: "请选择以下来由之一：{values}");
+
+message!(invalid_launch_note(), en: "Use 1 to 512 UTF-8 bytes without control characters, or omit --note", zh: "请写 1 至 512 字节的 UTF-8 文字，不含控制字符；没有备注时不写 --note");
+
 message!(start_target(), en: "Configuration alias from settings.json or path to a configuration file. Defaults to default_config in settings.json, otherwise ~/.aproxy/config.toml", zh: "配置别名（settings.json 中的别名表）或配置文件路径；不写时用默认配置文件 （settings.json 的 default_config，否则 ~/.aproxy/config.toml）");
 
 message!(start_config(), en: "Path to the configuration file, equivalent to passing a path after start. Use a different listen_addr for each instance", zh: "配置文件路径，与把路径直接写在 start 后面等价。多开不同配置的实例时各自指定 （listen_addr 须互不相同）");

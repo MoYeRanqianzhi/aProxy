@@ -86,8 +86,17 @@ pub async fn restart_instance(
     info: &InstanceRecord,
     mode: StopMode,
     exe: &Path,
+    launch: &crate::spec::Launch,
 ) -> Result<Restarted, RestartFailure> {
-    restart_in(&aproxy_ipc::home::home(), info, mode, exe, Authority::Cli).await
+    restart_in(
+        &aproxy_ipc::home::home(),
+        info,
+        mode,
+        exe,
+        Authority::Cli,
+        launch,
+    )
+    .await
 }
 
 /// 配置预检、停旧实例和拉起同属一个主目录；桌面的观察到执行之间还要核验控制连接。
@@ -97,6 +106,7 @@ pub async fn restart_in(
     mode: StopMode,
     exe: &Path,
     authority: Authority,
+    launch: &crate::spec::Launch,
 ) -> Result<Restarted, RestartFailure> {
     let port = daemon::port_of(&info.listen_addr).to_string();
     let run_dir = home.join("run");
@@ -133,7 +143,7 @@ pub async fn restart_in(
         .await
         .map_err(RestartFailure::Stop)?;
 
-    match spawn::spawn_from_spec(home, exe, &spec, spawn::READY_TIMEOUT).await {
+    match spawn::spawn_from_spec(home, exe, &spec, launch, spawn::READY_TIMEOUT).await {
         Ok(live) => {
             // 配置改了端口：新实例按新端口写了自己的记录，旧端口那份被它接替
             let new_port = daemon::port_of(&live.instance.listen_addr).to_string();

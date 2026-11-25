@@ -110,7 +110,9 @@ fn snapshot_sample() -> Value {
             "base_url": "https://api.example.com",
             "started_at": 1_760_190_000_123_u64,
             "log_path": "/home/u/.aproxy/logs/19ac3f2e8b5d-1a2b.log",
-            "foreground": false
+            "foreground": false,
+            "launch_reason": "start",
+            "launch_note": ""
         },
         "state": "serving",
         "behavior": {
@@ -795,6 +797,8 @@ fn control_channel_speaks_v1_as_sampled() {
         format!("127.0.0.1:{port}")
     );
     assert_eq!(snapshot["instance"]["foreground"], false);
+    assert_eq!(snapshot["instance"]["launch_reason"], "start");
+    assert_eq!(snapshot["instance"]["launch_note"], "");
     assert_eq!(snapshot["activity"]["requests_total"], 0);
     assert_eq!(snapshot["activity"]["buckets"]["width_secs"], 120);
     for series in ["requests", "retries", "failures"] {

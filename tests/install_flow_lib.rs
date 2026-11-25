@@ -902,6 +902,9 @@ async fn rolling_restart_skips_a_port_stopped_during_the_install() {
         .await
         .unwrap();
     assert_ne!(info.instance.pid, child.id());
+    assert_eq!(info.instance.launch_reason, "upgrade");
+    let version = env!("CARGO_PKG_VERSION");
+    assert_eq!(info.instance.launch_note, format!("{version} -> {version}"));
     assert!(same_path(
         &aproxy::process::process_image_path(info.instance.pid).unwrap(),
         &bin

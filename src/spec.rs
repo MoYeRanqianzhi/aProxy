@@ -26,6 +26,65 @@ pub use aproxy_ipc::registry::{SCHEMA, Unreadable, restore_path_in};
 use crate::config::Overrides;
 use serde::{Deserialize, Serialize};
 
+/// 调用者可以指定的启动来由；登录、看护和安装来由只由相应的拉起路径提供。
+pub const CALLER_REASONS: [&str; 4] = ["start", "restart", "restore", "plugin"];
+
+/// 一次进程启动的说明。它与可重放的规格并列，只写入临时交接槽，不写入期望状态。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Launch {
+    /// 供机器读取的固定拼写，显示时才翻译。
+    pub reason: String,
+    /// 调用方给的单行说明；未指定与显式给空串有不同的校验语义。
+    pub note: Option<String>,
+    // 安装者只观察到上一个进程的版本；目标、ACK 收敛或回退究竟跑了哪个版本，以接收方自身为准。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_version: Option<String>,
+}
+
+impl Launch {
+    /// 无备注的启动；拉起方知道更多时再填入备注。
+    pub fn new(reason: &str) -> Self {
+        Self {
+            reason: reason.into(),
+            note: None,
+            previous_version: None,
+        }
+    }
+
+    /// 安装窗口只保留可核实的旧版本；接收方即使是回退镜像也能准确补上自己的版本。
+    pub(crate) fn upgrade(previous: Option<&str>) -> Self {
+        Self {
+            previous_version: previous.filter(|v| !v.is_empty()).map(str::to_owned),
+            ..Self::new("upgrade")
+        }
+    }
+
+    /// 命令行与交接槽共用同一条界限，按 UTF-8 字节而不是字符计数。
+    pub fn valid_note(text: &str) -> bool {
+        (1..=512).contains(&text.len()) && !text.chars().any(char::is_control)
+    }
+
+    fn from_slot(value: serde_json::Value) -> Self {
+        serde_json::from_value::<Self>(value)
+            .ok()
+            .filter(|v| v.note.as_deref().is_none_or(Self::valid_note))
+            .map(|mut v| {
+                if v.reason == "upgrade"
+                    && let Some(old) = v.previous_version.take()
+                {
+                    v.note = Some(format!("{old} -> {}", env!("CARGO_PKG_VERSION")));
+                }
+                v
+            })
+            .filter(|v| {
+                (CALLER_REASONS.contains(&v.reason.as_str())
+                    || matches!(v.reason.as_str(), "login" | "watchdog" | "upgrade"))
+                    && v.note.as_deref().is_none_or(Self::valid_note)
+            })
+            .unwrap_or_else(|| Self::new("unknown"))
+    }
+}
+
 /// 拉起规格。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct InstanceSpec {
@@ -119,20 +178,42 @@ pub fn capture_env() -> BTreeMap<String, Option<String>> {
 
 /// 把规格写成交接文件 `run/<纳秒>-<pid>.spec.json`，返回路径。名字里的 pid 是拉起方的：
 /// 残留的交接文件靠它判断写者是否还在。
-pub fn write_spec_file(run_dir: &Path, spec: &InstanceSpec) -> std::io::Result<PathBuf> {
+pub fn write_spec_file(
+    run_dir: &Path,
+    spec: &InstanceSpec,
+    launch: Option<&Launch>,
+) -> std::io::Result<PathBuf> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let path = run_dir.join(format!("{nanos}-{}{SPEC_SUFFIX}", std::process::id()));
-    let json = serde_json::to_string(spec).expect("launch specifications must serialize");
+    // 规格仍在顶层：旧实例忽略不认识的 launch 字段，连旧实例的子进程也不会继承备注。
+    #[derive(Serialize)]
+    struct Slot<'a> {
+        #[serde(flatten)]
+        spec: &'a InstanceSpec,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        launch: Option<&'a Launch>,
+    }
+    let json = serde_json::to_string(&Slot { spec, launch })
+        .expect("launch specifications must serialize");
     crate::fsx::write_atomic_private(&path, json.as_bytes())?;
     Ok(path)
 }
 
 /// 读交接文件。
-pub fn read_spec_file(path: &Path) -> Result<InstanceSpec, Unreadable> {
-    read_record(path, SCHEMA)
+pub fn read_spec_file(path: &Path) -> Result<(InstanceSpec, Launch), Unreadable> {
+    #[derive(Deserialize)]
+    struct Slot {
+        #[serde(flatten)]
+        spec: InstanceSpec,
+        // 来由读不懂不能妨碍启动；规格或其 schema 无效才拒绝交接。
+        #[serde(default)]
+        launch: serde_json::Value,
+    }
+    let slot: Slot = read_record(path, SCHEMA)?;
+    Ok((slot.spec, Launch::from_slot(slot.launch)))
 }
 
 // ---------------------------------------------------------------------------
@@ -339,16 +420,48 @@ mod tests {
     }
 
     #[test]
+    fn one_launch_metadata_is_optional_and_cannot_invalidate_the_spec() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let spec = sample();
+        let path = write_spec_file(dir.path(), &spec, Some(&Launch::new("login"))).unwrap();
+        // 旧实例直接反序列化顶层规格，不认识的交接字段不能妨碍它启动。
+        assert_eq!(read_record::<InstanceSpec>(&path, SCHEMA).unwrap(), spec);
+        assert_eq!(read_spec_file(&path).unwrap().1, Launch::new("login"));
+        let mut slot = serde_json::to_value(&spec).unwrap();
+        for invalid in [
+            json!(null),
+            json!(7),
+            json!({"reason":"newer"}),
+            json!({"reason":"start","note":1}),
+            json!({"reason":"plugin","note":""}),
+            json!({"reason":"restart","note":"a\nb"}),
+            json!({"reason":"restore","note":"界".repeat(171)}),
+        ] {
+            slot["launch"] = invalid;
+            std::fs::write(&path, slot.to_string()).unwrap();
+            assert_eq!(
+                read_spec_file(&path).unwrap(),
+                (spec.clone(), Launch::new("unknown"))
+            );
+        }
+        assert!(Launch::valid_note(&"é".repeat(256)));
+    }
+
+    #[test]
     fn spec_file_round_trips_and_is_named_after_the_writer() {
         let dir = tempfile::tempdir().unwrap();
         let spec = sample();
-        let path = write_spec_file(dir.path(), &spec).unwrap();
+        let path = write_spec_file(dir.path(), &spec, None).unwrap();
         let name = path.file_name().unwrap().to_str().unwrap();
         assert!(
             name.ends_with(&format!("-{}.spec.json", std::process::id())),
             "{name}"
         );
-        assert_eq!(read_spec_file(&path).unwrap(), spec);
+        assert_eq!(
+            read_spec_file(&path).unwrap(),
+            (spec, Launch::new("unknown"))
+        );
         assert!(matches!(
             read_spec_file(&dir.path().join("gone.spec.json")),
             Err(Unreadable::Io(_))
@@ -423,7 +536,7 @@ mod tests {
     fn records_are_private_to_the_owner() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let spec_path = write_spec_file(dir.path(), &sample()).unwrap();
+        let spec_path = write_spec_file(dir.path(), &sample(), None).unwrap();
         write_restore_in(dir.path(), "12345", &sample()).unwrap();
         for path in [spec_path, restore_path_in(dir.path(), "12345")] {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

@@ -217,12 +217,14 @@ async fn spawn_and_wait_ready(
     home: &Path,
     exe: &Path,
     spec: &InstanceSpec,
+    launch: &crate::spec::Launch,
     on_timeout: crate::spawn::OnReadyTimeout,
 ) -> Result<u32, Box<Cause>> {
     crate::spawn::spawn_from_spec_with_timeout_action(
         home,
         exe,
         spec,
+        launch,
         crate::spawn::READY_TIMEOUT,
         on_timeout,
     )
@@ -267,6 +269,7 @@ pub async fn restart_instance(
 ) -> Result<u32, RestartError> {
     let spec = restore_spec(run_dir, port).map_err(|e| RestartError::NotRestarted(Box::new(e)))?;
     let live = crate::daemon::ipc_ping_in(run_dir, port).await.ok();
+    let launch = crate::spec::Launch::upgrade(live.as_ref().map(|s| s.instance.version.as_str()));
     let image = live
         .as_ref()
         .and_then(|i| crate::process::process_image_path(i.instance.pid));
@@ -291,6 +294,7 @@ pub async fn restart_instance(
         home,
         exe,
         &spec,
+        &launch,
         crate::spawn::OnReadyTimeout::StopBeforeRollback,
     )
     .await
@@ -319,6 +323,7 @@ pub async fn restart_instance(
             home,
             &old,
             &spec,
+            &launch,
             crate::spawn::OnReadyTimeout::LeaveRunning,
         )
         .await

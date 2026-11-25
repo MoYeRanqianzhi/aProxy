@@ -287,7 +287,7 @@ impl TestHome {
                 *value = Some(NO_PROXY_LOOPBACK.to_string());
             }
         }
-        let spec_path = aproxy::spec::write_spec_file(&self.home.join("run"), &spec).unwrap();
+        let spec_path = aproxy::spec::write_spec_file(&self.home.join("run"), &spec, None).unwrap();
         let mut cmd = self.cmd_with(exe);
         cmd.arg("__serve")
             .arg("--home")

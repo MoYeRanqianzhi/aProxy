@@ -83,7 +83,7 @@ async fn explicit_home_control_keeps_the_selected_process_alive_on_identity_mism
             .unwrap(),
         start::Preflight::Clear
     ));
-    let live = start::launch_in(home.path(), exe, &spec)
+    let live = start::launch_in(home.path(), exe, &spec, &spec::Launch::new("start"))
         .await
         .unwrap()
         .instance;
@@ -141,12 +141,28 @@ async fn window_operations_refuse_stale_choices_replaced_runs_and_responsive_for
         .unwrap();
     let one = ops.start_instance(start.target.clone()).await.unwrap();
     home.stop_on_drop(one.port);
+    assert_eq!(
+        aproxy::daemon::ipc_ping_in(&home.path().join("run"), &one.port.to_string())
+            .await
+            .unwrap()
+            .instance
+            .launch_reason,
+        "start"
+    );
     assert!(matches!(
         ops.force_stop_instance(one.clone()).await,
         Err(Fault::DesktopForceRefused { .. })
     ));
     let two = ops.restart_instance(one.clone()).await.unwrap();
     home.stop_on_drop(two.port);
+    assert_eq!(
+        aproxy::daemon::ipc_ping_in(&home.path().join("run"), &two.port.to_string())
+            .await
+            .unwrap()
+            .instance
+            .launch_reason,
+        "restart"
+    );
     assert_ne!(one.instance_id, two.instance_id);
     assert!(matches!(
         ops.stop_instance(one.clone()).await,
@@ -230,6 +246,8 @@ async fn force_targets_only_the_owned_unresponsive_test_process() {
     let start = aproxy_ipc::ledger::start_marker(pid).unwrap();
     let id = "aced000000000001".to_owned();
     let rec = aproxy::daemon::InstanceRecord {
+        launch_reason: "unknown".into(),
+        launch_note: String::new(),
         pid,
         start,
         instance_id: id.clone(),
@@ -974,7 +992,7 @@ async fn run_form_binds_the_read_destination_and_keeps_launch_overrides_private(
         },
         &home.path().join("own.log"),
     );
-    let live = start::launch_in(home.path(), exe, &launch)
+    let live = start::launch_in(home.path(), exe, &launch, &spec::Launch::new("start"))
         .await
         .unwrap()
         .instance;

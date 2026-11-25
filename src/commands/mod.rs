@@ -59,7 +59,7 @@ impl JsonOutput {
             } => false,
             Commands::Stop { json, .. }
             | Commands::Restart { json, .. }
-            | Commands::Restore { json }
+            | Commands::Restore { json, .. }
             | Commands::Migrate { json, .. }
             | Commands::Doctor { json }
             | Commands::Status { json, .. }
@@ -455,7 +455,15 @@ mod tests {
     async fn lifecycle_results_return_to_the_runtime_owner() {
         assert_eq!(stop::handle_stop_cmd(None, Some(1), false, false).await, 2);
         assert_eq!(
-            restart::handle_restart_cmd(None, Some(1), false, Vec::new(), false).await,
+            restart::handle_restart_cmd(
+                None,
+                Some(1),
+                false,
+                Vec::new(),
+                aproxy::spec::Launch::new("restart"),
+                false
+            )
+            .await,
             2
         );
         assert_eq!(Results::new(None).finish(false), 0);

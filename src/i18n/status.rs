@@ -38,6 +38,38 @@ message!(live(port: &str, pid: u32, version: &str, uptime: &str, idle: &str), en
 
 message!(endpoints(addr: &str, upstream: &str, config: &str), en: "    Listen http://{addr}   upstream {upstream}   config {config}", zh: "    监听 http://{addr}   上游 {upstream}   配置 {config}");
 
+message!(last_start(label: &str), en: "    Last start: {label}", zh: "    最近一次启动：{label}");
+message!(with_note(label: &str, note: &str), en: "{label} ({note})", zh: "{label}（{note}）");
+message!(reason_start(), en: "started", zh: "启动");
+message!(reason_restart(), en: "restarted", zh: "重启");
+message!(reason_restore(), en: "restored", zh: "恢复");
+message!(reason_login(), en: "restored at login", zh: "登录时恢复");
+message!(reason_watchdog(), en: "relaunched by the watchdog", zh: "看门狗重拉");
+message!(reason_upgrade(), en: "restarted for an upgrade", zh: "升级后重启");
+message!(reason_plugin(), en: "started by a plugin", zh: "插件启动");
+message!(reason_unknown(), en: "unknown", zh: "未知");
+
+/// 只翻译本版本认得的来由；未知拼写可能来自更新的实例，保留原文供辨认。
+pub(super) fn launch_line(lang: aproxy_ipc::i18n::Lang, reason: &str, note: &str) -> String {
+    let label = match reason {
+        "start" => reason_start(lang),
+        "restart" => reason_restart(lang),
+        "restore" => reason_restore(lang),
+        "login" => reason_login(lang),
+        "watchdog" => reason_watchdog(lang),
+        "upgrade" => reason_upgrade(lang),
+        "plugin" => reason_plugin(lang),
+        "unknown" | "" => reason_unknown(lang),
+        other => other,
+    };
+    let line = last_start(lang, label);
+    if note.is_empty() {
+        line
+    } else {
+        with_note(lang, &line, note)
+    }
+}
+
 message!(recent(code: &str, message: &str, age: &str), en: "\"{code}{message}\" ({age} ago)", zh: "\"{code}{message}\"（{age} 前）");
 
 message!(no_error(), en: "none", zh: "无");
@@ -59,3 +91,18 @@ message!(unresponsive(n: usize), en: "Unresponsive aProxy instances ({n}): the p
 message!(unresponsive_row(port: &str, pid: u32, version: &str, config: &str), en: "  Port {port}  pid {pid}  v{version}  config {config}\n    Run aproxy stop {port} --force to stop it, or aproxy restart {port} --force to restart it.", zh: "  端口 {port}  pid {pid}  v{version}  配置 {config}\n    可用 aproxy stop {port} --force 结束（或 aproxy restart {port} --force 重启）");
 
 message!(no_config(), en: "(no configuration file)", zh: "（没有配置文件）");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aproxy_ipc::i18n::Lang;
+
+    #[test]
+    fn missing_and_future_reasons_remain_readable() {
+        assert_eq!(launch_line(Lang::En, "", ""), "    Last start: unknown");
+        assert_eq!(
+            launch_line(Lang::Zh, "future", "说明"),
+            "    最近一次启动：future（说明）"
+        );
+    }
+}

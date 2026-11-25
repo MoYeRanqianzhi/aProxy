@@ -420,7 +420,7 @@ impl InstanceOps for DesktopHome {
                     self.resolve_choice(&target).await?;
                     let log = start::daemon_log_path_in(&self.home, cfg.log_file.as_deref());
                     let spec = spec::capture(file, ov, &log);
-                    start::launch_in(&self.home, &self.exe, &spec)
+                    start::launch_in(&self.home, &self.exe, &spec, &spec::Launch::new("start"))
                         .await
                         .map_err(|e| start_error(e, false))?
                 }
@@ -467,6 +467,7 @@ impl InstanceOps for DesktopHome {
                 stop::StopMode::Graceful,
                 &self.exe,
                 stop::Authority::Observed,
+                &spec::Launch::new("restart"),
             )
             .await
             .map_err(|err| match err {

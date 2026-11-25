@@ -48,6 +48,43 @@ pub struct Cli {
     pub command: Option<Commands>,
 }
 
+/// 三个可拉起实例的命令共用校验：在解析参数时拒绝无效值，不能先停实例再报错。
+#[derive(clap::Args, Debug, Clone, PartialEq, Default)]
+pub struct LaunchArgs {
+    #[arg(long, help = help::launch_reason(current()), value_parser = reason_parser(), allow_hyphen_values = true)]
+    reason: Option<String>,
+    #[arg(long, value_name = "TEXT", help = help::launch_note(current()), value_parser = parse_note, allow_hyphen_values = true)]
+    note: Option<String>,
+}
+
+impl LaunchArgs {
+    /// 只在没有显式指定来由时才采用命令本身的来由。
+    pub fn resolve(self, command: &str) -> crate::spec::Launch {
+        let mut launch = crate::spec::Launch::new(self.reason.as_deref().unwrap_or(command));
+        launch.note = self.note;
+        launch
+    }
+}
+
+// 先接收原生参数：非法 UTF-8 也是不认识的来由，也应列出可用值。
+fn reason_parser() -> impl clap::builder::TypedValueParser<Value = String> {
+    use clap::builder::TypedValueParser;
+    clap::builder::OsStringValueParser::new().try_map(|v| {
+        v.into_string()
+            .ok()
+            .filter(|s| crate::spec::CALLER_REASONS.contains(&s.as_str()))
+            .ok_or_else(|| {
+                help::invalid_launch_reason(current(), &crate::spec::CALLER_REASONS.join(", "))
+            })
+    })
+}
+
+fn parse_note(text: &str) -> Result<String, &'static str> {
+    crate::spec::Launch::valid_note(text)
+        .then(|| text.to_owned())
+        .ok_or(help::invalid_launch_note(current()))
+}
+
 /// `aproxy start` 的参数集：启动哪个配置，以及只对这次启动生效的覆盖。
 #[derive(clap::Args, Debug, Clone, PartialEq, Default)]
 pub struct StartArgs {
@@ -89,6 +126,10 @@ pub struct StartArgs {
     #[arg(help = help::start_json(current()))]
     #[arg(long, conflicts_with = "foreground")]
     pub json: bool,
+
+    /// 只说明这次启动，不是配置覆盖。
+    #[command(flatten)]
+    pub launch: LaunchArgs,
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -141,6 +182,8 @@ pub enum Commands {
         #[arg(help = help::results_json(current()))]
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        launch: LaunchArgs,
     },
 
     #[command(about = help::logs(current()))]
@@ -163,6 +206,8 @@ pub enum Commands {
         #[arg(help = help::restore_json(current()))]
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        launch: LaunchArgs,
     },
 
     #[command(about = help::login_restore(current()))]

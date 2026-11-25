@@ -54,6 +54,7 @@ pub(crate) async fn serve_forever(
     cfg: Config,
     cfg_path: Option<&std::path::Path>,
     spec: Option<aproxy::spec::InstanceSpec>,
+    launch: aproxy::spec::Launch,
 ) -> Result<(), ServeFailure> {
     let daemon_child = spec.is_some();
     let listen_addr = cfg.listen_addr.clone();
@@ -157,7 +158,13 @@ pub(crate) async fn serve_forever(
         started_at: daemon::now_millis(),
         log_path: daemon_log_path.as_ref().map(|p| p.display().to_string()),
         foreground: !daemon_child,
+        launch_reason: launch.reason,
+        launch_note: state
+            .history
+            .secrets()
+            .replace(launch.note.as_deref().unwrap_or_default()),
     };
+    tracing::info!(launch_reason = %info.launch_reason, launch_note = %info.launch_note, "Instance started");
     if let Err(e) = daemon::write_instance_file(&info) {
         tracing::warn!(error = %e, "Could not write the instance registry; proxy traffic is unaffected");
     }

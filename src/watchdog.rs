@@ -371,6 +371,33 @@ struct Watched {
     start: String,
 }
 
+/// 保留最初的死亡证据；退避后不能用一次拉起失败的结果冒充原实例的退出码。
+#[derive(Debug, Clone, Copy)]
+enum DeathCause {
+    Exited(Option<u32>),
+    Hung,
+}
+
+impl DeathCause {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Exited(_) => KIND_CRASH,
+            Self::Hung => KIND_HANG,
+        }
+    }
+
+    fn launch(self) -> crate::spec::Launch {
+        let note = match self {
+            Self::Exited(Some(code)) => format!("previous process exited with code {code}"),
+            Self::Exited(None) => "previous process exited".into(),
+            Self::Hung => "previous process stopped responding".into(),
+        };
+        let mut launch = crate::spec::Launch::new("watchdog");
+        launch.note = Some(note);
+        launch
+    }
+}
+
 /// 待重试的崩溃实例（重拉失败后的退避队列条目）。
 /// 实例从 watched 摘除后进队列——失败期间不存在可等待的进程句柄，
 /// 死亡事件不会再来，「下轮重试」只能由时间驱动。
@@ -378,7 +405,7 @@ struct Watched {
 struct PendingRetry {
     port: String,
     /// 这个实例当初为什么没了（[`KIND_CRASH`] 或 [`KIND_HANG`]），记进重拉记录
-    kind: &'static str,
+    cause: DeathCause,
     /// 连续重拉失败次数（crashloop 计数挂在队列条目上，跨收养周期累计）
     failures: u32,
     /// 下次重试时刻（退避序列 1s→2s→4s…封顶 300s）
@@ -608,15 +635,16 @@ impl WatchdogState {
             return DeathOutcome::Unknown;
         };
         let w = self.watched.swap_remove(idx);
-        crate::process::close_handle(w.handle);
         // 起因：被本看护者按挂死结束的，死亡事件到这里才来；其余都算崩溃
-        let kind = match self.hung_ports.iter().position(|p| p == port) {
+        let cause = match self.hung_ports.iter().position(|p| p == port) {
             Some(i) => {
                 self.hung_ports.swap_remove(i);
-                KIND_HANG
+                DeathCause::Hung
             }
-            None => KIND_CRASH,
+            None => DeathCause::Exited(crate::process::exit_code(w.handle)),
         };
+        crate::process::close_handle(w.handle);
+        let kind = cause.kind();
         // 看护关系终止即清理心跳残留：优雅退出路径守护会自清，崩溃/强杀路径
         // 靠这里兜底（Windows 节对象由内核回收，这里是 no-op；unix 上是 run 目录里
         // 的心跳文件）。删到同端口刚起来的新实例也只丢一拍，它的
@@ -656,7 +684,7 @@ impl WatchdogState {
             w.consecutive_failures
         };
         if failures >= self.cfg.max_restarts {
-            return self.slow_retry(port, failures, kind);
+            return self.slow_retry(port, failures, cause);
         }
         let delay = backoff_delay_secs(failures);
         if delay > 0 {
@@ -666,7 +694,7 @@ impl WatchdogState {
             ));
             self.pending.push(PendingRetry {
                 port: port.to_string(),
-                kind,
+                cause,
                 failures,
                 next_retry: std::time::Instant::now() + Duration::from_secs(delay),
             });
@@ -675,7 +703,7 @@ impl WatchdogState {
         }
 
         tracing::warn!(port = %port, "Instance crashed; respawning immediately");
-        match respawn_instance(&self.cfg.home, &self.cfg.run_dir, port).await {
+        match respawn_instance(&self.cfg.home, &self.cfg.run_dir, port, cause).await {
             Ok((pid, actual_port)) => {
                 self.note_restart(port, kind, Ok(pid));
                 self.admit_respawned_at(port, &actual_port, pid, failures);
@@ -684,7 +712,7 @@ impl WatchdogState {
             Err(e) => {
                 let why = e.to_string();
                 self.note_restart(port, kind, Err(&why));
-                self.queue_retry(port, failures, kind, why)
+                self.queue_retry(port, failures, cause, why)
             }
         }
     }
@@ -705,9 +733,9 @@ impl WatchdogState {
         for i in due.into_iter().rev() {
             let p = self.pending.remove(i);
             tracing::info!(port = %p.port, attempt = p.failures + 1, "Backoff elapsed; retrying respawn");
-            match respawn_instance(&self.cfg.home, &self.cfg.run_dir, &p.port).await {
+            match respawn_instance(&self.cfg.home, &self.cfg.run_dir, &p.port, p.cause).await {
                 Ok((pid, actual_port)) => {
-                    self.note_restart(&p.port, p.kind, Ok(pid));
+                    self.note_restart(&p.port, p.cause.kind(), Ok(pid));
                     self.admit_respawned_at(&p.port, &actual_port, pid, p.failures)
                 }
                 // 记录没了 = 用户在退避期间 stop 了它：不再是要恢复的实例，出队
@@ -721,8 +749,8 @@ impl WatchdogState {
                 }
                 Err(e) => {
                     let why = e.to_string();
-                    self.note_restart(&p.port, p.kind, Err(&why));
-                    self.queue_retry(&p.port, p.failures, p.kind, why);
+                    self.note_restart(&p.port, p.cause.kind(), Err(&why));
+                    self.queue_retry(&p.port, p.failures, p.cause, why);
                 }
             }
         }
@@ -794,18 +822,18 @@ impl WatchdogState {
         &mut self,
         port: &str,
         failures: u32,
-        kind: &'static str,
+        cause: DeathCause,
         err: String,
     ) -> DeathOutcome {
         let failures = failures.saturating_add(1);
         tracing::error!(port = %port, error = %err, attempt = failures, "Respawn failed");
         if failures >= self.cfg.max_restarts {
-            return self.slow_retry(port, failures, kind);
+            return self.slow_retry(port, failures, cause);
         }
         let delay = backoff_delay_secs(failures);
         self.pending.push(PendingRetry {
             port: port.to_string(),
-            kind,
+            cause,
             failures,
             next_retry: std::time::Instant::now() + Duration::from_secs(delay),
         });
@@ -818,7 +846,8 @@ impl WatchdogState {
     /// 说一遍（用户排查「实例为什么没回来」的第一个入口），之后的重试只进日志。
     ///
     /// `max_restarts = 0` 的含义是「只看不拉」：一次都不重拉，记录留着等人工 restore。
-    fn slow_retry(&mut self, port: &str, failures: u32, kind: &'static str) -> DeathOutcome {
+    fn slow_retry(&mut self, port: &str, failures: u32, cause: DeathCause) -> DeathOutcome {
+        let kind = cause.kind();
         if self.cfg.max_restarts == 0 {
             self.log(&format!(
                 "the instance on port {port} is down ({kind}); watchdog.max_restarts is 0, so it is not respawned (run `aproxy restore` to bring it back)"
@@ -846,7 +875,7 @@ impl WatchdogState {
         }
         self.pending.push(PendingRetry {
             port: port.to_string(),
-            kind,
+            cause,
             failures,
             next_retry: std::time::Instant::now() + Duration::from_secs(SLOW_RETRY_SECS),
         });
@@ -1124,6 +1153,7 @@ async fn respawn_instance(
     home: &Path,
     run_dir: &Path,
     port: &str,
+    cause: DeathCause,
 ) -> Result<(u32, String), RespawnError> {
     let entry = match crate::spec::read_restore_in(run_dir, port) {
         Ok(Some(entry)) => entry,
@@ -1153,7 +1183,14 @@ async fn respawn_instance(
     // 实测坑）。spawn_from_spec 只读注册表、不做 list_instances_in 那种验活清理：后者的副作用
     // 会在轮询里顺带删掉同注册表其他死实例的记录，其死亡事件随后被混合态误判为优雅退出、静默
     // 失去自动恢复（P6 死亡风暴实测）。新实例启动即死时立即返回，不空等到时限，退避照常推进。
-    match crate::spawn::spawn_from_spec(home, &exe, &entry.spec, crate::spawn::READY_TIMEOUT).await
+    match crate::spawn::spawn_from_spec(
+        home,
+        &exe,
+        &entry.spec,
+        &cause.launch(),
+        crate::spawn::READY_TIMEOUT,
+    )
+    .await
     {
         Ok(live) => Ok((
             live.instance.pid,
@@ -1554,6 +1591,8 @@ mod tests {
     /// 一份测试用的实例记录：给定 pid、端口与登记的启动标记，其余字段随意。
     fn sample_record(pid: u32, port: &str, start: &str) -> crate::daemon::InstanceRecord {
         crate::daemon::InstanceRecord {
+            launch_reason: "unknown".into(),
+            launch_note: String::new(),
             pid,
             start: start.to_string(),
             instance_id: "19ac3f2e8b5d1a2b".into(),
@@ -2243,7 +2282,17 @@ mod tests {
         assert!(st.hung_ports.is_empty(), "起因用过一次就清掉");
         assert_eq!(st.record.restarts.len(), 1);
         assert_eq!(st.record.restarts[0].kind, KIND_HANG);
-        assert_eq!(st.pending[0].kind, KIND_HANG, "之后的重试沿用同一个起因");
+        let launch = st.pending[0].cause.launch();
+        assert_eq!(launch.reason, "watchdog");
+        assert_eq!(
+            launch.note.as_deref(),
+            Some("previous process stopped responding")
+        );
+        assert_eq!(
+            st.pending[0].cause.kind(),
+            KIND_HANG,
+            "之后的重试沿用同一个起因"
+        );
 
         for i in 0..(RESTARTS_KEPT as u32 + 5) {
             st.note_restart("59905", KIND_CRASH, Ok(i));
@@ -2294,7 +2343,7 @@ mod tests {
         let cfg = test_cfg(dir.path()); // max_restarts = 2
         let mut st = WatchdogState::new(cfg);
         st.pending.push(PendingRetry {
-            kind: KIND_CRASH,
+            cause: DeathCause::Exited(None),
             port: port.to_string(),
             failures: 1, // 再失败一次即达上限
             next_retry: std::time::Instant::now() - Duration::from_secs(1),
@@ -2351,7 +2400,7 @@ mod tests {
         };
         let mut st = WatchdogState::new(cfg);
         st.pending.push(PendingRetry {
-            kind: KIND_CRASH,
+            cause: DeathCause::Exited(None),
             port: port.to_string(),
             failures: 1,
             next_retry: std::time::Instant::now() + Duration::from_secs(3600), // 远期

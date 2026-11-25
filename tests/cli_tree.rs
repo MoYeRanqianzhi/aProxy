@@ -300,8 +300,8 @@ help:
 install: --from --adopt --no-path --no-shortcut --abort --force --yes --variant --cpu --allow-downgrade --pre --download-proxy --no-skills --check --json -h --help
 logs: -n --lines -f --follow -h --help
 migrate: --dry-run --json -h --help
-restart: --idle-threshold-secs --format --force --json -h --help
-restore: --json -h --help
+restart: --idle-threshold-secs --format --force --json --reason --note -h --help
+restore: --json --reason --note -h --help
 restore-at-login: --home -h --help
 settings: -h --help
 settings get: --json -h --help
@@ -315,7 +315,7 @@ skill help:
 skill install: --download-proxy --json -h --help
 skill list: --json -h --help
 skill show: --files -h --help
-start: --config --base-url --listen-addr --proxy --api-key --log-file --foreground --json -h --help
+start: --config --base-url --listen-addr --proxy --api-key --log-file --foreground --json --reason --note -h --help
 status: --idle --busy --json -h --help
 stop: --idle-threshold-secs --force --json -h --help"#;
     // 每个语言在独立进程里构建真正用于解析的树，含隐藏路径；clap 的 help 镜像不重复遍历。
@@ -802,4 +802,83 @@ fn migrate_path_help_in_both_languages() {
             "{help_text}"
         );
     }
+}
+
+/// 参数错误在动实例之前报告；包括内部保留来由、空备注、控制字符及多字节越界。
+#[test]
+fn invalid_launch_options_are_usage_errors_before_any_start() {
+    let home = TestHome::new();
+    let over = "é".repeat(257);
+    for command in ["start", "restart", "restore"] {
+        for (flag, values) in [
+            (
+                "--reason",
+                &[
+                    "login", "watchdog", "upgrade", "unknown", "START", "future", "", "-x",
+                ][..],
+            ),
+            (
+                "--note",
+                &[
+                    "",
+                    "a\nb",
+                    "a\rb",
+                    "a\tb",
+                    "a\u{7f}",
+                    "a\u{85}",
+                    over.as_str(),
+                ][..],
+            ),
+        ] {
+            for &value in values {
+                let mut args = vec![command];
+                if command == "start" {
+                    args.extend([
+                        "--listen-addr",
+                        "127.0.0.1:0",
+                        "--base-url",
+                        "http://127.0.0.1:9",
+                    ]);
+                }
+                args.extend([flag, value]);
+                let out = run(&home, &args);
+                assert_eq!(out.status.code(), Some(2), "{args:?}");
+                if flag == "--reason" {
+                    let err = text(&out.stderr);
+                    for allowed in aproxy::spec::CALLER_REASONS {
+                        assert!(err.contains(allowed), "{err}");
+                    }
+                }
+            }
+        }
+    }
+    // 两个平台都能传给子进程、但不能表示为 UTF-8 的原生参数。
+    #[cfg(unix)]
+    let bad = std::os::unix::ffi::OsStringExt::from_vec(vec![0xff]);
+    #[cfg(windows)]
+    let bad = std::os::windows::ffi::OsStringExt::from_wide(&[0xd800]);
+    let bad: std::ffi::OsString = bad;
+    for flag in ["--reason", "--note"] {
+        let out = home
+            .cmd()
+            .args([
+                "start",
+                "--listen-addr",
+                "127.0.0.1:0",
+                "--base-url",
+                "http://127.0.0.1:9",
+                flag,
+            ])
+            .arg(&bad)
+            .output()
+            .report_exit()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        if flag == "--reason" {
+            assert!(text(&out.stderr).contains("start, restart, restore, plugin"));
+        }
+    }
+    let run_dir = home.path().join("run");
+    assert!(aproxy::daemon::registry_instances_in(&run_dir).is_empty());
+    assert!(aproxy::spec::list_restore_in(&run_dir).entries.is_empty());
 }

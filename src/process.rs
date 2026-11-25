@@ -107,19 +107,35 @@ pub fn terminate_verified_process(pid: u32, expected_start: u64) -> Result<(), S
 }
 
 // 看护者等待实例死亡用的同步句柄（Windows 为进程句柄；unix 上句柄值就是 pid，等待退化为每秒探活）
-pub(crate) use imp::{close_handle, open_sync_handle, terminate_handle, wait_blocking};
+pub(crate) use imp::{close_handle, exit_code, open_sync_handle, terminate_handle, wait_blocking};
 
 #[cfg(windows)]
 mod imp {
     /// 打开进程的 SYNCHRONIZE|TERMINATE 句柄（死亡等待/挂死终止共用）
     pub fn open_sync_handle(pid: u32) -> Option<isize> {
         use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
         };
         unsafe {
-            let h = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid);
+            let rights = PROCESS_SYNCHRONIZE | PROCESS_TERMINATE;
+            let mut h = OpenProcess(rights | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            // 查退出码只是补充说明；不能因此放弃原本有权限看护的实例。
+            if h == 0 {
+                h = OpenProcess(rights, 0, pid);
+            }
             if h == 0 { None } else { Some(h) }
         }
+    }
+
+    /// 只在原句柄上读退出码；缺少查询权限或进程尚未退出时不猜。
+    pub fn exit_code(handle: isize) -> Option<u32> {
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+        let mut code = 0;
+        (handle != 0
+            && unsafe {
+                WaitForSingleObject(handle, 0) == 0 && GetExitCodeProcess(handle, &mut code) != 0
+            })
+        .then_some(code)
     }
 
     /// 阻塞等待进程死亡（内核对象 signaled）。仅在 spawn_blocking 中调用。
@@ -197,6 +213,11 @@ mod imp {
 
     unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    /// 收养的进程不一定是自己的子进程；探活消失没有给出退出状态。
+    pub fn exit_code(_handle: isize) -> Option<u32> {
+        None
     }
 
     /// unix 无可等待的进程句柄对象：句柄值直接存 pid，死亡等待退化为轮询。

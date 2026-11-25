@@ -171,6 +171,10 @@ fn print_live(live: &[&Enumerated], now: u64) {
                 config_label(&info.config_path)
             )
         );
+        println!(
+            "{}",
+            text::launch_line(current(), &info.launch_reason, &info.launch_note)
+        );
         let err_text = match &activity.last_error {
             // 码在前，便于按码检索；没有码的（更旧的实例）只显示说明
             Some(e) => text::recent(
@@ -246,6 +250,10 @@ fn print_unresponsive(unresponsive: &[&daemon::InstanceRecord]) {
                 &info.version,
                 config_label(&info.config_path)
             )
+        );
+        println!(
+            "{}",
+            text::launch_line(current(), &info.launch_reason, &info.launch_note)
         );
     }
 }

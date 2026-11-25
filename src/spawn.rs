@@ -247,10 +247,18 @@ pub async fn spawn_from_spec(
     home: &Path,
     exe: &Path,
     spec: &InstanceSpec,
+    launch: &spec::Launch,
     timeout: Duration,
 ) -> Result<InstanceStatus, SpawnError> {
-    spawn_from_spec_with_timeout_action(home, exe, spec, timeout, OnReadyTimeout::LeaveRunning)
-        .await
+    spawn_from_spec_with_timeout_action(
+        home,
+        exe,
+        spec,
+        launch,
+        timeout,
+        OnReadyTimeout::LeaveRunning,
+    )
+    .await
 }
 
 /// 普通启动超时不剥夺实例随后就绪的机会；只有准备回退时才清走占着端口的子进程。
@@ -265,12 +273,14 @@ pub(crate) async fn spawn_from_spec_with_timeout_action(
     home: &Path,
     exe: &Path,
     spec: &InstanceSpec,
+    launch: &spec::Launch,
     timeout: Duration,
     on_timeout: OnReadyTimeout,
 ) -> Result<InstanceStatus, SpawnError> {
     let run_dir = home.join("run");
     let mark = startup_log_len(home);
-    let spec_path = spec::write_spec_file(&run_dir, spec).map_err(SpawnError::Spawn)?;
+    let spec_path =
+        spec::write_spec_file(&run_dir, spec, Some(launch)).map_err(SpawnError::Spawn)?;
     let result = launch_and_wait(home, exe, spec, &spec_path, mark, timeout, on_timeout).await;
     let _ = std::fs::remove_file(&spec_path);
     result
@@ -484,6 +494,7 @@ mod tests {
             home.path(),
             &exe,
             &spec,
+            &spec::Launch::new("start"),
             Duration::ZERO,
             OnReadyTimeout::StopBeforeRollback,
         )

@@ -89,6 +89,129 @@ fn crash(pid: u64, port: u16) {
     panic!("pid {pid} 被结束之后，端口 {port} 仍在接受连接");
 }
 
+/// 用户提供的说明只属于一次启动。两个实例共享同一条批量命令，各自用自己的配置脱敏。
+#[test]
+fn launch_metadata_follows_each_launch_not_the_desired_state() {
+    let home = TestHome::new();
+    let run_dir = home.path().join("run");
+    let key = "test-launch-private-key";
+    let note = format!("handoff by {key}");
+    let mut ports = Vec::new();
+    for name in ["one", "two"] {
+        let cfg = home.path().join(format!("{name}.toml"));
+        fs::write(
+            &cfg,
+            format!("listen_addr='127.0.0.1:0'\nbase_url='http://127.0.0.1:9'\napi_key='{key}'\n"),
+        )
+        .unwrap();
+        let started = document(&run(
+            &home,
+            &[
+                "start",
+                cfg.to_str().unwrap(),
+                "--reason",
+                "plugin",
+                "--note",
+                &note,
+                "--json",
+            ],
+        ));
+        let port = home.track_started_port(&started);
+        ports.push(port);
+        let record: Value = serde_json::from_slice(
+            &fs::read(run_dir.join(format!("{port}.instance.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["launch_reason"], "plugin");
+        assert_eq!(record["launch_note"], "handoff by <secret>");
+        let log = fs::read_to_string(record["log_path"].as_str().unwrap()).unwrap();
+        assert!(
+            log.contains("launch_reason=plugin")
+                && log.contains("handoff by <secret>")
+                && !log.contains(key),
+            "{log}"
+        );
+        let restore = fs::read_to_string(run_dir.join(format!("{port}.restore.json"))).unwrap();
+        for forbidden in [
+            "plugin",
+            "handoff by",
+            "launch_reason",
+            "launch_note",
+            "\"launch\"",
+        ] {
+            assert!(!restore.contains(forbidden));
+        }
+    }
+    let check = |reason: &str, note: &str| {
+        let doc = document(&run(&home, &["status", "--json"]));
+        let rows = doc["instances"].as_array().unwrap();
+        assert_eq!(rows.len(), ports.len());
+        for row in rows {
+            assert_eq!(row["instance"]["launch_reason"], reason);
+            assert_eq!(row["instance"]["launch_note"], note);
+        }
+    };
+    let crash_all = || {
+        for port in &ports {
+            let record: Value = serde_json::from_slice(
+                &fs::read(run_dir.join(format!("{port}.instance.json"))).unwrap(),
+            )
+            .unwrap();
+            crash(record["pid"].as_u64().unwrap(), *port);
+        }
+    };
+    check("plugin", "handoff by <secret>");
+    for (lang, line) in [
+        (
+            "en",
+            "Last start: started by a plugin (handoff by <secret>)",
+        ),
+        ("zh-CN", "最近一次启动：插件启动（handoff by <secret>）"),
+    ] {
+        let out = home
+            .cmd()
+            .env("APROXY_LANG", lang)
+            .arg("status")
+            .output()
+            .report_exit()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap().matches(line).count(),
+            2
+        );
+    }
+    run(&home, &["restart", "all"]);
+    check("restart", "");
+    let max_note = "é".repeat(256);
+    run(
+        &home,
+        &["restart", "all", "--reason", "plugin", "--note", &max_note],
+    );
+    check("plugin", &max_note);
+    crash_all();
+    run(
+        &home,
+        &[
+            "restore",
+            "--reason",
+            "restart",
+            "--note",
+            "after maintenance",
+        ],
+    );
+    check("restart", "after maintenance");
+    crash_all();
+    run(&home, &["restore"]);
+    check("restore", "");
+    crash_all();
+    run(
+        &home,
+        &["restore-at-login", "--home", home.path().to_str().unwrap()],
+    );
+    check("login", "");
+}
+
 /// 空 home 也输出完整文档；活动筛选只影响运行中的实例，等待恢复的实例仍可供人和程序查看。
 #[test]
 fn status_json_document() {
@@ -122,6 +245,8 @@ fn status_json_document() {
     assert_eq!(live["port"], port);
     assert_eq!(live["liveness"], "live");
     assert_eq!(live["instance"]["pid"], pid);
+    assert_eq!(live["instance"]["launch_reason"], "start");
+    assert_eq!(live["instance"]["launch_note"], "");
     assert_eq!(live["status"]["state"], "serving");
     assert_eq!(live["restore_pending"], false);
     assert!(live.get("reason").is_none(), "{live}");

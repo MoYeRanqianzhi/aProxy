@@ -312,12 +312,12 @@ pub struct DownloadCtx {
     /// [`VARIANT_HEADLESS`](super::force::VARIANT_HEADLESS)。[`DownloadCtx::build`] 取正在
     /// 运行的这个二进制的变体（升级保持原变体），调用方按 `--variant` 与本机情况改写
     pub variant: &'static str,
-    /// 指令集档的资产名后缀：`-v3` 或空
+    /// 指令集档的资产名后缀：`-v3` 或空。自动选档同时看本机 CPU 和目标是否发布 v3 档
     pub cpu_suffix: &'static str,
 }
 
-/// 本机是否选 x86-64-v3 档的产物（发布的 -v3 产物以 `-C target-cpu=x86-64-v3` 构建）：
-/// CPU 支持 AVX2 就选。普通在线安装与强制安装共用这一条规则。AVX2 检测只在 x86 目标上
+/// 本机 CPU 是否优先选 x86-64-v3 档（发布的 -v3 产物以 `-C target-cpu=x86-64-v3` 构建）：
+/// 支持 AVX2 就优先。普通在线安装另按目标判断是否发布了该档，强制安装查发布清单。AVX2 检测只在 x86 目标上
 /// 可用（aarch64 等目标上 is_x86_feature_detected! 编译不过——CI unix job 曾因此全红），
 /// 其余目标恒为 false。
 pub fn prefers_x86_64_v3() -> bool {
@@ -331,14 +331,14 @@ pub fn prefers_x86_64_v3() -> bool {
     }
 }
 
-/// 发布 x86-64-v3 档产物的目标：只有 x86_64 的 Windows 与 linux-gnu（release.yml 的构建
-/// 矩阵）。别的 x86 目标（macOS x86_64、i686 Windows、musl）只有基线档，CPU 支持 AVX2 也
+/// 发布 x86-64-v3 档产物的目标：只有 x86_64 的 Windows、linux-gnu 与 macOS（release.yml 的构建
+/// 矩阵）。别的 x86 目标（i686 Windows、musl）只有基线档，CPU 支持 AVX2 也
 /// 不能去取 `-v3`：普通在线安装按名字找资产，取不到就 404、落到后面的渠道。强制安装读发布
 /// 清单，清单里没有 v3 档就自己退回基线档（`Manifest::select`），用不着这一条。
 fn publishes_v3(target: &str) -> bool {
     matches!(
         target,
-        "x86_64-pc-windows-msvc" | "x86_64-unknown-linux-gnu"
+        "x86_64-pc-windows-msvc" | "x86_64-unknown-linux-gnu" | "x86_64-apple-darwin"
     )
 }
 
@@ -801,6 +801,14 @@ mod tests {
             "aproxy-x86_64-unknown-linux-gnu-v3"
         );
         assert_eq!(
+            Artifact::Binary.asset_name("x86_64-apple-darwin", "desktop", "-v3"),
+            "aproxy-x86_64-apple-darwin-v3"
+        );
+        assert_eq!(
+            Artifact::Binary.asset_name("x86_64-apple-darwin", "headless", "-v3"),
+            "aproxy-headless-x86_64-apple-darwin-v3"
+        );
+        assert_eq!(
             Artifact::Binary.asset_name("aarch64-apple-darwin", "headless", ""),
             "aproxy-headless-aarch64-apple-darwin"
         );
@@ -877,7 +885,8 @@ mod tests {
             version: "0.2.0".into(),
             target,
             variant,
-            cpu_suffix: "-v3",
+            // 固定 CPU 偏好为 v3，不让测试机的指令集决定期望的资产名。
+            cpu_suffix: if publishes_v3(target) { "-v3" } else { "" },
         };
         let names = |attempts: Vec<DownloadCtx>| {
             attempts
@@ -907,22 +916,38 @@ mod tests {
                 ]
             );
         }
-        let windows = "x86_64-pc-windows-msvc";
-        assert_eq!(
-            names(ctx(windows, VARIANT_DESKTOP).attempts(false)),
-            [
+        for (target, desktop, headless) in [
+            (
+                "x86_64-pc-windows-msvc",
                 "aproxy-x86_64-pc-windows-msvc-v3.exe",
                 "aproxy-headless-x86_64-pc-windows-msvc-v3.exe",
-            ]
-        );
-        assert_eq!(
-            names(ctx(windows, VARIANT_DESKTOP).attempts(true)),
-            ["aproxy-x86_64-pc-windows-msvc-v3.exe"]
-        );
-        assert_eq!(
-            names(ctx(windows, VARIANT_HEADLESS).attempts(false)),
-            ["aproxy-headless-x86_64-pc-windows-msvc-v3.exe"]
-        );
+            ),
+            (
+                "x86_64-apple-darwin",
+                "aproxy-x86_64-apple-darwin-v3",
+                "aproxy-headless-x86_64-apple-darwin-v3",
+            ),
+            (
+                "aarch64-apple-darwin",
+                "aproxy-aarch64-apple-darwin",
+                "aproxy-headless-aarch64-apple-darwin",
+            ),
+        ] {
+            assert_eq!(
+                names(ctx(target, VARIANT_DESKTOP).attempts(false)),
+                [desktop, headless]
+            );
+            assert_eq!(
+                names(ctx(target, VARIANT_DESKTOP).attempts(true)),
+                [desktop]
+            );
+            for explicit in [false, true] {
+                assert_eq!(
+                    names(ctx(target, VARIANT_HEADLESS).attempts(explicit)),
+                    [headless]
+                );
+            }
+        }
     }
 
     /// 只有发布了 v3 档的目标才会按 CPU 选 `-v3`
@@ -930,8 +955,9 @@ mod tests {
     fn v3_is_only_picked_where_it_is_published() {
         assert!(publishes_v3("x86_64-pc-windows-msvc"));
         assert!(publishes_v3("x86_64-unknown-linux-gnu"));
+        assert!(publishes_v3("x86_64-apple-darwin"));
         for target in [
-            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
             "i686-pc-windows-msvc",
             "x86_64-unknown-linux-musl",
             "aarch64-unknown-linux-gnu",

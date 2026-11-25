@@ -118,7 +118,7 @@ message!(yes(), en: "Skip the force-install confirmation (required for nonintera
 
 message!(variant(), en: "Select desktop or headless; defaults to the running variant. An online install can fall back to headless on Linux without the required libraries such as WebKitGTK; it explains the fallback or fails if desktop was requested explicitly. With --from, verify that the file matches the specified variant", zh: "要装的变体：desktop（带桌面界面）或 headless（无界面）；默认与正在运行的这个 aproxy 相同。带界面的版本在缺 WebKitGTK 等系统库的 Linux 上跑不起来：没写这个 参数时，在线安装下载的带界面版本跑不起来就改装 headless 并说明原因，写了 desktop 就报错。与 --from 同用时是核对：文件必须正是这个变体，否则不装");
 
-message!(cpu(), en: "Select x86-64-v3 or baseline. Defaults to x86-64-v3 on Windows or GNU/Linux x86-64 when the CPU supports AVX2 and a build is available; otherwise baseline", zh: "指令集档：x86-64-v3 或 baseline（默认按本机 CPU：支持 AVX2、且这个目标发布了 x86-64-v3 档（x86_64 的 Windows 与 Linux gnu）→ x86-64-v3，否则 baseline）");
+message!(cpu(), en: "Select x86-64-v3 or baseline. Defaults to x86-64-v3 on x86-64 Windows, GNU/Linux or macOS when the CPU supports AVX2 and a build is available; otherwise baseline", zh: "指令集档：x86-64-v3 或 baseline（默认按本机 CPU：支持 AVX2、且这个目标发布了 x86-64-v3 档（x86_64 的 Windows、Linux gnu 与 macOS）→ x86-64-v3，否则 baseline）");
 
 message!(downgrade(), en: "Allow an older version than the installed one. Versions below 0.2.0 are not supported", zh: "允许降级安装（目标版本 < 当前已安装版本时默认拒绝）；低于 0.2.0 的版本 仍然拒绝");
 

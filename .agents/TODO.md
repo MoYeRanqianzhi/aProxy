@@ -207,7 +207,11 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] **正式发布：GitHub 构建指令集多版本**（必然项，2026-09-07 定调）：CI 矩阵 baseline + `RUSTFLAGS="-C target-cpu=x86-64-v3"`（AVX2），产物命名区分，发布页两者都放；详见 memory/release-engineering
 - [ ] **H.（可选）配置热重载**：IPC reload，避免 restart 断流（改配置生效目前用 restart，已有单命令路径）
 - [ ] **测试稳定性**：proxy_integration 的 alias_start_and_stop_roundtrip
-  偶发并行失败（单跑必过——端口/时序竞争，本轮全量跑撞上一次）
+  偶发并行失败（单跑必过——端口/时序竞争，本轮全量跑撞上一次）。2026-11-25 ubuntu (desktop) 上又见两条，各一次、重跑即过：
+  `proxy::tests::spool_chunk_dropped_mid_disk_transition_leaves_no_file`（run 45710095430，`src/proxy/tests.rs:510`
+  「迁移不应在文件出现前就一次完成」：逐次 poll 时迁移在文件出现前就完成了，测试前提依赖阻塞池的时序）；
+  `proxy_integration` 的 `restore_recovers_crashed_daemon_and_is_idempotent`（run 45716490850，`:5641`「restore 应成功」，
+  restore 退出 1，断言没打印 stdout 与 stderr，原因查不了，先让它打印）
 - [ ] **看门狗二期（可选）**：挂死不杀进程原地救（scoped runtime 注入 spike）、实例数极大时线程池死亡等待（unix 死亡等待已实装为轮询，见 unix-testing.md）
 
 ## macOS 支持（必须完成——用户 2026-09-12 定调）

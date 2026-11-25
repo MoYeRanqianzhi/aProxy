@@ -641,7 +641,7 @@ impl WatchdogState {
                 self.hung_ports.swap_remove(i);
                 DeathCause::Hung
             }
-            None => DeathCause::Exited(crate::process::exit_code(w.handle)),
+            None => DeathCause::Exited(crate::process::handle_exit_code(w.handle)),
         };
         crate::process::close_handle(w.handle);
         let kind = cause.kind();

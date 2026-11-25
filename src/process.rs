@@ -107,7 +107,9 @@ pub fn terminate_verified_process(pid: u32, expected_start: u64) -> Result<(), S
 }
 
 // 看护者等待实例死亡用的同步句柄（Windows 为进程句柄；unix 上句柄值就是 pid，等待退化为每秒探活）
-pub(crate) use imp::{close_handle, exit_code, open_sync_handle, terminate_handle, wait_blocking};
+pub(crate) use imp::{
+    close_handle, handle_exit_code, open_sync_handle, terminate_handle, wait_blocking,
+};
 
 #[cfg(windows)]
 mod imp {
@@ -128,7 +130,7 @@ mod imp {
     }
 
     /// 只在原句柄上读退出码；缺少查询权限或进程尚未退出时不猜。
-    pub fn exit_code(handle: isize) -> Option<u32> {
+    pub fn handle_exit_code(handle: isize) -> Option<u32> {
         use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
         let mut code = 0;
         (handle != 0
@@ -216,7 +218,7 @@ mod imp {
     }
 
     /// 收养的进程不一定是自己的子进程；探活消失没有给出退出状态。
-    pub fn exit_code(_handle: isize) -> Option<u32> {
+    pub fn handle_exit_code(_handle: isize) -> Option<u32> {
         None
     }
 

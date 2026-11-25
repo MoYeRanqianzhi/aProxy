@@ -268,7 +268,11 @@ pub enum Commands {
             long_about = None
         )
     )]
-    Desktop,
+    Desktop {
+        /// 菜单项按可执行文件所在的 bin 选择 home，不依赖桌面会话继承的环境。
+        #[arg(long, hide = true)]
+        installed_home: bool,
+    },
 }
 
 /// `aproxy install` 的参数集。
@@ -285,6 +289,18 @@ pub struct InstallArgs {
     #[arg(help = help::adopt(current()))]
     #[arg(long, conflicts_with_all = ["from", "abort", "version"])]
     pub adopt: bool,
+
+    /// 只在收编时提供 PATH 集成，普通升级不改用户环境。
+    #[arg(long, requires = "adopt", help = help::no_path(current()))]
+    pub no_path: bool,
+
+    /// 菜单项与 PATH 可以分别选择。
+    #[arg(long, requires = "adopt", help = help::no_shortcut(current()))]
+    pub no_shortcut: bool,
+
+    /// 引导脚本已验证并落位镜像，只做收编的用户环境部分，不交换、不下载。
+    #[arg(long, hide = true, requires = "adopt")]
+    pub integrate_only: bool,
 
     #[arg(help = help::abort(current()))]
     #[arg(long, conflicts_with_all = ["from", "adopt", "version"])]

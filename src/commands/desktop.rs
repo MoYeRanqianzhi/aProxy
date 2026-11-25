@@ -274,7 +274,12 @@ mod tests {
     #[test]
     fn desktop_is_a_subcommand_in_every_build() {
         let cli = Cli::try_parse_from(["aproxy", "desktop"]).expect("desktop 必须能解析");
-        assert_eq!(cli.command, Some(Commands::Desktop));
+        assert_eq!(
+            cli.command,
+            Some(Commands::Desktop {
+                installed_home: false
+            })
+        );
     }
 
     /// 带界面的构建在帮助里列出 desktop；headless 构建隐藏它（仍然认得，见上一个测试）

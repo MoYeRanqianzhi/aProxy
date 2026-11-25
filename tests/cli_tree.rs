@@ -297,7 +297,7 @@ desktop: -h --help
 doctor: --json -h --help
 find: --aliased --unaliased --port --json -h --help
 help:
-install: --from --adopt --abort --force --yes --variant --cpu --allow-downgrade --pre --download-proxy --no-skills --check --json -h --help
+install: --from --adopt --no-path --no-shortcut --abort --force --yes --variant --cpu --allow-downgrade --pre --download-proxy --no-skills --check --json -h --help
 logs: -n --lines -f --follow -h --help
 migrate: --dry-run --json -h --help
 restart: --idle-threshold-secs --format --force --json -h --help

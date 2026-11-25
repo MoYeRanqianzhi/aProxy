@@ -77,7 +77,7 @@ pkg-fmt = "bin"
 # aproxy-desktop/Cargo.toml）。
 [features]
 default = ["desktop"]
-desktop = ["dep:aproxy-desktop"]
+desktop = ["dep:aproxy-desktop", "dep:windows"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -144,8 +144,10 @@ aproxy-desktop = { version = "=0.2.0-alpha.4", path = "aproxy-desktop", optional
 toml_edit = "0.25"
 
 [target.'cfg(windows)'.dependencies]
-# 当前用户的登录登记只使用固定的 Run 值。
+# 当前用户的登录登记与用户环境；Path 读写保留注册表值的原始类型。
 winreg = "0.56"
+# 桌面菜单快捷方式使用系统 COM ShellLink，沿用桌面库锁定的 Win32 绑定。
+windows = { version = "0.62", optional = true, features = ["Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Shell_PropertiesSystem"] }
 # spawn_detached 手写 CreateProcessW（bInheritHandles=FALSE，std 无稳定 API 可关）。
 # 精确钉死 =0.52.0：HANDLE 在 windows-sys 0.59+ 从 isize 改为 *mut c_void，
 # 本仓库句柄逻辑（看门狗/force_terminate）全部按 isize 书写；CI 首跑曾观察到
@@ -163,7 +165,7 @@ winreg = "0.56"
 # Win32_System_IO：安装锁直接调用 LockFileEx / UnlockFileEx（它们的 OVERLAPPED 参数在
 # 这个 feature 里）——锁原语是永久兼容契约 C4，不经 std 的 File::try_lock。
 # home 的解析（C1）与台账（C3）要的 Win32_UI_Shell、Win32_System_Com 在 aproxy-ipc 里声明。
-windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_SystemInformation", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_Security", "Win32_Security_Authorization"] }
+windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Environment", "Win32_UI_WindowsAndMessaging", "Win32_System_SystemInformation", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_Security", "Win32_Security_Authorization"] }
 
 [target.'cfg(unix)'.dependencies]
 # 安装锁（src/install/mod.rs）直接调用 flock：锁原语是永久兼容契约 C4，不经 std 的

@@ -56,7 +56,18 @@ pub(crate) fn main() -> std::process::ExitCode {
     if let Some(settings) = terminal_settings(std::env::args_os().skip(1)) {
         aproxy_ipc::i18n::init_terminal(|| settings.then(aproxy_ipc::home::resolve_home)?.ok());
     }
-    let cli = Cli::from_arg_matches_mut(&mut aproxy::cli::command_tree().get_matches())
+    let args = std::env::args_os();
+    // LaunchServices 直接启动包内的原生可执行文件，没有命令行参数。只在这个进程消费
+    // 应用包的标记；从窗口启动的命令仍按普通 CLI 解析。
+    #[cfg(all(target_os = "macos", feature = "desktop"))]
+    let args = {
+        let app = std::env::var_os("APROXY_BUNDLE_LAUNCH").is_some_and(|v| v == "1");
+        // SAFETY: 尚无其他线程读取环境。
+        unsafe { std::env::remove_var("APROXY_BUNDLE_LAUNCH") };
+        let launch = app && args.len() == 1;
+        args.chain(launch.then(|| std::ffi::OsString::from("desktop")))
+    };
+    let cli = Cli::from_arg_matches_mut(&mut aproxy::cli::command_tree().get_matches_from(args))
         .unwrap_or_else(|e| e.exit());
     // `-V`/`--version` 与别的参数写在一起（`aproxy -V start`）时走到这里，输出同一行。
     // 这种写法要靠 clap 才分得清 `-V` 是版本参数还是别的参数的取值，所以排在解析之后；
@@ -70,7 +81,16 @@ pub(crate) fn main() -> std::process::ExitCode {
     // 而在 block_on 里的主线程处于异步上下文，Tauri 回调里任何 block_on 都会 panic。它自己
     // 建运行时、交给 Tauri 后再进事件循环，见 commands::desktop。不读配置与 settings，界面
     // 自己按 home 寻址
-    if cli.command == Some(Commands::Desktop) {
+    if let Some(Commands::Desktop { installed_home }) = &cli.command {
+        if *installed_home {
+            // 只有已安装镜像由菜单用这个参数拉起；后续窗口、实例与看护者继承同一 home。
+            let exe = std::env::current_exe().expect("current executable");
+            let Some(home) = exe.parent().and_then(std::path::Path::parent) else {
+                return std::process::ExitCode::FAILURE;
+            };
+            // SAFETY: 尚未启动日志线程、事件循环或异步运行时。
+            unsafe { std::env::set_var(aproxy_ipc::home::HOME_ENV, home) };
+        }
         commands::desktop::handle_desktop_cmd();
     }
 
@@ -350,7 +370,7 @@ async fn run(cli: Cli) -> u8 {
         Some(Commands::Settings { cmd }) => commands::settings::handle_settings_cmd(cmd).await,
         Some(Commands::Install(args)) => commands::install::handle_install_cmd(args).await,
         Some(Commands::Skill { cmd }) => return commands::skill::run(cmd).await,
-        Some(Commands::Desktop) => {
+        Some(Commands::Desktop { .. }) => {
             unreachable!("desktop was dispatched before the runtime was built")
         }
         Some(Commands::Serve { .. } | Commands::Watchdog { .. }) => {
@@ -425,7 +445,7 @@ fn resumes_install(command: &Commands) -> bool {
         | Commands::Doctor { .. }
         | Commands::Install(_)
         | Commands::Skill { .. }
-        | Commands::Desktop
+        | Commands::Desktop { .. }
         | Commands::Serve { .. }
         | Commands::Watchdog { .. } => false,
     }

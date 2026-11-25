@@ -152,7 +152,13 @@ pub async fn fetch_build(
     let target_buf = target_dir.clone();
     let headless = ctx.variant == crate::install::force::VARIANT_HEADLESS;
     let build = tokio::task::spawn_blocking(move || {
-        let status = std::process::Command::new("cargo")
+        let mut command = std::process::Command::new("cargo");
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(
+            &mut command,
+            windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
+        );
+        let status = command
             .args(["build", "--release", "--locked"])
             .args(headless.then_some("--no-default-features"))
             .arg("--manifest-path")

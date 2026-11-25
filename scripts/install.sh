@@ -27,6 +27,7 @@
 #      --pre` 同一规则：按版本号而非创建时间，补丁版晚于预发布发布时也不会装到更低版本）。
 # 环境变量：
 #   APROXY_HOME     目录根（默认 ~/.aproxy；空或只含空白视为未设，否则必须是绝对路径）
+#   APROXY_NO_PATH=1     跳过 PATH 配置（等效 --no-path）
 #   APROXY_NO_SKILLS=1   跳过 skill 文档
 #   APROXY_PRE=1    等效 --pre
 #   APROXY_VARIANT  等效 --variant（desktop 或 headless）
@@ -309,11 +310,13 @@ download_binary() {
 }
 
 main() {
+    no_path="${APROXY_NO_PATH:-0}"
     want_pre="${APROXY_PRE:-0}"
     VARIANT="${APROXY_VARIANT:-}"
     TAG=""
     while [ $# -gt 0 ]; do
         case "$1" in
+            --no-path) no_path=1 ;;
             --pre) want_pre=1 ;;
             --variant)
                 # 放在最后又没给值：先报错，不然下面的 shift 在 dash 里报「can't shift」、
@@ -321,7 +324,7 @@ main() {
                 [ $# -ge 2 ] || { echo "--variant 需要一个值（desktop 或 headless）" >&2; exit 1; }
                 shift; VARIANT="$1" ;;
             --variant=*) VARIANT="${1#--variant=}" ;;
-            -*) echo "未知参数: $1（可用: --pre、--variant desktop|headless、tag）" >&2; exit 1 ;;
+            -*) echo "未知参数: $1（可用: --no-path、--pre、--variant desktop|headless、tag）" >&2; exit 1 ;;
             *) TAG="$1" ;;
         esac
         shift
@@ -487,13 +490,13 @@ main() {
         echo "装的是无界面的 headless 版本（$headless_reason）：代理与命令行完全相同，只是没有 aproxy desktop 窗口。"
         echo "  装好所需的系统库之后，可用 aproxy install --variant desktop 换成带界面的版本。"
     fi
-    case ":$PATH:" in
-        *":$BIN_DIR:"*) ;;
-        *)
-            echo "注意: $BIN_DIR 不在 PATH 中——加入后即可直接使用 aproxy 命令："
-            echo "  echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.profile && source ~/.profile"
-            ;;
-    esac
+    # 文件已落位，复用二进制的环境集成；显式选了旧版、不认识该入口时仍是成功首装。
+    set -- install --adopt --integrate-only
+    if [ "$no_path" = 1 ]; then set -- "$@" --no-path; fi
+    if ! APROXY_HOME="$APROXY_HOME" "$BIN_DIR/$BIN_NAME" "$@"; then
+        echo "未能配置用户环境；二进制已安装。" >&2
+        if [ "$no_path" != 1 ]; then echo "请手动将 $BIN_DIR 加入当前用户的 PATH，然后打开新终端。" >&2; fi
+    fi
     echo "下一步: 先配置上游（新装机没有 base_url，直接启动会失败），再启动："
     echo "  aproxy config set base_url <上游地址>"
     echo "  aproxy config set api_key <密钥>"

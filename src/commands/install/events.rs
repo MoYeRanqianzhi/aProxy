@@ -83,6 +83,11 @@ pub(super) fn take_outcome(home: &Path) -> Result<bool, aproxy::install::Install
     Ok(true)
 }
 
+/// 收编只在镜像落位并完成交接后报告用户环境，其他安装结果的形状不变。
+pub(super) fn adopted(steps: &super::integration::Steps) {
+    let _ = STREAM.try_with(|s| super::super::print_doc(json!({"event":"result","outcome":"installed","version":s.borrow().version,"integration":steps})));
+}
+
 /// 最后一行只在失败时带 error，message 与同一路径给人读的首行一致。
 pub(super) fn result(outcome: &str, error: Option<(&aproxy::install::InstallFailure, &str)>) {
     let _ = STREAM.try_with(|s| {

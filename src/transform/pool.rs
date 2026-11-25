@@ -852,6 +852,7 @@ impl Pool {
         command.args(args).envs(&self.entry.env).kill_on_drop(true);
         #[cfg(windows)]
         let (stdin, stdout, stderr) = {
+            command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
             let security =
                 crate::daemon::PipeSecurity::for_current_user().map_err(|_| Fault::Spawn)?;
             let (stdin, input) = worker_pipe(&security, true)

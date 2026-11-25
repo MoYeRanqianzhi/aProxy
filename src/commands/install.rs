@@ -4,6 +4,7 @@
 //! 中断、中断点不留烂摊子。计划全文见 `.agents/plan/install-v1.md`。
 
 mod events;
+mod integration;
 #[path = "../i18n/install.rs"]
 mod text;
 use aproxy::install::reason::Cause;
@@ -111,6 +112,21 @@ async fn install(args: InstallArgs) {
     let home = aproxy_ipc::home::home();
     let run_dir = aproxy::daemon::run_dir();
 
+    if args.integrate_only {
+        let installed = aproxy::install::swap::bin_path_in(&home);
+        if !std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .is_ok_and(|p| installed.canonicalize().is_ok_and(|bin| bin == p))
+        {
+            fail(InstallFailure::because(
+                "install_failed",
+                Cause::NotInstalledImage,
+            ));
+        }
+        events::target(env!("CARGO_PKG_VERSION"));
+        events::adopted(&integration::apply(&home, args.no_path, args.no_shortcut));
+        return;
+    }
     if args.abort {
         return handle_abort(&home);
     }
@@ -245,7 +261,7 @@ async fn install(args: InstallArgs) {
             &home,
             &run_dir,
             plan,
-            false,
+            None,
             !args.no_skills,
             effective_proxy(&args).as_deref(),
         )
@@ -278,7 +294,7 @@ async fn install(args: InstallArgs) {
             &home,
             &run_dir,
             plan,
-            true,
+            Some(&args),
             !args.no_skills,
             effective_proxy(&args).as_deref(),
         )
@@ -697,7 +713,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         proxy,
     )
     .await;
-    report_outcome(home, result).await;
+    report_outcome(home, result, None).await;
 }
 
 /// 安装结局的用户可见输出与退出码（三个安装入口共用）。**一律硬退**：
@@ -710,6 +726,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
 async fn report_outcome(
     home: &std::path::Path,
     result: Result<aproxy::install::flow::FlowExit, InstallFailure>,
+    adopt: Option<&InstallArgs>,
 ) -> ! {
     let result = match result {
         Ok(aproxy::install::flow::FlowExit::HandedOver) => {
@@ -743,7 +760,12 @@ async fn report_outcome(
         terminal_lang(),
         aproxy::install::swap::bin_path_in(home).display(),
     ));
-    events::result("installed", None);
+    if let Some(args) = adopt {
+        let steps = integration::apply(home, args.no_path, args.no_shortcut);
+        events::adopted(&steps);
+    } else {
+        events::result("installed", None);
+    }
     crate::util::exit(0);
 }
 
@@ -905,7 +927,7 @@ async fn run_plan(
     home: &std::path::Path,
     run_dir: &std::path::Path,
     plan: aproxy::install::flow::InstallPlan,
-    adopt: bool,
+    adopt: Option<&InstallArgs>,
     skill_enabled: bool,
     download_proxy: Option<&str>,
 ) {
@@ -913,7 +935,8 @@ async fn run_plan(
         Ok(ports) => events::plan(&ports),
         Err(e) => fail(e),
     }
-    if let Err(e) = aproxy::install::flow::check_jurisdiction(run_dir, home, adopt).await {
+    if let Err(e) = aproxy::install::flow::check_jurisdiction(run_dir, home, adopt.is_some()).await
+    {
         fail(e.into());
     }
     let target = plan.target_version.clone();
@@ -921,7 +944,7 @@ async fn run_plan(
     let result =
         aproxy::install::flow::run_install(home, run_dir, &plan, skill_enabled, download_proxy)
             .await;
-    report_outcome(home, result).await;
+    report_outcome(home, result, adopt).await;
 }
 
 /// --abort：显式回滚（仅 swapping 前可完全回滚，此后只进不退）。

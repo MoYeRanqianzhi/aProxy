@@ -522,7 +522,7 @@ fn adopt_migrates_foreign_instance() {
     // CLI 交棒后会等接手者到达终点（状态为 done 或已清场）才以 0 退出——
     // 退出码即结局；此后只可能剩下状态文件清场与被等待者占用的旧镜像
     let out = env
-        .install_cmd(&["--adopt", "--no-skills"])
+        .install_cmd(&["--adopt", "--no-skills", "--no-path", "--no-shortcut"])
         .output()
         .report_exit()
         .unwrap();
@@ -1221,4 +1221,99 @@ fn a_desktop_build_no_channel_delivers_is_not_replaced() {
         !aproxy::install::swap::bin_path_in(&env.home()).exists(),
         "什么都没装"
     );
+}
+/// 真正的收编完成（含交棒）才发布环境结果。Windows 的注册表与菜单另经注入测试，
+/// 子进程只验证跳过、已有 PATH 等不会打开真实系统存储的分支。
+#[test]
+fn adopt_reports_profile_integration_after_installing() {
+    let home = TestHome::new();
+    let profile = home.path().join("user profile");
+    std::fs::create_dir(&profile).unwrap();
+    let mut cmd = home.cmd();
+    cmd.env(aproxy_ipc::home::USER_DIR_ENV, &profile)
+        .env("XDG_DATA_HOME", profile.join("data"))
+        .args(["install", "--adopt", "--no-skills", "--json"]);
+    #[cfg(windows)]
+    cmd.args(["--no-shortcut", "--no-path"]);
+    let out = cmd.output_ready().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let result: serde_json::Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+    assert_eq!(result["outcome"], "installed");
+    let steps = &result["integration"];
+    #[cfg(windows)]
+    {
+        assert_eq!(steps["path"]["status"], "skipped");
+        assert_eq!(steps["shortcut"]["status"], "skipped");
+        assert!(std::fs::read_dir(&profile).unwrap().next().is_none());
+    }
+    #[cfg(unix)]
+    {
+        assert_eq!(steps["path"]["status"], "changed");
+        assert!(profile.join(".profile").is_file());
+        assert_eq!(
+            steps["shortcut"]["status"],
+            if cfg!(feature = "desktop") {
+                "changed"
+            } else {
+                "skipped"
+            }
+        );
+    }
+    assert!(steps["path"]["reason"].is_string());
+    assert!(steps["shortcut"]["touched"].is_array());
+    let exe = aproxy::install::swap::bin_path_in(home.path());
+    // 引导脚本从已在 bin 的同一镜像调用；禁用两个动作时不应重装，且没有下载。
+    let out = home
+        .cmd_with(&exe)
+        .env(aproxy_ipc::home::USER_DIR_ENV, &profile)
+        .env("XDG_DATA_HOME", profile.join("data"))
+        .args([
+            "install",
+            "--adopt",
+            "--integrate-only",
+            "--no-path",
+            "--no-shortcut",
+        ])
+        .output_ready()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("Skipped PATH setup"));
+    assert_eq!(text.contains("application menu"), cfg!(feature = "desktop"));
+
+    #[cfg(unix)]
+    {
+        // 人工造成 PATH 步骤的局部失败：二进制仍然可用，退出码与安装结局都不能改变。
+        let not_dir = profile.join("not-a-directory");
+        std::fs::write(&not_dir, []).unwrap();
+        let out = home
+            .cmd_with(&exe)
+            .env("HOME", not_dir)
+            .args([
+                "install",
+                "--adopt",
+                "--integrate-only",
+                "--no-shortcut",
+                "--json",
+            ])
+            .output_ready()
+            .unwrap();
+        assert!(out.status.success());
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["integration"]["path"]["status"], "failed");
+        assert!(
+            String::from_utf8(out.stderr)
+                .unwrap()
+                .contains("to your user PATH manually")
+        );
+    }
 }

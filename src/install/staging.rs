@@ -93,7 +93,13 @@ pub fn run_version(bin: &Path) -> Result<String, String> {
 pub fn version_output(bin: &Path) -> Result<String, FileIssue> {
     use std::io::Read;
     let spawn = || {
-        std::process::Command::new(bin)
+        let mut command = std::process::Command::new(bin);
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(
+            &mut command,
+            windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
+        );
+        command
             .arg("--version")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())

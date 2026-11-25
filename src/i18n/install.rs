@@ -58,3 +58,7 @@ message!(install(target: &str), en: "Installing aProxy {target}...", zh: "开始
 message!(no_installation(), en: "No installation is in progress.", zh: "没有进行中的安装。");
 
 message!(aborted(), en: "Installation aborted. Temporary files were removed. The binary and instances were not changed.", zh: "安装已中止，现场已清理（二进制与实例未受影响）。");
+message!(path_changed(files: &str), en: "Updated PATH for new terminals: {files}. Already open terminals keep their old PATH.", zh: "已为新终端更新 PATH：{files}。已打开的终端仍使用原 PATH。");
+message!(path_present(bin: impl std::fmt::Display), en: "PATH is already configured for {bin}; nothing changed.", zh: "已为 {bin} 配置 PATH，无需更改。");
+message!(path_failed(reason: &str, bin: impl std::fmt::Display), en: "Warning: PATH setup failed: {reason}. Add {bin} to your user PATH manually, then open a new terminal.", zh: "警告：PATH 配置失败：{reason}。请手动将 {bin} 加入用户 PATH，然后打开新终端。");
+message!(path_skipped(), en: "Skipped PATH setup (--no-path).", zh: "已跳过 PATH 配置（--no-path）。");

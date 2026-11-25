@@ -108,6 +108,8 @@ message!(install_version(), en: "Install `latest` (default) from the selected up
 
 message!(from(), en: "Install from a local binary: copy, verify, swap atomically and restart instances one at a time. Its --version output selects the version (at least 0.2.0). Cannot be combined with --adopt or VERSION", zh: "从本地二进制文件安装（复制 → 校验 → 原子落位 → 滚动重启实例）。 二进制的 `--version` 自报版本即安装目标版本（低于 0.2.0 的拒绝）。");
 
+message!(no_path(), en: "Do not add the installed bin directory to your PATH during adoption", zh: "收编时不把安装目录下的 bin 加入当前用户的 PATH");
+message!(no_shortcut(), en: "Do not create an application menu entry during adoption (desktop builds)", zh: "收编时不创建应用菜单项（桌面版）");
 message!(adopt(), en: "Install the running aProxy binary (for example, one installed by npm) in ~/.aproxy/bin/ using the normal installation procedure. Adoption is explicit, never automatic", zh: "收编：把当前运行的 aProxy（如包管理器/npm 安装的）迁移到标准位置 `~/.aproxy/bin/`——当前进程镜像作为安装源，走完整标准流水线。 显式执行，绝不自动。");
 
 message!(abort(), en: "Abort installation before the swap and remove staging files and state. After the swap, installation can only continue", zh: "中止进行中的安装：仅 swapping 前可完全回滚（此后只进不退）。 清理状态文件与 staging 现场。");

@@ -39,6 +39,7 @@ message!(local_variant(path:&str, got:&str, want:&str), en: "{path} is a {got} b
 
 message!(unknown_variant(), en: "unknown variant", zh: "未知变体");
 
+message!(not_installed_image(), en: "Run this command from the installed binary in this home’s bin directory.", zh: "请从这个 home 的 bin 目录运行已安装的二进制。");
 message!(self_exe(e:&str), en: "Cannot locate the current executable: {e}", zh: "无法定位自身可执行文件: {e}");
 
 message!(cannot_run(e:&str), en: "The downloaded file cannot run: {e}", zh: "下载产物不可运行: {e}");
@@ -86,6 +87,8 @@ pub enum Cause {
     },
     /// 收编时无法取得本进程的镜像路径。
     SelfExe(String),
+    /// 只有已经在规范位置的镜像才可跳过安装流水线。
+    NotInstalledImage,
     /// 下载文件执行探测失败。
     CannotRun(Box<Cause>),
     /// 下载的文件不是可验证的 aProxy 发布产物。
@@ -195,6 +198,7 @@ impl Cause {
                 got.as_deref().unwrap_or_else(|| unknown_variant(lang)),
                 want,
             ),
+            Self::NotInstalledImage => not_installed_image(lang).into(),
             Self::SelfExe(e) => self_exe(lang, e),
             Self::CannotRun(e) => cannot_run(lang, &e.render(lang)),
             Self::BadDownload(e) => bad_download(lang, &e.render(lang)),

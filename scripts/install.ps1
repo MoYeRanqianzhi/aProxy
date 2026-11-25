@@ -23,6 +23,7 @@
 # 环境变量：
 #   APROXY_HOME       根目录（默认 ~\.aproxy）——bin/skills/run 全目录的根；空或只含空白
 #                     视为未设，否则必须是绝对路径
+#   APROXY_NO_PATH=1    跳过 PATH 配置（等效 -NoPath）
 #   APROXY_NO_SKILLS=1  跳过 skill 文档（等效 -NoSkills）
 #   APROXY_PRE=1      等效 -Pre
 #   APROXY_DL_PROXY   下载代理（等效 -DownloadProxy；仅本次，与上游请求代理完全无关）
@@ -34,6 +35,7 @@
 
 param(
     [string]$Version = "",      # 指定 tag（Releases 页上的版本号，形如 vX.Y.Z 或 vX.Y.Z-alpha.N）；空 = 按上面的选版规则
+    [switch]$NoPath,            # 不配置当前用户的 PATH
     [switch]$NoSkills,          # 跳过 skill 文档下载
     [string]$DownloadProxy = "", # 下载代理（仅本次；与上游请求代理完全无关）
     [switch]$Pre                # 允许安装预发布（取版本号最大的 v* release）
@@ -43,7 +45,7 @@ param(
 # 用户的 PowerShell 窗口，顶层设置的 $ErrorActionPreference 也会泄漏到会话里。
 # 函数内用 return/throw 收场，$ErrorActionPreference 随函数作用域结束自动还原。
 function Install-AProxy {
-    param([string]$Version, [bool]$NoSkills, [string]$DownloadProxy, [bool]$Pre)
+    param([string]$Version, [bool]$NoPath, [bool]$NoSkills, [string]$DownloadProxy, [bool]$Pre)
 
     $ErrorActionPreference = "Stop"
     # Windows PowerShell 5.1 在较老的系统上默认只启用 TLS 1.0/1.1，访问 GitHub 会
@@ -204,9 +206,14 @@ function Install-AProxy {
 
     Write-Host ""
     Write-Host "aProxy 已安装: $exePath"
-    if ($env:PATH -notlike "*$BinDir*") {
-        Write-Host "注意: $BinDir 不在 PATH 中——将其加入 PATH 后即可直接使用 aproxy 命令："
-        Write-Host ('  [Environment]::SetEnvironmentVariable(''Path'', $env:Path + '';' + $BinDir + ''', ''User'')')
+    $integrationArgs = @('install', '--adopt', '--integrate-only')
+    if ($NoPath) { $integrationArgs += '--no-path' }
+    try {
+        & $exePath @integrationArgs
+        if ($LASTEXITCODE -ne 0) { throw "exit $LASTEXITCODE" }
+    } catch {
+        Write-Warning "未能配置用户环境：$_。二进制已安装。"
+        if (-not $NoPath) { Write-Host "请手动将 $BinDir 加入当前用户的 PATH，然后打开新终端。" }
     }
     Write-Host "下一步: 先配置上游（新装机没有 base_url，直接启动会失败），再启动："
     Write-Host "  aproxy config set base_url <上游地址>"
@@ -218,6 +225,7 @@ function Install-AProxy {
 # 环境变量对应 irm | iex 场景（无法传 param）；显式 param 优先
 Install-AProxy `
     -Version $Version `
+    -NoPath ([bool]($NoPath -or $env:APROXY_NO_PATH -eq "1")) `
     -NoSkills ([bool]($NoSkills -or $env:APROXY_NO_SKILLS -eq "1")) `
     -DownloadProxy $(if ($DownloadProxy) { $DownloadProxy } else { $env:APROXY_DL_PROXY }) `
     -Pre ([bool]($Pre -or $env:APROXY_PRE -eq "1"))

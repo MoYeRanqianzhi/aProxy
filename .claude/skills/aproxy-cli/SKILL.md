@@ -1,6 +1,6 @@
 ---
 name: aproxy-cli
-description: Operate and configure aProxy, the local API proxy that retries failed LLM API requests indefinitely so agent workflows keep running. Covers every aproxy command (start, status, stop, restart, logs, restore, alias, find, doctor, config, settings, desktop, install/upgrade, and install --force for a failed upgrade or a broken binary), the config.toml and settings.json fields, runtime behavior (retries, keepalive heartbeats, multiple instances, logs, watchdog), connecting agent clients such as Claude Code and Codex, and troubleshooting. Use this skill whenever the user mentions aproxy or wants an agent client routed through a local retrying proxy, even if they do not ask for documentation - for example "point Claude Code at aproxy", "add a second instance on port 12346", "why is the port still in use after stop", "/compact hangs behind my relay API". Configuring format programs ([[format]]) on the aProxy side is covered here; writing the format program itself belongs to the aproxy-format skill.
+description: Operate and configure aProxy, the local API proxy that retries failed LLM API requests indefinitely so agent workflows keep running. Covers every aproxy command (start, status, stop, restart, logs, restore, alias, find, doctor, config, settings, desktop, install/upgrade, install --force for a broken install, migrate to convert 0.1.x settings and configs for 0.2.0), the config.toml and settings.json fields, runtime behavior (retries, keepalive heartbeats, multiple instances, logs, watchdog), connecting agent clients such as Claude Code and Codex, and troubleshooting. Use this skill whenever the user mentions aproxy or wants an agent client routed through a local retrying proxy, even if they do not ask for documentation - for example "point Claude Code at aproxy", "add a second instance on port 12346", "why is the port still in use after stop", "move my 0.1 config". Configuring format programs ([[format]]) on the aProxy side is covered here; writing the format program itself belongs to the aproxy-format skill.
 ---
 
 # aProxy
@@ -142,6 +142,19 @@ recovery from an interrupted install are in [commands.md](references/latest/comm
 control each other's instances. Move by reinstalling, as
 [compatibility.md](references/latest/compatibility.md) describes.
 
+0.2.0 also renamed most settings.json and config.toml keys and refuses the old ones, so after the
+reinstall nothing starts until the files are converted. `aproxy migrate --dry-run` shows what will
+change, `aproxy migrate` converts every file the home knows and keeps each original as
+`<file>.0.1.bak`, and the files it cannot convert mechanically (a 0.1.x transformer, a global API key
+with no upstream named for it, an old key next to its new name) are left untouched with the line to
+settle. Those are the user's decisions, about where a credential goes or which program sees their
+requests, so ask rather than pick, and never delete a key that holds a credential. Show the user the preview before running it; afterwards
+`aproxy doctor` must report no errors. compatibility.md, "Converting the files with aproxy migrate",
+has the procedure, what each review point means, and both rename tables for editing by hand.
+When any command reports a key such as `max_body_mb`, `forward_only` or `read_timeout_secs` as
+unknown, or ends its errors with a suggestion to run `aproxy migrate`, this is the situation. The
+command's text follows the user's language; `aproxy migrate --json` is always English.
+
 Every release has two builds with the same proxy and commands: `desktop`, which adds the
 `aproxy desktop` window, and `headless`, which has none and is the only one for musl Linux. The
 first word in the parentheses of `aproxy --version` says which one runs. Upgrades keep it; switch
@@ -171,7 +184,7 @@ If you cannot open the files linked below (a sandbox, or the skill installed und
 | Setting up Claude Code, Codex, Gemini CLI or another client | [clients.md](references/latest/clients.md) |
 | How retries, heartbeats, streaming, disk cache, forward-only mode, format programs, IPC, logs, watchdog and install work | [behaviors.md](references/latest/behaviors.md) |
 | A symptom or log message to explain | [troubleshooting.md](references/latest/troubleshooting.md) |
-| Whether these docs match the installed version; moving from 0.1.x to 0.2.0 | [compatibility.md](references/latest/compatibility.md) |
+| Whether these docs match the installed version; moving from 0.1.x to 0.2.0; converting 0.1.x settings and config files (`aproxy migrate`) and the old-to-new key tables | [compatibility.md](references/latest/compatibility.md) |
 
 These references describe aProxy 0.2.0, pre-releases included; compatibility.md lists where 0.1.0
 behaves differently. Check `aproxy --version` (and the versions `aproxy status` reports for running

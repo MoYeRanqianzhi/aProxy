@@ -163,13 +163,133 @@ moment with the user first.
    old files are ignored rather than acted on; remove them so they do not mislead a later
    inspection. A crashed 0.1.x instance's record is dead too: if that instance matters, start it
    again with the new CLI after the upgrade.
-5. Keep `settings.json` and the config files, but rewrite both: settings.json changed shape, and a
-   flat 0.1.x file is refused. Rename its keys with the table in "settings.json keys renamed in
-   0.2.0", then rename the config.toml keys in the table after it. Run `aproxy doctor`.
+5. Keep `settings.json` and the config files, but convert both: 0.2.0 refuses the 0.1.x shapes, so
+   until they are converted most commands stop with exit 3 and no instance starts. Use
+   `aproxy migrate` as [Converting the files with aproxy migrate](#converting-the-files-with-aproxy-migrate)
+   describes: preview with `aproxy migrate --dry-run`, show the user the planned changes, run
+   `aproxy migrate`, then settle with the user whatever it leaves for review. Finish with
+   `aproxy doctor`, which must report no errors.
 6. Start each instance with the new CLI: `aproxy start <alias or config path>`. Ports are unchanged,
    so agent clients need no change.
 7. Refresh these documents with `aproxy install --skills-only`, and check that the agent's skills
    directory links to or copies `<home>/skills/aproxy-cli`.
+
+### Converting the files with aproxy migrate
+
+`aproxy migrate` rewrites 0.1.x files into the 0.2.0 shape using the two rename tables further down
+("settings.json keys renamed in 0.2.0" and "Config keys renamed in 0.2.0"). Only 0.2.0 and later
+have it, so run it with the new CLI after step 3. It changes only what has one mechanical answer and
+leaves alone any file that needs a decision, so it never guesses on the user's behalf.
+
+**Which files.** Without arguments it takes `<home>/settings.json` and every config file the home
+knows: alias targets, `default_config`, and the `*.toml` files in each `config_dirs` entry, in
+`<home>/configs/` and in `<home>` itself, the same set `aproxy doctor` checks. It reads that list from the 0.1.x settings.json even though 0.2.0 otherwise refuses
+the file, so no alias is missed. `aproxy migrate PATH...` converts only the named config files, each
+once even when two paths lead to the same file; settings.json is converted only by the form without
+paths. Backups, files under `<home>/run/` and files already in the 0.2.0 shape are not rewritten.
+
+**What happens to each file.**
+
+1. The new text is built from the rename tables. A key moves into its section; comments and the
+   rest of the file stay as they were. A few values change form: `forward_only = true` becomes
+   `delivery = "forward"` and `false` becomes `"retry"`; each `bounded_retry_paths` pattern becomes
+   a rule with that `path` and `max_attempts = 3` (what 0.1.x did); `read_timeout_secs` becomes both
+   `timeouts.first_byte_secs` and `timeouts.read_idle_secs`; a format's `every_attempt = true` adds
+   `"retry"` after `"request"` in its `stages`. settings.json also gains `"schema": 1`.
+2. The new text is checked the way `start` would check it, against the settings being converted in
+   the same run. If it would still be invalid, the file is not written.
+3. The original is copied to `<file>.0.1.bak`, readable only by the user, and then replaced, unless
+   someone edited the file in the meantime. If a startup check of the written file fails, the
+   original is put back from the backup. An existing `.0.1.bak` with different content is never
+   overwritten.
+
+Running it again is safe: converted files report "Already current", and a backup with the same
+content is reused.
+
+Settle settings.json first. Each config is checked against the settings it will run with, so while
+settings.json still has a point to review, every config file reports "Repair settings.json first so
+startup can validate this configuration." and waits.
+
+**What is left for the user.** A file is "Left unchanged; review needed" when any part of it has no
+single correct translation. Nothing in such a file is written, not even the keys that could have
+moved, so the user sees it exactly as it was. Each point names the original key and line:
+
+| Message | Why | What to do |
+|---|---|---|
+| on `request_transform`, `response_transform` or `heartbeat_transform`: "Choose the format program, stages and arguments before migrating this file." | A 0.1.x transformer has no rename: 0.2.0 speaks a different protocol, so the program itself has to change. | Replace the table with a `[[format]]` entry whose `command` speaks protocol 1 (an official `aproxy-format` role or the user's rewritten program) and whose `stages` list what it serves; `mode` becomes `process`, `idle_timeout_secs` becomes `worker_idle_secs`, `pool_max` and `timeout_secs` keep their names. The aproxy-format skill covers choosing or writing the program. Or delete the table if the user no longer needs it. Then run migrate again for the remaining keys. |
+| on a format's `extra`: the same message | 0.2.0 has no `extra`. | Pass the data through the entry's `args` or `env` and change the program to read it from there. |
+| on `defaults.api_key`, a top-level `api_key`, or a secret header in `defaults.extra_headers` / `override_headers`: "Set defaults.base_url first, so it is clear which upstream this credential belongs to." | 0.2.0 sends a global credential only to the upstream it is bound to (settings-json.md, "Credentials in defaults follow their target"). 0.1.0 had no global key; these come from files written for a 0.2.0 pre-release. | Ask the user which upstream the key belongs to and set `defaults.base_url` to it; move a top-level `api_key` to `defaults.api_key`. Or move the key into the config.toml of the instances that use it. |
+| "Cannot move this key without overwriting `<new key>`." | The file has both the old and the new key, possibly with different values. | Ask the user which value is right, delete the other key, run migrate again. |
+| "Unrecognized key; it is not a documented 0.1.x rename." | Neither version knows the key: a typo, `upstream_url` from an alpha build, or a top-level `api_key` once `defaults.base_url` is set. | Rename `upstream_url` to `base_url`. A key that holds a credential (`api_key`, a token) is never just deleted: ask the user where it belongs and move it there (`defaults.api_key`, or the config of the instance that uses it). Fix or delete anything else (`aproxy config unset KEY --config FILE`, `aproxy settings unset KEY`). |
+| "This member occurs more than once; choose which value to keep." | settings.json names one key twice. | Keep one. |
+| "This value or file is not valid in the target format." | 0.2.0 rejects the value even after the rename, or the file is not valid TOML or JSON. | Fix what the line points to, using config-toml.md or settings-json.md. |
+| "Repair settings.json first so startup can validate this configuration." | A config file waits for settings.json. | Settle settings.json first, then run migrate again. |
+| "This alias or default_config points to a file that does not exist; remove the alias or restore the file." | settings.json names a config that is gone. | Ask the user: remove the alias (`aproxy alias remove NAME`) or `default_config`, or put the file back. |
+| "This config_dirs entry does not exist; remove it from settings.json or create it." | A configured directory is gone. | Ask the user: remove the entry from `config_dirs` or create the directory. |
+| "Cannot reuse the existing .0.1.bak as an identical private backup; neither file was replaced." | An earlier backup with other content is in the way. | Ask the user before moving it aside: it may be the only copy of an earlier original. |
+
+Settle these with the user rather than on your own: each one decides where a credential is sent,
+which program sees the user's requests, or which of two values wins. Then run
+`aproxy migrate --dry-run` again until nothing is left for review.
+
+**Output.** One block per file: the path and "Would migrate" (with `--dry-run`), "Migrated",
+"Already current", "Left unchanged; review needed" or "Failed", then one line per change
+(`old → new = value`) or per point to settle (`key:line: message (section)`; a point about the whole
+file has no key or line and prints as `: message (section)`). Secrets are masked in the report, not
+in the files. The last line reminds that running instances keep the configuration they loaded.
+
+The text follows the user's language, so on a Chinese system the headings and messages are Chinese
+(`将迁移`, `未改动，需要人工确认` …). To match messages against the table above, use `--json`: it
+prints the same report as one document, always in English, with `files[]` (`path`, `outcome` =
+`migrated`, `current`, `needs-review` or `failed`, `changes`, `issues` with `key`, `line`, `message`,
+`section`) and a `summary` with the counts.
+
+| Exit | Meaning |
+|---|---|
+| 0 | every file was converted (or would be, with `--dry-run`) or was already current |
+| 5 | some files were converted, others are left for review |
+| 3 | nothing was converted and some files are left for review |
+| 1 | a file operation failed on at least one file (permission denied, disk full and the like); takes precedence over 5 and 3 |
+
+A file edited by someone else while migrate ran, or one whose written text failed the startup check
+and was put back from its backup, is left for review (exit 5 or 3), not a failure: run migrate again.
+
+**What it leaves alone.** Running instances, until they restart; desired-state records; the 0.1.x
+leftovers of step 4; the programs that format entries run.
+
+Elsewhere 0.2.0 points at migrate when it meets a 0.1.x file. Most commands end their error list
+with ``Preview the 0.1.x changes with `aproxy migrate --dry-run`, then run `aproxy migrate`.``,
+and `doctor` adds that line as an `[INFO]` finding with the code `config_legacy_shape`. When `start`
+was given the file as an alias or path, or `config show` got `--config`, the line names the file:
+``… `aproxy migrate --dry-run <file>`, then run `aproxy migrate <file>`.`` On a 0.1.x home
+settings.json is almost always old too, so expect the short form first. The hint appears only when
+every error in the file comes from the 0.1.x shape, so a plain typo does not send the user here.
+
+A session on a 0.1.x home with one plain config and one that uses a transformer:
+
+```text
+$ aproxy migrate --dry-run
+<home>/settings.json: Would migrate
+  max_body_mb → defaults.max_request_mb = 64
+  forward_only → defaults.delivery = "retry"
+  bounded_retry_paths → defaults.retry.rules = [{"path":"/v1/messages/count_tokens","max_attempts":3}]
+  watchdog → watchdog.enabled = true
+  download_proxy → update.download_proxy = "http://***@127.0.0.1:7890"
+  — → schema = 1
+<home>/relay.toml: Left unchanged; review needed
+  request_transform:5: Choose the format program, stages and arguments before migrating this file. (compatibility.md#config-keys-renamed-in-020)
+<home>/work.toml: Would migrate
+  max_body_mb → max_request_mb = 32
+  read_timeout_secs → timeouts.first_byte_secs = 600
+  read_timeout_secs → timeouts.read_idle_secs = 600
+Running instances keep the configuration they loaded; restart them to use the migrated files.
+$ aproxy migrate               # exit 5: settings.json and work.toml converted
+  ... replace [request_transform] in relay.toml with the [[format]] entry the user chose ...
+$ aproxy migrate relay.toml    # exit 0: forward_only → delivery = "forward"
+$ aproxy doctor                # no errors
+```
+
+Windows prints the paths in their long form, beginning with `\\?\`.
 
 ### Commands changed in 0.2.0
 
@@ -200,9 +320,8 @@ stdout, so a script can read the output of `--json` directly.
 
 ### settings.json keys renamed in 0.2.0
 
-0.2.0 has no automatic migration for settings.json, because a value that moved into a section cannot
-be distinguished reliably from a key the user meant to keep. A flat 0.1.x file is rejected field by
-field: every old top-level key is reported as `config_unknown_key`, `watchdog: true|false` as
+`aproxy migrate` applies this table; edit by hand only what it leaves for review. A flat 0.1.x
+file is rejected field by field: every old top-level key is reported as `config_unknown_key`, `watchdog: true|false` as
 `config_type` ("watchdog must be an object"), and commands that need settings stop with exit 3
 (settings-json.md, "When settings.json is invalid"). `aproxy settings show`, `aproxy doctor` and the
 other tolerated commands still run, so you can inspect the file and repair it one key at a time;
@@ -242,9 +361,9 @@ Two behaviors differ from a pure rename:
 - **0.1.x had no `language` or `ui`.** Both are optional; leave them out and take the built-in
   defaults (`"system"` and `{}`).
 
-Rewrite the whole file before starting 0.2.0: a mixture of old and new keys is still invalid for the
-new CLI (the old keys are unknown), and 0.1.x cannot read the new sections either. With the 0.2.0
-CLI, for example:
+Convert the whole file before starting 0.2.0: a mixture of old and new keys is still invalid for the
+new CLI (the old keys are unknown), and 0.1.x cannot read the new sections either. To edit by hand
+with the 0.2.0 CLI, for example:
 
 ```sh
 aproxy settings unset max_body_mb
@@ -264,7 +383,8 @@ names whatever is still wrong, and `doctor` lists it with the rest of the home's
 
 config.toml is parsed strictly from 0.2.0 on. An old key is not ignored: it is reported as
 `config_unknown_key`, naming the file, the key path and line:column, and the instance does not
-start. Rename each key before the first start with the new CLI.
+start. Convert each file before the first start with the new CLI. `aproxy migrate` applies every
+row except the transformer tables and format `extra`, which it leaves for the user.
 
 | 0.1.x config.toml | 0.2.0 |
 |---|---|
@@ -278,7 +398,7 @@ start. Rename each key before the first start with the new CLI.
 | `keepalive_heartbeat = "..."` | `[keepalive] heartbeat = "..."` |
 | `max_retry_backoff_secs = N` | `[retry] max_backoff_secs = N` |
 | `bounded_retry_paths = ["..."]` | `[[retry.rules]]` entries with `path` (regex) and `max_attempts` (required; `0` = no limit), plus optional `status` |
-| `[request_transform]`, `[response_transform]`, `[heartbeat_transform]` tables | `[[format]]` array entries with `command`, `args`, `process`, and `stages` (config-toml.md, format). The program itself must speak protocol 1; the official `aproxy-format run` command is replaced by one subcommand per role |
+| `[request_transform]`, `[response_transform]`, `[heartbeat_transform]` tables | `[[format]]` array entries with `command`, `args`, `process`, and `stages` (config-toml.md, format); `pool_max` and `timeout_secs` keep their names. The program itself must speak protocol 1; the official `aproxy-format run` command is replaced by one subcommand per role |
 | format `mode = "spawn"\|"persistent"` | `process = "spawn"\|"persistent"` |
 | format `idle_timeout_secs = N` | `worker_idle_secs = N` |
 | format `every_attempt = true` | add `"retry"` to `stages` next to `"request"` |
@@ -287,7 +407,7 @@ start. Rename each key before the first start with the new CLI.
 The 0.1.x `upstream_url` name is older still and also no longer read; it is `base_url` in 0.2.0 and
 in 0.1.0's stable line (the "What these docs describe" table above).
 
-A rewrite that edits one key at a time with `aproxy config set KEY VALUE` and
+To edit by hand, changing one key at a time with `aproxy config set KEY VALUE` and
 `aproxy config unset OLD` is safe: an unknown key does not block unrelated edits, and `unset`
 accepts any key, including one this version does not know. After the renames, `aproxy config show`
 prints the file's values and exits 3 if anything is still wrong.
@@ -323,7 +443,7 @@ these docs do not track how they differ, so upgrade rather than look up alpha be
    `aproxy restart <port>` for any that does not.
 
 Config files from alpha builds need the same renames as 0.1.x (see "Config keys renamed in 0.2.0",
-and rename `upstream_url` to `base_url`), and their flat settings.json is refused the same way
-("settings.json keys renamed in 0.2.0"). From 0.2.0 on, a key the version does not know is an error
+and rename `upstream_url` to `base_url` by hand), and their flat settings.json is refused the same
+way ("settings.json keys renamed in 0.2.0"). `aproxy migrate` converts both, as for 0.1.x. From 0.2.0 on, a key the version does not know is an error
 that stops the instance; it is no longer ignored. Missing keys still take their defaults. If
 something stops working after the upgrade, look the symptom up in troubleshooting.md.

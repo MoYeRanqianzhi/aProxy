@@ -12,7 +12,8 @@ troubleshooting.md.
 - [Options for start](#options-for-start)
 - [start](#start) · [status](#status) · [stop](#stop) · [restart](#restart) · [logs](#logs) ·
   [restore](#restore)
-- [alias](#alias) · [find](#find) · [doctor](#doctor) · [config](#config) · [settings](#settings)
+- [alias](#alias) · [find](#find) · [doctor](#doctor) · [config](#config) · [settings](#settings) ·
+  [migrate](#migrate): converting 0.1.x files
 - [desktop](#desktop): the desktop window
 - [install / upgrade](#install--upgrade), including recovery from a failed install and
   [force install](#force-install)
@@ -640,7 +641,7 @@ to run (settings-json.md, "When settings.json is invalid").
 |---|---|
 | error | everything `start` rejects, in settings.json and in each config: syntax (`config_syntax`), an unknown key (`config_unknown_key`), a wrong type or value (`config_type`, `config_invalid_value`), a missing key (`config_missing_key`), a newer settings.json `schema` (`settings_schema_too_new`). In settings.json this includes `watchdog.heartbeat_secs` or `watchdog.stale_after_cycles` set to 0, a credential in `defaults` without the `base_url` or `proxy` it belongs to, and an invalid alias name |
 | warning | `config_file_unreadable`: an alias or `default_config` points at a file that is missing or cannot be read. `config_dir_missing`: a directory added to `config_dirs` does not exist. `listen_not_loopback`: any host that can reach the port can use the proxy, with the key it injects. `port_shared`: configs on the same port cannot run at the same time (each alone is fine). `file_permissions_too_open`: other users can read the home or a config, which hold keys; when the current user owns the home, aproxy tightens it on its next write. `watchdog_slow_hang_detection`: `watchdog.heartbeat_secs` above 600 delays hang detection. `watchdog_restarts_disabled`: `watchdog.max_restarts` is 0. `record_unreadable`, `record_schema_too_new`: a record in `run/` is left as it is, and log cleanup pauses while it is there |
-| info | `default_header_shared`: a header in settings.json `defaults` is sent to every target; a header that carries a credential belongs in the configs that need it |
+| info | `default_header_shared`: a header in settings.json `defaults` is sent to every target; a header that carries a credential belongs in the configs that need it. `config_legacy_shape`: every error in the file comes from the 0.1.x shape; convert it with `aproxy migrate` (below) |
 
 `--json` prints one document:
 
@@ -654,6 +655,29 @@ records (`kind` is `settings`, `config`, `home` or `record`); a file without fin
 (`error`, `warning`, `info`), `file`, `message` and `details`, plus `key`, `line` and `column` when
 known. `"gc_paused":{"reason":"unreadable_records"}` appears while log cleanup is paused. The exit
 code is the same as in text mode.
+
+## migrate
+
+```
+aproxy migrate [PATH...] [--dry-run] [--json]
+```
+
+Converts 0.1.x settings.json and config files into the 0.2.0 shape, applying only the renames that
+have one mechanical answer, after copying each original to `<file>.0.1.bak`. Without `PATH` it takes
+settings.json and every config the home knows (aliases, `default_config`, `config_dirs`, `*.toml` in
+`<home>/configs/` and `<home>`); with paths, only those config files. `--dry-run` prints the plan and writes nothing. A
+file with anything that needs a decision (a 0.1.x transformer, a global `api_key` without
+`defaults.base_url`, an old key next to its new name, an unknown key) is left entirely unchanged and
+reported with the key and line. Running instances keep what they loaded until they restart.
+
+Exit 0 when every file is converted or already current, 5 when some are converted and others left
+for review, 3 when only review points remain, 1 when a file operation failed (this wins over 5 and 3).
+The text output follows the user's language; `--json` is always English. `--json` gives
+`files[]` (`path`, `outcome` = `migrated`/`current`/`needs-review`/`failed`, `changes`, `issues`)
+and `summary`.
+
+The full procedure, what each review point means and how to settle it with the user:
+compatibility.md, "Converting the files with aproxy migrate".
 
 ## config
 

@@ -904,7 +904,7 @@ to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running anot
 | `VERSION` | a version without the `v`, e.g. `0.2.0`; default `latest` |
 | `--pre` | resolve `latest` in the pre-release channel |
 | `--allow-downgrade` | allow a VERSION lower than the running CLI's version, but never below 0.2.0. Not with `--force`, which installs a named VERSION regardless |
-| `--cpu x86-64-v3\|baseline` | which x86-64 build to download; default `x86-64-v3` when the CPU has AVX2 and the target publishes one (x86_64 Windows and x86_64 Linux gnu), baseline otherwise |
+| `--cpu x86-64-v3\|baseline` | which x86-64 build to download; default `x86-64-v3` when the CPU has AVX2 and the target publishes one (x86_64 Windows, x86_64 Linux gnu and x86_64 macOS), baseline otherwise |
 | `--download-proxy URL` | proxy for downloads only; default `update.download_proxy` in settings.json (not read by `--force`), then the environment's proxy settings. Unrelated to config.toml's `proxy` |
 | `--no-skills` | skip the skill update this time (permanently: `update.skill_auto_update` in settings.json). Not with `--force`, which never updates skills |
 | `--from PATH` | install a local binary; its `--version` output decides the version, with no downgrade check (below 0.2.0 is still refused) |

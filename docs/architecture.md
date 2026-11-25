@@ -927,7 +927,7 @@ aproxy-desktop 需要的 home 与运行时由 bin 经 `Options` 交进去。浏�
   门槛：两种变体都跑 clippy、全量测试与 `--version` 冒烟
 - **发布门禁**（`release.yml`）：tag 触发后先构建一次前端，再在 windows、ubuntu 与 macOS 上按
   两种变体复跑 fmt/clippy/test/`--version` 冒烟（tag 可能落后于 main），全绿才进入构建。
-  构建出 20 个二进制（每个平台 desktop 与 headless 各一份，musl 只有
+  构建出 22 个二进制（每个平台 desktop 与 headless 各一份，musl 只有
   headless；Linux gnu 的带界面版在 `ubuntu:22.04` 容器里构建），每个都核对嵌着的 C5 版本行、
   能跑的再真的执行 `--version`；之后由 `examples/release-manifest.rs` 生成发布清单
   `aproxy-manifest.json` 并用强制安装读清单的代码读回核对。渠道发布幂等：npm 与 crates.io
@@ -996,7 +996,7 @@ Ubuntu 22.04 等系统启动即报 `GLIBC_2.39 not found`（alpha.17 实测如�
 - **0.2.0**：当前开发线（`0.2.0-alpha.*` 预发布）。与 0.1.x 互不兼容、不能原地升级
   （迁移步骤见 CHANGELOG），可安装版本的下限是 0.2.0；引入桌面界面与主题、扩展（早期的 alpha
   版只显示演示数据，现在接的是真实数据，见「桌面界面」）。
-- 发布产物：x86_64 的 Windows 与 Linux gnu 同时提供 baseline 与 x86-64-v3
-  （AVX2）两种指令集变体。`aproxy install` 运行时检测 AVX2，只在这两个目标上选 v3
+- 发布产物：x86_64 的 Windows、Linux gnu 与 macOS 同时提供 baseline 与 x86-64-v3
+  （AVX2）两种指令集变体。`aproxy install` 运行时检测 AVX2，只在这三个目标上选 v3
   （它按名字找资产，别的目标取 `-v3` 只会 404）；强制安装按发布清单选，清单里没有 v3
   档就用 baseline；一键安装脚本保守地装 baseline；musl 与其他架构只有 baseline。

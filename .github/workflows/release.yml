@@ -1,12 +1,12 @@
 name: Release
 
-# 主线（tag v*）的发布：前端构建 → 发布门槛（两种变体的全量验证）→ 20 个产物的构建矩阵 → skill
+# 主线（tag v*）的发布：前端构建 → 发布门槛（两种变体的全量验证）→ 22 个产物的构建矩阵 → skill
 # 打包 → 发布清单（生成并核对）→ GitHub Release → npm 与 crates.io 两个渠道（publish-npm /
 # publish-crates，trusted publishing / OIDC）。
 #
 # 产物（文件名不带版本号，版本由 tag 承载，见 install 计划「发布资产命名」）：
-#   带桌面界面的 desktop  aproxy-<target>[-v3][.exe]           9 个（musl 没有带界面版）
-#   无界面的 headless     aproxy-headless-<target>[-v3][.exe]  11 个
+#   带桌面界面的 desktop  aproxy-<target>[-v3][.exe]           10 个（musl 没有带界面版）
+#   无界面的 headless     aproxy-headless-<target>[-v3][.exe]  12 个
 #   aproxy-manifest.json  发布清单（永久兼容契约 C6）：强制安装靠它找资产
 #   aproxy-skills.zip（内含 manifest.json）
 #   每个二进制与 skill 包附 .sha256
@@ -140,12 +140,14 @@ jobs:
         run: bash .github/scripts/version-smoke.sh target/debug/aproxy${{ runner.os == 'Windows' && '.exe' || '' }} ${{ matrix.variant }}
 
   build:
-    # 在 runner 宿主机上构建的 17 个产物：Windows 与 macOS 的两个变体，Linux 的 headless（gnu 用
+    # 在 runner 宿主机上构建的 19 个产物：Windows 与 macOS 的两个变体，Linux 的 headless（gnu 用
     # cargo-zigbuild 压低 glibc 下限，musl 静态链接，两者都只出 headless）。Linux gnu 的带界面版要在
     # 老系统里链接 WebKitGTK，另见 build-linux-desktop。
     #
-    # x86-64-v3（AVX2，约 2013 年后主流 CPU）只给 x64 的 Windows 与 Linux gnu 出；install 按
-    # is_x86_feature_detected 自动选档，失败回退 baseline。Windows x86（32 位）在 x64 runner 上
+    # x86-64-v3（AVX2，约 2013 年后主流 CPU）给 x64 的 Windows、Linux gnu 与 macOS 出；install 按
+    # is_x86_feature_detected 自动选档，失败回退 baseline（Apple Silicon 上经 Rosetta 跑的 x86_64
+    # 版查不到 AVX2 时同样取 baseline）。macOS 的 x86_64 两档都在 Apple Silicon runner 上交叉编译，
+    # 冒烟只核对嵌着的版本行。Windows x86（32 位）在 x64 runner 上
     # 交叉编译（MSVC 自带 x86 交叉工具链），Windows 与 Linux 的 ARM64 用原生 arm runner（ring 要
     # 编 C），macOS 在 Apple Silicon runner 上原生出 arm64、交叉出 x86_64。
     needs: test
@@ -164,8 +166,10 @@ jobs:
           - { os: windows-11-arm, target: aarch64-pc-windows-msvc, ui: headless, cpu: baseline, ext: .exe }
           - { os: macos-latest, target: aarch64-apple-darwin, ui: desktop, cpu: baseline, ext: "" }
           - { os: macos-latest, target: x86_64-apple-darwin, ui: desktop, cpu: baseline, ext: "" }
+          - { os: macos-latest, target: x86_64-apple-darwin, ui: desktop, cpu: x86-64-v3, ext: "" }
           - { os: macos-latest, target: aarch64-apple-darwin, ui: headless, cpu: baseline, ext: "" }
           - { os: macos-latest, target: x86_64-apple-darwin, ui: headless, cpu: baseline, ext: "" }
+          - { os: macos-latest, target: x86_64-apple-darwin, ui: headless, cpu: x86-64-v3, ext: "" }
           # zigbuild: true：用 cargo-zigbuild 按 GNU_GLIBC_FLOOR 链接（见顶部 env）
           - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, ui: headless, cpu: baseline, ext: "", zigbuild: true }
           - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, ui: headless, cpu: x86-64-v3, ext: "", zigbuild: true }
@@ -327,7 +331,7 @@ jobs:
             aproxy-skills.zip.sha256
 
   manifest:
-    # 发布清单（永久兼容契约 C6）：从 20 个二进制生成 aproxy-manifest.json，并用强制安装读清单的
+    # 发布清单（永久兼容契约 C6）：从 22 个二进制生成 aproxy-manifest.json，并用强制安装读清单的
     # 同一段代码读回核对，做法见 examples/release-manifest.rs 的模块文档。要编译并运行仓库代码，
     # 所以与写仓库的 release job 分开，只有只读权限。--no-default-features：清单代码在 lib 里，
     # 用不着编译桌面界面。

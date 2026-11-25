@@ -28,7 +28,7 @@ cat <<EOF
 ## 基础信息
 
 - 版本：\`$tag\`
-- 平台产物：windows（x64/x86/arm64）/ linux（x64+arm64，gnu+musl）/ macOS（arm64+x64），各有 desktop 与 headless 两个变体（musl 只有 headless）；x86_64 的 Windows 与 Linux gnu 提供 baseline 与 AVX2（-v3）两种指令集档
+- 平台产物：windows（x64/x86/arm64）/ linux（x64+arm64，gnu+musl）/ macOS（arm64+x64），各有 desktop 与 headless 两个变体（musl 只有 headless）；x86_64 的 Windows、Linux gnu 与 macOS 提供 baseline 与 AVX2（-v3）两种指令集档
 - 变更记录：见下方 Automatic release notes
 
 ## SHA256

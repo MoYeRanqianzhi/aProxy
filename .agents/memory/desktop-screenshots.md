@@ -5,7 +5,7 @@ metadata:
   type: project
   scope: 截图工作流（目前在 probe/screenshots 分支）、README 的截图、APROXY_DESKTOP_DEMO
   status: active
-  last_verified: 2026-11-25
+  last_verified: 2026-11-26
 ---
 
 用户在 2026-11-24/25 定下的截图做法：
@@ -13,7 +13,7 @@ metadata:
 - **用演示数据。** 窗口外壳是真的，数据用浏览器预览里那套演示数据：设 `APROXY_DESKTOP_DEMO=<en|zh-CN>,<light|dark>[,scene=<名字>]`，
   场景表在 `aproxy-desktop/ui/src/lib/backend/demo/scenes.ts`。这个开关只编进 debug 构建（`7e891836`），发布的二进制里没有。
 - **每个细节页都截，展示各个功能。** README 只挑典型页面，其余作为额外图片供查看细节。
-- **完整图集放到一个专门的分支上。** 每次生成都把这个分支重置成只有一个提交再强推，克隆只带最新一套图，
+- **完整图集放到一个专门的分支上**（`screenshots`，首页由 `.github/screenshots/gallery.py` 生成，2026-11-26 首次推送 run 45539839130 的 153 张图）。每次生成都把这个分支重置成只有一个提交再强推，克隆只带最新一套图，
   `.git` 不会越积越大；README 用的几张典型图经 PR 进 main。一套图约一百张、二三十 MB（每张 140–430 KB）。
   README 里三个平台的切换只能用 `<details>`（GitHub markdown 没有标签页组件，也不能用脚本）。
 - **Windows 用 Windows 11。** 用户：「演示也使用Win11，win10已经停止官方支持了」。`windows-latest` 是

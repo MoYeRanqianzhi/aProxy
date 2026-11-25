@@ -923,13 +923,11 @@ aproxy-desktop 需要的 home 与运行时由 bin 经 `Options` 交进去。浏�
   任务下载已经发布的每个 0.2.0 版本（预发布也算；清单在 ci.yml 的 `PREV_VERSIONS`，每发一个
   版本加一个）的无界面资产，让它与当前构建互相强制安装——谁执行、装上谁、被结束的进程是谁
   启动的，四种组合都走——断言进程按台账结束、二进制换好、端口放开
-  （`tests/force_cross_version.rs`，同样平时 `#[ignore]`）。macos-build 只要求两种变体都
-  编得过。macOS 测试是独立 job，**已知红**（`/proc` 依赖，见「平台」）：不设
-  skip 也不设 `continue-on-error`，红色就是「未完成」的如实信号，独立成 job 后不淹没其他
-  平台的结论
-- **发布门禁**（`release.yml`）：tag 触发后先构建一次前端，再在 windows 与 ubuntu 上按
-  两种变体复跑 fmt/clippy/test/`--version` 冒烟（tag 可能落后于 main），全绿才进入构建；
-  macOS 不进门禁。构建出 20 个二进制（每个平台 desktop 与 headless 各一份，musl 只有
+  （`tests/force_cross_version.rs`，同样平时 `#[ignore]`）。macOS 与 windows、ubuntu 同为
+  门槛：两种变体都跑 clippy、全量测试与 `--version` 冒烟
+- **发布门禁**（`release.yml`）：tag 触发后先构建一次前端，再在 windows、ubuntu 与 macOS 上按
+  两种变体复跑 fmt/clippy/test/`--version` 冒烟（tag 可能落后于 main），全绿才进入构建。
+  构建出 20 个二进制（每个平台 desktop 与 headless 各一份，musl 只有
   headless；Linux gnu 的带界面版在 `ubuntu:22.04` 容器里构建），每个都核对嵌着的 C5 版本行、
   能跑的再真的执行 `--version`；之后由 `examples/release-manifest.rs` 生成发布清单
   `aproxy-manifest.json` 并用强制安装读清单的代码读回核对。渠道发布幂等：npm 与 crates.io
@@ -946,18 +944,17 @@ aproxy-desktop 需要的 home 与运行时由 bin 经 `Options` 交进去。浏�
 |---|---|
 | Windows（x64 / x86 / arm64） | 全功能（开发与主测试平台） |
 | Linux（x86_64 / aarch64，glibc 与 musl） | 全功能；headless 的 gnu 产物 glibc 下限 2.28，带界面的 gnu 产物要 glibc 2.34 与 WebKitGTK 2.40；更低的 glibc 与 musl 系统用 musl 产物（只有 headless） |
-| macOS（Apple Silicon / Intel） | 提供预构建二进制，但未经真机验证；看门狗、`aproxy install` 与依赖进程查询的实例管理用到 Linux 专有接口（`/proc`），在 macOS 上不可用或退化 |
+| macOS（Apple Silicon / Intel） | 全功能；CI 在 Apple Silicon 上跑全部测试，看护者、安装与桌面窗口在 GitHub 的 macOS runner 上实测过；Intel 版交叉编译，没有在 Intel 上运行过 |
 
-unix 分支（UDS IPC、run 目录里的心跳文件、`/proc` 进程查询、单步 rename 交换）按
-**Linux** 实现：`#[cfg(unix)]` 路径读 `/proc` 取进程创建时间，macOS 上没有它，所以 macOS 上
-进程创建时间读取，以及一切靠「pid + 创建时间」核验身份的环节（看护者的收养与处决、
-`stop --force`、靠创建时间判定安装者存活的 install 宣告）无法工作。这部分需要在 macOS 真机上补齐实现与验证（后续贡献者），
-补齐之前 README 的平台矩阵如实标注为暂不支持。macOS 的代理转发路径不依赖它们，
-可用。
+unix 分支（UDS IPC、run 目录里的心跳文件、单步 rename 交换）在 Linux 与 macOS 上共用；进程查询
+分平台实现：Linux 读 `/proc`，macOS 用 `proc_pidinfo`（创建时间取 `proc_bsdinfo` 的启动秒与微秒、
+僵尸按进程状态判定、镜像路径用 `proc_pidpath`），所以一切靠「pid + 创建时间」核验身份的环节
+（看护者的收养与处决、`stop --force`、install 宣告）在两个平台上同样工作，见 `src/process.rs` 与
+`aproxy-ipc/src/registry.rs`。
 
 桌面界面另有平台前提：Windows 要 WebView2 运行时（Windows 11 自带）；Linux 的带界面构建
 动态链接 WebKitGTK 4.1，缺库时整个二进制都起不来，所以 musl 只有 headless，没有图形界面的
-机器也该用 headless；macOS 只保证两种变体都编得过。`aproxy install` 与 `install --force`
+机器也该用 headless；macOS 用系统自带的 WebKit，不需要另装。`aproxy install` 与 `install --force`
 不预先猜本机缺什么，只看下载下来的二进制自己的 `--version` 能不能跑：系统要求属于目标版本的
 构建，会随以后的发布变化（换构建基线、换 WebKitGTK 的 API 与 soname），而安装器的代码随正在
 运行的旧版本永远不变——强制安装尤其要能装以后任何一版。没写 `--variant` 时按

@@ -121,7 +121,7 @@ jobs:
     # unix 分支已在 Ubuntu/WSL 实测全绿（2026-09-11，见团队记忆
     # install-three-platform-e2e）——CI 从编译面 check 升级为真实测试门槛，
     # 防止 unix-only 代码的编译/行为回归再次溜进 main。
-    # 与 macOS 拆成独立 job：macOS 已知红（见下）时，ubuntu 的结论仍然单独可读。
+    # 与 macOS 分成独立 job，各平台的结论单独可读。
     # 钉 24.04 而不跟 ubuntu-latest：带界面的变体编译要系统的 libwebkit2gtk-4.1-dev，
     # 镜像换代时包名与版本可能跟着变，换镜像要当作一次有意的改动。
     name: ubuntu (${{ matrix.variant }})
@@ -266,55 +266,48 @@ jobs:
       # 一次只跑一种组合：每种都要起实例与看护者、等 restore，并发只会互相拖慢
       - run: cargo test --locked --no-default-features --test force_cross_version -- --ignored --nocapture --test-threads=1
 
-  macos-build:
-    # macOS 不在 0.2.0 的支持范围（测试见下面的 macos 任务，已知红），但两种变体都必须编得过：
-    # 带界面的变体在 macOS 上链接 WebKit 与 AppKit，任何平台分支写错都在这里暴露。
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.3
-      - uses: actions/setup-node@v7.1.0
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: aproxy-desktop/ui/package-lock.json
-      - name: Build the desktop front end
-        working-directory: aproxy-desktop/ui
-        run: |
-          npm ci
-          npm run build
-      - run: cargo build --workspace --all-targets --locked
-      - name: Smoke-test --version (C5, desktop)
-        run: bash .github/scripts/version-smoke.sh target/debug/aproxy desktop
-      # 无界面变体会重新链接同一个 target/debug/aproxy，所以紧接着冒烟
-      - run: cargo build --workspace --exclude aproxy-desktop --no-default-features --all-targets --locked
-      - name: Smoke-test --version (C5, headless)
-        run: bash .github/scripts/version-smoke.sh target/debug/aproxy headless
-
   macos:
-    # 已知红：#[cfg(unix)] 的共享内存与进程查询实现是 Linux 专用（/dev/shm、
-    # /proc），macOS 上 3 个 lib 测试失败——待有 macOS 真机的贡献者完成支持，
-    # 见团队记忆 2026-09-12-macos-support-required。不加 skip、不设
-    # continue-on-error：红色就是「未完成」的如实信号；独立成 job 后不再淹没
-    # windows/ubuntu 的结论。能否编译由上面的 macos-build 单独给出结论。
+    # macOS 在 0.2.0 的支持范围内，与 windows、ubuntu 同为门槛：两种变体都跑 clippy、全量测试与
+    # --version 冒烟，任何一项红都挡住合入，release.yml 的发布门槛同样包含 macOS。windows 上的
+    # clippy 不编译 #[cfg(target_os = "macos")] 的代码，ubuntu 上也不编译，零警告纪律在这里补上
+    # macOS 这一面；带界面的变体在 macOS 上链接 WebKit 与 AppKit，平台分支写错在编译时就暴露。
+    name: macos (${{ matrix.variant }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: desktop
+            flags: ""
+          - variant: headless
+            flags: --exclude aproxy-desktop --no-default-features
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          key: ${{ matrix.variant }}
       - uses: actions/setup-node@v7.1.0
+        if: matrix.variant == 'desktop'
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: aproxy-desktop/ui/package-lock.json
       - name: Build the desktop front end
+        if: matrix.variant == 'desktop'
         working-directory: aproxy-desktop/ui
         run: |
           npm ci
           npm run build
-      - run: cargo test --locked
+      # 依赖闭包的离线测试（aproxy-ipc）检查全部目标平台的依赖；在 macOS 上本机构建不会下载
+      # Windows 目标的依赖源码，先用 cargo tree 取齐，测试本身保持离线
+      - run: cargo tree --locked -p aproxy-ipc --no-default-features --target all -e normal > /dev/null
+        shell: bash
+      - run: cargo clippy --workspace ${{ matrix.flags }} --all-targets --locked -- -D warnings
+      - run: cargo test --workspace ${{ matrix.flags }} --locked --no-fail-fast
+      - name: Smoke-test --version (C5)
+        run: bash .github/scripts/version-smoke.sh target/debug/aproxy ${{ matrix.variant }}

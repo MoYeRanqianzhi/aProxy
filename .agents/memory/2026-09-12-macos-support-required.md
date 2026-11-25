@@ -1,5 +1,16 @@
 # macOS 支持：必须完成（用户 2026-09-12 定调）
 
+## 2026-11-26 更新：macOS 的 CI 失败是阻断项
+
+用户 2026-11-26：「macOS成功了的话，后续也将macOS CI报错作为阻碍，不再像之前一样忽视错误可以正常发布」。
+main 的 CI 在 t13、t15 合入后首次三平台全绿（run 45672469676），随即把 macOS 升为门槛：ci.yml 的 macos
+任务与 ubuntu 同样分两种变体跑 clippy、`--workspace` 测试与 `--version` 冒烟；release.yml 与
+release-format.yml 的发布门槛都加上 macos-latest。下文「已知红」「不进门禁」的说法全部作废。
+
+**Why:** macOS 在 0.2.0 的支持范围内，红色不再是「未完成」的信号，而是缺陷。
+**How to apply:** macOS 任务红了与 windows、ubuntu 红了同等对待：先修再合入或发布，不以「macOS 已知问题」放行。
+**Recheck when:** 用户改变 macOS 的支持范围。
+
 ## 2026-11-24 更新：0.2.0 必须在 macOS 正常运行
 
 用户 2026-11-24：「本次需要确保macOS端在0.2.0也能正常运行」。下文「0.1.0 不处理 macOS」与「不要在 Windows

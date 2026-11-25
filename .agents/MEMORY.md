@@ -22,7 +22,7 @@
 - [CI unix 编译盲区](memory/2026-09-11-ci-unix-blindspot.md) — 918ea33 的 unix job 红着没人看就报了收尾；push 后必须 gh run list 确认 CI 绿；unix-only 改动本地无法编译验证时交 WSL/CI 裁决；现行 windows/ubuntu 为门禁、macos 已知红；2026-10-06 复发四坑（平台门控调用方致 unix 死代码、启动顺序致 run 目录未建、errno 假设、unix 测试里 Child 未 wait 触发 zombie_processes），改 unix 路径后先等 ubuntu 结论再叠加；2026-10-12 起推送前可在本机用 clang + 三个 C 头文件桩交叉 check/clippy Linux 目标
 - [install 在线深度实测](memory/2026-09-12-install-online-deep-test.md) — WSL 3 轮 16 场景全 PASS；挖出在线主路径状态机缺口/skill 下载目录自毁/产物缺 755/版本回写缺失；musl 回退 + npm latest 兜底；测试 tag 发布全坑集
 - [release 版本对齐](memory/2026-09-12-release-version-alignment.md) — build+publish 双 job 对齐 tag 版本（python 显式 utf-8 + \r?\n + --allow-dirty）；alpha.10/11 被 t 标签抢注正式版顺延 alpha.12；测试 tag 一次性（失败必须 bump tN）；tN 被选版排除但仍会把 npm next 移到测试构建，演练建议改用 rc.N
-- [macOS release requirement](memory/2026-09-12-macos-support-required.md) -- The 0.2.0 decision, original limitations and native acceptance criteria; see W8 progress for the implementation.
+- [macOS release requirement](memory/2026-09-12-macos-support-required.md) -- The 0.2.0 decision, macOS CI failures block merges and releases (2026-11-26), original limitations and acceptance criteria; see W8 progress.
 - [Darwin exit evidence](memory/darwin-exit-evidence.md) -- How to distinguish a live child, an unreaped zombie and a reused PID without changing the ledger.
 - [install 三平台实测记录](memory/2026-09-11-install-three-platform-e2e.md) — Windows/Ubuntu/WSL 全量+e2e 全绿；挖出 5 个真 bug（unix 编译面×2、平台硬编码测试、库层 IPC 环境泄漏、有实例 swapping 续作状态机拒绝）；WSL TUN 劫持 TLS 的绕法与 e2e 脚本坑集
 - [仅转发模式](memory/2026-09-14-forward-only.md) — forward_only（alpha.12）：放弃重试/缓冲/心跳换真流式直通（可信上游的显式取舍），config.toml + settings.json 分层；分支点/流式/透传与「不得 unwrap」消费点约束 [[forward-only]] [[alias-settings]] [[disconnect-billing-protection]]

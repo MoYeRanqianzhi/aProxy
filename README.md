@@ -14,7 +14,7 @@
 - **完全透传** —— 大音希声，大象无形。路径、查询、请求头原样转发；控制通道走独立命名管道，代理端口只做透传一件事。
 - **format 程序（可选）** —— 化而欲作，吾将镇之以无名之朴。请求、响应、重试的决定与心跳都可以交给外部 format 程序（一行 JSON 一问一答，任何能读写 stdin/stdout 的程序都行），多个程序按配置顺序串成一条链。本体只做编排，转换逻辑全部外置；官方的 `aproxy-format` 开箱即用：OpenAI Chat、OpenAI Responses 与 Anthropic Messages 之间的协议转换（**流式与非流式**），多 key 轮换与冷却，按模型的多渠道路由与故障切换，重试策略，按请求在真流式与无限重试之间选择。程序坏了有熔断：判断类程序被跳过，请求回到无限重试。
 - **守护进程** —— `aproxy start` 后台启动（按拉起规格分离子进程，关终端不掉；密钥只在拉起规格与期望状态记录里，不出现在实例与看护者的进程命令行上）；`status` / `stop` / `logs` / `restore` 全套实例管理。
-- **看门狗** —— 天网恢恢，疏而不失。全局看护进程自动重拉崩溃/挂死的实例（默认开启；实测 +2.4% 体积、+2.9MB 常驻、转发热路径零损耗）。身份按进程 ID + 创建时间核验，与二进制文件名无关。连续重拉失败不放弃：转入每 300 秒一次的慢速重试，直到实例起来或被 `aproxy stop` 删掉期望状态记录；重拉出的实例存活满 60 秒才清空之前的失败计数。每个扫描周期重读 settings，关掉 `watchdog.enabled` 即退出。macOS 暂不支持，见「平台支持」。
+- **看门狗** —— 天网恢恢，疏而不失。全局看护进程自动重拉崩溃/挂死的实例（默认开启；实测 +2.4% 体积、+2.9MB 常驻、转发热路径零损耗）。身份按进程 ID + 创建时间核验，与二进制文件名无关。连续重拉失败不放弃：转入每 300 秒一次的慢速重试，直到实例起来或被 `aproxy stop` 删掉期望状态记录；重拉出的实例存活满 60 秒才清空之前的失败计数。每个扫描周期重读 settings，关掉 `watchdog.enabled` 即退出。
 - **多开** —— 万物并育而不相害。每份 config.toml 一实例，端口各自独立，并存不扰。
 - **自愈** —— 复命曰常，知常曰明。崩溃/断电/系统重启后 `aproxy restore` 一键恢复，空清单静默成功——可配开机自启。实例的期望状态记录（拉起规格：配置文件、覆盖参数、钉住的端口、启动时的代理环境与 PATH、日志路径）只有 `stop` 删除；`restart` 中途失败也留着记录，修好原因后 `restore` 或看门狗可把它拉回。配置文件暂时找不到时记录同样保留。
 
@@ -97,7 +97,7 @@ cargo build --release
 |---|---|
 | Windows（x64 / x86 / arm64） | 全功能 |
 | Linux（x86_64 / aarch64，glibc 与 musl） | 全功能；headless 的 gnu 产物要求 glibc ≥ 2.28，带界面的 gnu 产物要求 glibc ≥ 2.34 与 WebKitGTK ≥ 2.40（glibc 下限由发布流程构建时断言）；更低版本的 glibc 与 musl 系统使用静态链接的 musl 产物（只有 headless） |
-| macOS（Apple Silicon / Intel） | 提供预构建二进制，但未经真机验证；看门狗、`aproxy install` 与依赖进程查询的实例管理用到 Linux 专有接口（`/proc`），在 macOS 上不可用或退化（需真机补齐，欢迎贡献） |
+| macOS（Apple Silicon / Intel） | 全功能；每次提交都在 Apple Silicon 的 macOS 上跑全部测试，看门狗、安装升级与桌面窗口也在上面实测过。Intel 版交叉编译，没有在 Intel Mac 上运行过 |
 
 ## 起手
 
@@ -210,7 +210,7 @@ Codex 的 `stream_idle_timeout_ms` 默认 300000（5 分钟），按 SSE 事件�
 - **主题与扩展**：在设置页可以装主题包（换颜色，可以带样式表、图片与字体）与扩展包（在窗口里运行的 JavaScript，可以加页面与面板、读写实例与配置）。包只从本地装：选一个 .zip 文件，或把 .zip 与解开的目录拖进窗口。扩展不在沙箱里，能做窗口能做的一切，所以安装之前窗口会把适用的风险逐条讲清（闭源、与 GitHub release 的摘要对不上、仓库星数很少、核对不了），每一条都要你确认。拿不准时，先让你的 agent 用随 aProxy 发布的审查 skill（`aproxy-audit-extension`、`aproxy-audit-theme`）审一遍。自己写主题或扩展：见 [docs/extensions.md](docs/extensions.md)（英文）。
 - Windows 需要 Microsoft Edge WebView2 运行时（Windows 11 自带，Windows 10 没有时按提示安装）。从终端运行时命令立即返回，窗口独立运行。
 - Linux 需要图形会话与 WebKitGTK 4.1（2.40 或更新）。带界面的版本动态链接 WebKitGTK，缺这些库时整个程序都起不来（连 `aproxy --version` 也不行），没有图形界面的机器请用无界面的 headless 版本——一键安装脚本与 `aproxy install` 在缺库的机器上会自动装它；musl 构建只有 headless 版本。
-- macOS 的带界面版本只保证编得过，窗口未经真机验证（和整个 macOS 支持一样，见「平台支持」）。
+- macOS 保留系统的红黄绿三个窗口按钮，页面一直延伸到标题栏里。
 - 同一个 home 只开一个窗口，再次运行会提示已经在运行。
 - headless 版本（`aproxy --version` 括号里的第一段是 `headless`）没有界面，运行 `aproxy desktop` 会说明怎样换装带界面的版本（`aproxy install --variant desktop`）。
 

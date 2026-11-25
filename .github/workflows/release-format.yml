@@ -43,15 +43,15 @@ jobs:
     # 防止 format 发布带着 aproxy 的破损中间态）。--workspace 不可省：根目录
     # 是 aproxy 包，不带它时 clippy 与测试只覆盖 aproxy，aproxy-format 与
     # aproxy-envelope 自己的测试一项都不跑（理由见 Cargo.toml [workspace] 注释）。
-    # windows 与 ubuntu 都全绿才进入构建；macOS 已知红、支持未完成，不进门禁。
+    # windows、ubuntu 与 macOS 都全绿才进入构建：三个平台都在支持范围内，任何一个红都挡住发布。
     # 按无界面的 headless 变体验证（--exclude aproxy-desktop --no-default-features）：
     # format 与桌面界面无关，带界面的变体要先构建前端、Linux 上还要 WebKitGTK 开发包，
     # 它由 ci.yml 与主线 release.yml 的门禁负责；本线的构建只编 -p aproxy-format，碰不到它。
     name: test-format (${{ matrix.os }})
     strategy:
-      fail-fast: false # 两个平台各自跑完，一次看到全部失败面
+      fail-fast: false # 各平台各自跑完，一次看到全部失败面
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7.0.1
@@ -62,6 +62,10 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2.9.3
       - run: cargo fmt --all -- --check
+      # 依赖闭包的离线测试（aproxy-ipc）检查全部目标平台的依赖；在 macOS 上本机构建不会下载
+      # Windows 目标的依赖源码，先用 cargo tree 取齐，测试本身保持离线
+      - run: cargo tree --locked -p aproxy-ipc --no-default-features --target all -e normal > /dev/null
+        shell: bash
       - run: cargo clippy --workspace --exclude aproxy-desktop --no-default-features --all-targets --locked -- -D warnings
       # 不带目标过滤的 cargo test 会顺带编译 examples——transform_integration
       # 依赖已编译的 examples/format-echo

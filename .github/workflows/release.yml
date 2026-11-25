@@ -86,17 +86,17 @@ jobs:
           if-no-files-found: error
 
   test:
-    # 发布门槛：与 CI 相同的全量验证（fmt/clippy/测试/--version 冒烟），windows 与 ubuntu、带界面
-    # 与无界面四路都全绿才进入构建。--workspace 覆盖 aproxy-envelope 与 aproxy-format（理由见
+    # 发布门槛：与 CI 相同的全量验证（fmt/clippy/测试/--version 冒烟），windows、ubuntu 与 macOS
+    # 三个平台、带界面与无界面六路都全绿才进入构建：macOS 与另外两个平台一样在支持范围内，它的
+    # 测试红了同样挡住发布。--workspace 覆盖 aproxy-envelope 与 aproxy-format（理由见
     # Cargo.toml [workspace] 注释）；headless 再排除 aproxy-desktop（它是 workspace 成员，
-    # --workspace 会把它当作选中的包编译，--no-default-features 管不到它）。macOS 已知红、支持未
-    # 完成，不进门禁。
+    # --workspace 会把它当作选中的包编译，--no-default-features 管不到它）。
     needs: frontend
     name: test (${{ matrix.os }}, ${{ matrix.variant }})
     strategy:
       fail-fast: false # 各路各自跑完，一次看到全部失败面
       matrix:
-        os: [windows-latest, ubuntu-24.04]
+        os: [windows-latest, ubuntu-24.04, macos-latest]
         variant: [desktop, headless]
         include:
           - variant: desktop
@@ -127,6 +127,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev
       - run: cargo fmt --all -- --check
+      # 依赖闭包的离线测试（aproxy-ipc）检查全部目标平台的依赖；在 macOS 上本机构建不会下载
+      # Windows 目标的依赖源码，先用 cargo tree 取齐，测试本身保持离线
+      - run: cargo tree --locked -p aproxy-ipc --no-default-features --target all -e normal > /dev/null
+        shell: bash
       - run: cargo clippy --workspace ${{ matrix.flags }} --all-targets --locked -- -D warnings
       # 不带目标过滤的 cargo test 会顺带编译 examples——transform_integration
       # 依赖已编译的 examples/format-echo

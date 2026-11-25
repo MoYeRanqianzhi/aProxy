@@ -55,7 +55,7 @@ by keepalive ends with a terminal SSE error event; see Configuration.)
   every 300 s until the instance starts or `aproxy stop` deletes its record,
   and a respawned instance must stay up 60 s before earlier failures are
   forgotten. It re-reads settings every scan, so disabling it stops a running
-  watchdog. Not supported on macOS yet; see Platform support.
+  watchdog.
 - **Multi-instance** — Every config.toml is its own instance, each on its own
   port, coexisting without interference.
 - **Self-healing** — After a crash, power loss, or reboot, `aproxy restore`
@@ -252,7 +252,7 @@ development package (see above).
 |---|---|
 | Windows (x64 / x86 / arm64) | Full support |
 | Linux (x86_64 / aarch64, glibc and musl) | Full support; the headless gnu build requires glibc ≥ 2.28, the desktop gnu build glibc ≥ 2.34 and WebKitGTK ≥ 2.40 (glibc floors asserted at build time in the release pipeline); older glibc and musl systems use the statically linked musl build (headless only) |
-| macOS (Apple Silicon / Intel) | Pre-built binaries are published but untested on real hardware; the watchdog, `aproxy install` and process-query-based instance management rely on a Linux-only interface (`/proc`) and are unavailable or degraded on macOS (needs real hardware; contributions welcome) |
+| macOS (Apple Silicon / Intel) | Full support; every commit runs the whole test suite on Apple Silicon macOS, where the watchdog, installs and upgrades, and the desktop window have also been tried by hand. The Intel build is cross-compiled and has not been run on an Intel Mac |
 
 ## Quick start
 
@@ -418,8 +418,8 @@ may restart instances one at a time.
   even `aproxy --version`); use the headless build on machines without a graphical interface. The
   install script and `aproxy install` pick it on their own when the libraries are missing. musl
   builds come only as headless.
-- On macOS the build with the interface is only guaranteed to compile; the window has not been tried on real
-  hardware (like macOS support as a whole, see Platform support).
+- On macOS the window keeps the system's red, yellow and green buttons, and the page extends into the
+  title bar.
 - One window per home; running it again says it is already open.
 - Headless builds (`headless` as the first word in the parentheses of `aproxy --version`) have no
   window; `aproxy desktop` there explains how to switch to the build with the interface

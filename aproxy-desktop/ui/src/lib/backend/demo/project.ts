@@ -180,7 +180,15 @@ function reportsOf(e: SimEntry): Report[] {
     { type: 'header-edit', name: 'http-referer', op: 'set', label: null },
   ];
   if (!gpt) actions.push({ type: 'header-edit', name: 'x-api-key', op: 'remove', label: null });
-  return [{ format: 'aproxy-format', stage: 'request', summary: `route ${gpt ? 'openai' : 'anthropic'}, key ${e.keyIndex ?? 1}`, actions }];
+  const reports: Report[] = [{ format: 'aproxy-format', stage: 'request', summary: `route ${gpt ? 'openai' : 'anthropic'}, key ${e.keyIndex ?? 1}`, actions }];
+  // Anthropic 客户端的请求经一个转换程序变成 OpenAI Chat 发往上游，回程再转回来：桌面的「协议路径」照这两份报告画出来
+  if (!gpt && e.path.startsWith('/v1/messages?')) {
+    reports.push(
+      { format: 'convert', stage: 'request', summary: 'Selected the protocol conversion', actions: [{ type: 'protocol-convert', from: 'anthropic_messages', to: 'openai_chat', label: null }] },
+      { format: 'convert', stage: e.stream ? 'stream' : 'response', summary: 'Converted the response', actions: [{ type: 'protocol-convert', from: 'openai_chat', to: 'anthropic_messages', label: null }] },
+    );
+  }
+  return reports;
 }
 
 function tryOf(e: SimEntry, a: Attempt, last: boolean): Try {

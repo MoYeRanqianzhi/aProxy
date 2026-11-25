@@ -197,6 +197,75 @@
   function tryLabel(x: Try): string {
     return x.upstreamStatus !== null ? String(x.upstreamStatus) : 'ERR';
   }
+
+  /**
+   * 一组报告里的协议转换，按报告的先后串成一条路径：每一次转换是一段 `from → to`，
+   * 前一段的 `to` 与后一段的 `from` 相同就接上，不同就另起一段（中间断开的地方如实显示，
+   * 不替程序补上它没报告的那一步）。只看 protocol-convert，别的动作与协议无关。
+   *
+   * 这里只陈述 format 程序自己报告的事实：转了几次、最后发出去的与客户端用的是不是同一种协议。
+   * format 是黑箱，绕一圈是不是有意为之、算不算问题，界面判断不了，所以不下结论。
+   */
+  function protocolPath(list: Report[]): Path | null {
+    const steps = list.flatMap((r) =>
+      r.actions.flatMap((a) => (a.type === 'protocol-convert' ? [{ from: a.from, to: a.to }] : [])),
+    );
+    if (!steps.length) return null;
+    const segments: string[][] = [];
+    for (const s of steps) {
+      const last = segments[segments.length - 1];
+      if (last && last[last.length - 1] === s.from) last.push(s.to);
+      else segments.push([s.from, s.to]);
+    }
+    return { segments, converts: steps.length };
+  }
+
+  type Path = { segments: string[][]; converts: number };
+
+  /**
+   * 收到请求时那一轮发往上游的路径。请求级报告里，request 阶段的按链上顺序（客户端一侧在前）追加，
+   * 所以报告的先后就是请求经过的先后
+   */
+  const requestPath = $derived(record ? protocolPath(record.reports.filter((r) => r.stage === 'request')) : null);
+
+  /**
+   * 重试时重跑的那一段：每次尝试自己的 retry 报告。重试只从第一个声明了 retry 的程序重跑，前面的程序
+   * 不再报告，所以这里只是重跑的那一段，不是完整的路径。相邻几次尝试的路径一样时并成一行
+   * （编号必须连着：中间被省略的尝试不知道走了哪条路，不能算进范围里）
+   */
+  const retryPaths = $derived.by(() => {
+    const groups: { first: number; last: number; path: Path; key: string }[] = [];
+    for (const x of tries) {
+      const path = protocolPath(x.reports.filter((r) => r.stage === 'retry'));
+      if (!path) continue;
+      const key = JSON.stringify(path.segments);
+      const prev = groups[groups.length - 1];
+      if (prev && prev.key === key && prev.last + 1 === x.attempt) prev.last = x.attempt;
+      else groups.push({ first: x.attempt, last: x.attempt, path, key });
+    }
+    return groups;
+  });
+
+  /**
+   * 回程：response 与 stream 阶段的报告记在请求级。回程按链的反向调用程序（离上游近的先），
+   * 报告也按这个先后追加，所以同样按报告的先后串起来
+   */
+  const responsePath = $derived(
+    record ? protocolPath(record.reports.filter((r) => r.stage === 'response' || r.stage === 'stream')) : null,
+  );
+
+  /** 路径的事实：转换几次；首尾相接（只有一段）时，再说起点与终点是不是同一种协议；接不上时说有断开 */
+  function pathFacts(p: Path): string {
+    const n = t('d.path.converts', { n: p.converts });
+    if (p.segments.length > 1) return `${n} · ${t('d.path.gap')}`;
+    const seg = p.segments[0];
+    return `${n} · ${t(seg[0] === seg[seg.length - 1] ? 'd.path.same' : 'd.path.differs')}`;
+  }
+
+  /** 读屏用的一句话：箭头与断开处是装饰，读屏读不出来 */
+  function pathText(p: Path): string {
+    return p.segments.map((s) => s.join(' → ')).join(' … ');
+  }
 </script>
 
 {#snippet attemptPicker(current: number | null, set: (n: number) => void, label: string)}
@@ -248,6 +317,23 @@
       </li>
     {/each}
   </ul>
+{/snippet}
+
+{#snippet protocolLine(label: string, p: Path)}
+  <li>
+    <span class="proto-label">{label}</span>
+    <div class="proto-path">
+      <span class="sr-only">{pathText(p)}</span>
+      {#each p.segments as seg, i (i)}
+        {#if i > 0}<span class="proto-gap" aria-hidden="true">⋯</span>{/if}
+        {#each seg as proto, j (j)}
+          {#if j > 0}<span class="proto-arrow" aria-hidden="true"><Icon name="arrowRight" size={13} stroke={2.4} /></span>{/if}
+          <code class="mono proto" aria-hidden="true">{proto}</code>
+        {/each}
+      {/each}
+    </div>
+    <p class="proto-facts">{pathFacts(p)}</p>
+  </li>
 {/snippet}
 
 {#snippet response(n: number | null)}
@@ -475,6 +561,20 @@
         {:else if !anyReports}
           <p class="note">{t('d.format.none')}</p>
         {:else}
+          {#if requestPath || retryPaths.length || responsePath}
+            <h3>{t('d.path.title')}</h3>
+            <ul class="proto-list">
+              {#if requestPath}{@render protocolLine(t('d.path.request'), requestPath)}{/if}
+              {#each retryPaths as g (g.first)}
+                {@render protocolLine(
+                  g.first === g.last ? t('d.path.retry', { n: g.first }) : t('d.path.retries', { a: g.first, b: g.last }),
+                  g.path,
+                )}
+              {/each}
+              {#if responsePath}{@render protocolLine(t('d.path.response'), responsePath)}{/if}
+            </ul>
+            <p class="note"><Icon name="info" size={14} />{t('d.path.note')}</p>
+          {/if}
           {#if record.reports.length}
             <h3>{t('d.format.request')}</h3>
             {@render reportList(record.reports)}
@@ -1116,6 +1216,59 @@
     line-height: 1.35;
     white-space: normal;
     overflow-wrap: anywhere;
+  }
+
+  /* 协议路径：每个方向一行，上面一行小标题，中间是协议名与箭头，下面一行事实。
+     协议名可能是程序自己起的长名字，窄窗口下整条路径在箭头处折行，单个名字在任意处断开 */
+  .proto-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 10px;
+  }
+  .proto-list li {
+    display: grid;
+    gap: 6px;
+    padding: 10px 12px;
+    border-radius: var(--r-md);
+    border: var(--line-w-thin) solid var(--line-soft);
+    background: var(--card-2-bg);
+  }
+  .proto-label {
+    color: var(--text-2);
+    font-size: var(--fs-sm);
+    font-weight: 600;
+  }
+  .proto-path {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+  .proto {
+    min-width: 0;
+    padding: 2px 8px;
+    border-radius: var(--r-pill);
+    background: var(--lilac-soft);
+    color: var(--lilac-deep);
+    font-weight: 600;
+    overflow-wrap: anywhere;
+  }
+  .proto-arrow {
+    display: inline-flex;
+    color: var(--text-3);
+  }
+  .proto-gap {
+    color: var(--text-3);
+    font-weight: 700;
+    letter-spacing: 0.1em;
+  }
+  .proto-facts {
+    margin: 0;
+    color: var(--text-3);
+    font-size: var(--fs-sm);
   }
 
   /* format 的报告摘要：来自 format 程序的文字，只当纯文本显示 */

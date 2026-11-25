@@ -166,7 +166,9 @@ its launcher suggests `@meowo/aproxy-headless` instead.
 
 Upgrades: `aproxy install` replaces the binary and rolling-restarts running
 instances one by one without client-visible downtime (`--from <path>` installs
-a local binary, `--adopt` takes over an existing install).
+a local binary, `--adopt` takes over a copy installed elsewhere: it moves it into
+`<home>/bin`, adds that to your `PATH` and, for the desktop build, adds an app menu
+entry that opens the window; `--no-path` and `--no-shortcut` skip those two steps).
 - **Update channel**: the default `latest` picks the highest version inside a
   channel. If the current version is a stable release only stable releases are
   considered (you are never carried onto a pre-release); if it is a

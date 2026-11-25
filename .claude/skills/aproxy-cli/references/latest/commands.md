@@ -881,7 +881,7 @@ from its description.
 aproxy install [latest|VERSION] [--pre] [--allow-downgrade] [--cpu x86-64-v3|baseline]
                [--variant desktop|headless] [--download-proxy URL] [--no-skills] [--json]
 aproxy install --from PATH [--variant desktop|headless] [--no-skills] [--download-proxy URL] [--json]
-aproxy install --adopt [--no-skills] [--json]
+aproxy install --adopt [--no-path] [--no-shortcut] [--no-skills] [--json]
 aproxy install --check [--pre] [--variant desktop|headless] [--download-proxy URL] [--json]
 aproxy install [latest|VERSION] --skills-only [--pre] [--download-proxy URL]
 aproxy install --abort
@@ -894,8 +894,10 @@ aproxy install --force --from PATH [--variant desktop|headless] [--yes]
 `<home>/install/staging/`, checks that it runs and reports the expected version, swaps it into
 `<home>/bin/`, restarts running instances one at a time on the new binary, verifies that each
 reports the new version, and cleans up; each instance is restarted once, one at a time. How the
-swap and rollback work: behaviors.md, "Upgrades with aproxy install". `install` does not edit `PATH`; check that `aproxy` resolves
-to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running another copy.
+swap and rollback work: behaviors.md, "Upgrades with aproxy install". Only `--adopt` (and the install
+scripts' first install, which runs the same step) edits `PATH`; after any other install check that
+`aproxy` resolves to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running another
+copy.
 `--force` replaces the binary another way, for when this one fails: see
 [Force install](#force-install).
 
@@ -908,7 +910,9 @@ to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running anot
 | `--download-proxy URL` | proxy for downloads only; default `update.download_proxy` in settings.json (not read by `--force`), then the environment's proxy settings. Unrelated to config.toml's `proxy` |
 | `--no-skills` | skip the skill update this time (permanently: `update.skill_auto_update` in settings.json). Not with `--force`, which never updates skills |
 | `--from PATH` | install a local binary; its `--version` output decides the version, with no downgrade check (below 0.2.0 is still refused) |
-| `--adopt` | copy the binary you are running into `<home>/bin/` and move running instances onto it |
+| `--adopt` | copy the binary you are running into `<home>/bin/`, move running instances onto it, then add `<home>/bin` to the user's `PATH` and, for the desktop build, an app menu entry that opens the window ([What --adopt sets up](#what---adopt-sets-up)) |
+| `--no-path` | with `--adopt`: leave `PATH` alone |
+| `--no-shortcut` | with `--adopt`: create no app menu entry |
 | `--skills-only` | update only the skill documents, to VERSION or, by default, the channel's latest version (the running version if the channel is empty) |
 | `--abort` | cancel an install that has not reached the swap |
 | `--check` | only report which version `install` would install, and whether it is newer than the running one; downloads nothing and changes nothing ("Checking for an update" below). Combines only with `--pre`, `--variant`, `--download-proxy` and `--json` |
@@ -1101,6 +1105,35 @@ binary, as the end of the next section describes.
 Do not replace the binary by hand with `stop all` followed by `restore`: a graceful stop deletes the
 desired-state records, so `restore` finds nothing to start. Force install keeps those records and
 runs `restore` itself.
+
+### What --adopt sets up
+
+`aproxy install --adopt` is the way to bring a copy installed elsewhere (npm, cargo, a package
+manager, a manual download) under the home's management. After the binary is in place it makes
+`aproxy` reachable and, for the desktop build, adds an entry that opens the window. Both steps are
+per user, need no admin rights, and are idempotent: running adopt again changes nothing that is
+already right. The install scripts run the same step at the end of a first install (skip `PATH` with
+`--no-path` or `APROXY_NO_PATH=1` for install.sh, `-NoPath` or `APROXY_NO_PATH=1` for install.ps1).
+
+| | `PATH` (skip with `--no-path`) | App menu entry (skip with `--no-shortcut`; desktop build only) |
+|---|---|---|
+| Windows | appends `<home>\bin` to the user's `Path` in `HKCU\Environment` (keeps `%VAR%` entries and the value type) and tells Explorer, so new terminals see it | Start menu shortcut `aProxy.lnk` running `<home>\bin\aproxy.exe desktop --installed-home`. On Windows 11 24H2 and later it opens no console window; older Windows shows one briefly |
+| macOS | writes `<home>/env` and adds `. <home>/env # aProxy` to `~/.profile`, to `~/.bashrc` / `~/.bash_profile` when they exist, to `~/.zshenv`, and a `~/.config/fish/conf.d/aproxy.fish` when fish is installed | `~/Applications/aProxy.app`, whose executable links to `<home>/bin/aproxy`, so it keeps working after `aproxy install` replaces the binary |
+| Linux | the same profile lines as macOS (`~/.zshenv` when zsh is the login shell or `~/.zshrc` exists) | `~/.local/share/applications/aproxy.desktop` (under `XDG_DATA_HOME` when set) and icons under `icons/hicolor/` |
+
+When `<home>/bin` is already on `PATH` nothing is written. Terminals that are already open keep their
+old `PATH`; open a new one. An entry always opens the home it was made for: for a home other than the
+default, its name carries a short id (`aProxy-<id>`), so entries for several homes can coexist.
+
+The binary install is the result that counts: a `PATH` or entry step that fails prints a warning with
+the cause and the manual way, and does not change adopt's exit code. With `--json` the final event has
+`integration.path` and `integration.shortcut`, each with `status` (`changed`, `unchanged`, `skipped`
+or `failed`), `reason` and `touched` (the files or registry value written).
+
+There is no uninstall command yet. To undo by hand: remove `<home>\bin` from the user's `Path`
+(Windows: Settings, "Edit environment variables for your account") or the lines ending in `# aProxy`
+from the profile files and `<home>/env`; delete the shortcut, the `.app` or the `.desktop` file and its
+icons.
 
 ### Force install
 

@@ -49,10 +49,11 @@ curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/
 - 已安装则不覆盖，升级走 `aproxy install`；sh 脚本需要 `sha256sum`、`shasum` 或 `openssl` 之一做 SHA256 校验。
 - Linux：glibc 过低或 musl 系统自动改用静态链接的 musl 产物；落位前先 `--version` 自检，gnu 产物在本机跑不起来会自动改拉 musl。
 - **两个变体**：每个平台都有带桌面界面的 desktop（`aproxy desktop` 打开窗口）与无界面的 headless 两个版本，代理与命令行完全相同；musl 只有 headless。Windows 与 macOS 装 desktop。Linux 上带界面的版本动态链接 GTK 与 WebKitGTK，缺库或库太旧时连 `--version` 都起不来，所以 sh 脚本先看本机：musl、glibc 低于 2.34、找不到 WebKitGTK 4.1（Debian/Ubuntu 的 `libwebkit2gtk-4.1-0`）的装 headless 并说明原因，带界面的版本下载后自检跑不起来（例如 WebKitGTK 低于 2.40）也改装 headless。要指定变体：sh 脚本加 `--variant desktop|headless`（或设 `APROXY_VARIANT`）；装好之后换变体用 `aproxy install --variant desktop`（或 `headless`）。
-- `irm | iex` 无法传参，PowerShell 脚本可用环境变量代替：`APROXY_PRE`、`APROXY_NO_SKILLS`、`APROXY_DL_PROXY`（下载代理，与上游请求代理无关）。
+- 首次安装最后把 `<home>/bin` 加进当前用户的 PATH，带界面的版本再建一个打开窗口的入口（Windows 开始菜单、macOS 的「应用程序」、Linux 的应用菜单）；不想改 PATH：sh 脚本加 `--no-path`，PowerShell 脚本加 `-NoPath`，或设 `APROXY_NO_PATH=1`。
+- `irm | iex` 无法传参，PowerShell 脚本可用环境变量代替：`APROXY_PRE`、`APROXY_NO_SKILLS`、`APROXY_DL_PROXY`（下载代理，与上游请求代理无关）、`APROXY_NO_PATH`。
 - Windows PowerShell 5.1 用 `-File` 本地运行 `install.ps1` 会解析失败（文件为 UTF-8 无 BOM）；请用上面的 `irm | iex`，或 `pwsh -File`。
 
-其他渠道（装好后可用 `aproxy install --adopt` 收编到标准位置）：
+其他渠道（装好后用 `aproxy install --adopt` 收编到标准位置：复制进 `<home>/bin`、加 PATH、建窗口入口，`--no-path` 与 `--no-shortcut` 分别跳过后两步）：
 
 ```sh
 npm install -g @meowo/aproxy@next            # 带桌面界面，按平台自动选二进制

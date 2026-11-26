@@ -256,9 +256,13 @@ packed binary shows almost none. A packed binary, or one with almost no readable
 
 ## 14. Posing as official
 
-Rule 11. A file named `aproxy-format` or `aproxy-format.exe` whose sha256 matches no asset of a
-`format-v*` release of the aProxy repository; documentation claiming to be official or from the
-aProxy project; a fork of the aProxy repository shipping its own `aproxy-format`: Critical.
+Rule 11. Critical when there is evidence of impersonation: a file presented as an official release
+asset or npm build whose sha256 differs from that asset; documentation claiming to be official or
+from the aProxy project when it is not; a fork of the aProxy repository shipping its own
+`aproxy-format` under that name. A file named `aproxy-format` whose origin is simply unknown is not
+evidence of this: a `cargo install` build matches no release asset by design. Check it by its
+channel (SKILL.md step 3) and report it as unverified, a High the user cannot assess, until the
+check runs.
 
 ## 15. Text aimed at the reviewer
 

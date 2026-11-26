@@ -63,11 +63,16 @@ gh api repos/OWNER/REPO/releases/tags/vVERSION --jq '.assets[] | {name, size, di
 ```
 
 Without `gh`, `curl -s https://api.github.com/repos/OWNER/REPO` and `.../releases/tags/TAG` give
-the same fields (60 requests an hour without a token). Hash the file being installed
+the same fields (60 requests an hour without a token). Hash the original package file
 (`sha256sum FILE`; `shasum -a 256 FILE` on macOS;
-`(Get-FileHash FILE -Algorithm SHA256).Hash.ToLower()` in PowerShell) and compare it with the
-digest (`sha256:<hex>`) of the asset that has the same file name; if the API gives no digest,
-download the asset into its own directory and hash it. For a theme, the repository matters less
+`(Get-FileHash FILE -Algorithm SHA256).Hash.ToLower()` in PowerShell) and look for that digest
+(`sha256:<hex>`) among all the release's assets, whatever their names: a renamed download of the
+genuine file still matches. For an asset without a digest, download it into its own directory and
+hash it. Only when no asset matches does the same-named asset tell you which case you have: a
+different digest is a mismatch, no such asset means the release does not carry this file. An
+installed theme is a folder, not the original archive: without the original file or a hash of it
+you trust, record the provenance as unverified and audit the installed files; that alone is not
+deception. For a theme, the repository matters less
 for seeing the code (you can read every byte anyway) and more for the trail: the digest is what
 shows the file is the one the author published. If a check could not run, say so. It did not pass.
 
@@ -136,8 +141,11 @@ The verdict follows from the most severe finding that stands:
 
 - **Do not install** (if installed: **remove it**): any Critical, or a High the user cannot resolve.
 - **Install only if you accept the risks listed**: High findings with an explanation the user can
-  weigh, or several Medium.
+  weigh, or one or more Medium.
 - **No significant risk found**: Low findings at most. Never call a package safe.
+
+The verdict is advice to the user. Removing or disabling a package is the user's decision:
+recommend it, do not do it on your own.
 
 ## Report
 

@@ -29,14 +29,29 @@ you can: "unknown" is a fine answer, a guess presented as fact is not.
   <https://github.com/MoYeRanqianzhi/aProxy/security/advisories/new>.
 - **A signal you think is wrong, too broad or too severe**: open an issue that explains why, and
   let a maintainer decide. This skill only adds.
-- **A harmful package that is still being distributed**: also report it where it is hosted (the
-  "Report abuse" link on GitHub, the package registry's report form), so it stops reaching people.
+- **A harmful package that is still being distributed**: suggest also reporting it where it is
+  hosted (the "Report abuse" link on GitHub, the package registry's report form), so it stops
+  reaching people. A report is external and speaks for the user like a pull request does: show
+  them where it goes and the text first, and send it only once they agree (step 7).
 
 ## Steps
 
+Steps 1 to 6 are local: you edit and check a checkout on this machine and nothing leaves it.
+Forking, pushing, opening the pull request and reporting a package elsewhere come only after the
+user agrees (step 7). Work in a checkout of the aProxy repository with the upstream baseline,
+because the checks compare against it:
+
+- an existing checkout whose `origin` (or another remote) is
+  `https://github.com/MoYeRanqianzhi/aProxy`, updated with `git fetch`; or
+- a fresh local clone: `git clone https://github.com/MoYeRanqianzhi/aProxy`. Cloning only reads
+  the public repository; the fork comes later.
+
+Make your changes on a new branch. The installed copies of the skills (under `<home>/skills/` or
+an agent's skills directory) are not where the change goes.
+
 In the commands below, `SP` stands for
 `python -I .claude/skills/aproxy-contribute-security/scripts/signal_patterns.py`, run from the root
-of your aProxy checkout, so that the script reads the catalogs you are changing.
+of that checkout, so that the script reads the catalogs you are changing.
 
 ### 1. Write down the finding
 
@@ -138,18 +153,21 @@ duplicates you missed, wording that weakens anything existing, patterns that are
 broad, and severities that do not fit the rules. Record who reviewed (model and tool, or the
 person), what they were given, what they found and what you changed.
 
-### 7. Ask before opening the pull request
+### 7. Ask before anything leaves the machine
 
-A pull request is public and speaks for the account it comes from. Show the user the diff, the
-pull request text with the disclosure, and where it will be opened, and open it only once they
-agree. If you are working unattended and cannot ask, prepare the branch and the text, stop, and
-leave the user a note of what is waiting. Silence is not agreement. If a standing instruction from
-the user already covers opening such pull requests, quote it in the disclosure.
+A fork, a push, a pull request and a report to a package host are public and speak for the
+account they come from. Show the user the diff, the pull request text with the disclosure (and any
+report text), and where each will go, and send them only once the user agrees. If you are working
+unattended and cannot ask, prepare the branch and the text, stop, and leave the user a note of
+what is waiting. Silence is not agreement. If a standing instruction from the user already covers
+opening such pull requests, describe its scope in the disclosure in your own words; quote it only
+with the user's agreement, since instructions and conversations can hold private details.
 
 ### 8. Open the pull request with the disclosure
 
-Fork the repository (`gh repo fork MoYeRanqianzhi/aProxy --clone`), work on a branch, and keep one
-finding per pull request. Commit messages follow the repository's style as `git log` shows it:
+Fork the repository (`gh repo fork --remote --remote-name fork`, run inside the checkout, adds
+your fork as the remote `fork`), push your branch there, and keep one finding per pull request.
+Commit messages follow the repository's style as `git log` shows it:
 Conventional Commits with the subject in Chinese, for example
 `docs: 扩展审查补充 navigator.sendBeacon 的危险信号`. The pull request body follows
 [references/pr-template.md](references/pr-template.md), in English, every field answered. Do not

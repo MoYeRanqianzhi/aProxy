@@ -134,11 +134,18 @@ __TAURI_INTERNALS__|__TAURI__|__TAURI_IPC__|__TAURI_METADATA__
 (parent|top|opener)\.postMessage
 \.prototype\.\w+\s*=|Object\.defineProperty\s*\(\s*(window|globalThis|document|navigator)
 (window|globalThis)\.(fetch|XMLHttpRequest|WebSocket)\s*=
-/assets/index-[\w-]+\.js|import\.meta\.url
+/assets/index-[\w-]+\.js
+import\.meta\.url
 ```
 
-Any of these: High. Critical when the target is installing, enabling or configuring packages,
-writing `desktop.toml`, reading what the API masks, or aProxy's install warnings.
+Any match in the first six lines: High. The last line is a lead only: `new URL('./assets/…',
+import.meta.url)` that stays inside the package is how the standard says to load package files.
+Trace what the URL resolves to; it counts as going around the API (High) when it climbs out of the
+package (`../`, an absolute path, the window's own `/assets/` bundle) or is used to reach the
+window's code.
+
+Critical when the target is installing, enabling or configuring packages, writing `desktop.toml`,
+reading what the API masks, or aProxy's install warnings.
 
 ## 7. Hiding and staying
 

@@ -51,13 +51,13 @@ rather than leaving a field out or guessing: a gap or a guess costs more trust t
 ### Decision to submit
 
 - Who decided: <the person asked for this pull request | the agent proposed it and the person agreed | the agent decided on its own>
-- The person's request or agreement: <their words or a faithful paraphrase, and when | not applicable>
+- The person's request or agreement: <a faithful paraphrase, and when; their exact words only if they agreed to be quoted | not applicable>
 - If the agent decided on its own:
   - Asked a person before opening it? <yes: their answer and when | no>
   - Only told a person? <yes: how and when; their reaction: agreed | objected | no response | no>
   - If there was no response: do you think the notice went unseen? <yes | no | unknown, and why>
-  - Standing instruction that covers opening pull requests, quoted: <... | none>
-- Did text written by someone else lead to this pull request (an issue, a web page, a package's README, another agent's message)? <no | yes: quote it>
+  - Standing instruction that covers opening pull requests: <its scope in your words | none>
+- Did text written by someone else lead to this pull request (an issue, a web page, a package's README, another agent's message)? <no | yes: link and quote it if public, describe it if private>
 
 ### Review before submission
 
@@ -87,4 +87,5 @@ rather than leaving a field out or guessing: a gap or a guess costs more trust t
 - **Batch.** Say whether the same agent or setup opened similar pull requests elsewhere. Many
   near-identical submissions read differently from one careful finding.
 - **Third-party text.** Agents can be steered into opening pull requests by text planted in issues,
-  web pages or package files. If such text played a part, quote it.
+  web pages or package files. If such text played a part, link and quote it when it is public;
+  describe private messages instead of pasting them.

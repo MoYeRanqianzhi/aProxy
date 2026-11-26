@@ -1,19 +1,26 @@
 ---
 name: aproxy-audit-extension
-description: Audit an aProxy desktop extension (a JavaScript package the aProxy window runs) for security risks and conformance to the aProxy package and data standard, with a risk verdict backed by evidence. Covers provenance (open or closed source, GitHub reputation, release digest), what the code reads, sends and changes (instance config, instances, updates, format programs), code loaded at run time, obfuscation, data kept outside the extension's own storage, keylogging, fake dialogs, tampering with install warnings and calls that go around the extension API. Use whenever someone asks whether an aProxy extension or plugin is safe, trustworthy or compliant - a package file, a GitHub repository or one installed under <home>/desktop/extensions - before installing it, after an install warning (closed source, hash mismatch, few stars, GitHub unreachable), or when an author checks their own extension before publishing. Themes: aproxy-audit-theme; format programs: aproxy-audit-format.
+description: Audit an aProxy desktop extension (a JavaScript package the aProxy window runs) for security risks and conformance to the aProxy package and data standard, with a risk verdict backed by evidence. Covers provenance (open or closed source, GitHub reputation, release digest), what the code reads, sends and changes (instance config, instances, updates, format programs), code loaded at run time, obfuscation, data kept outside the extension's own storage, keylogging, fake dialogs, tampering with install warnings and calls that go around the extension API. Use whenever someone asks whether an aProxy desktop extension or plugin (JavaScript run by the window) is safe, trustworthy or compliant - a package file, a GitHub repository or one installed under <home>/desktop/extensions - before installing it, after an install warning (closed source, hash mismatch, few stars, GitHub unreachable), or when an author checks their own extension before publishing. Themes: aproxy-audit-theme; format programs: aproxy-audit-format.
 ---
 
 # Audit an aProxy extension
 
 An extension is a JavaScript module that the aProxy desktop window runs in its own page, with no
-sandbox. Through the extension API it can read request records, bodies included (credentials in
-them are masked); change an instance's configuration, including the upstream URL, which alone is
-enough to send the user's prompts and API keys to another server; start and stop instances;
-install updates; and call the control methods of format programs, which run natively. Outside the
-API it can reach any host on the network and call the window's internal commands directly.
-aProxy restricts none of this. Its only defense is a set of warnings shown before installation,
-and once a harmful extension is installed the damage is done. A review before installing is what
-protects the user; a review afterwards tells them whether to remove it.
+sandbox. Through the extension API it can:
+
+- read request records, bodies included. Headers whose names look like credentials are masked and
+  the secrets named in the instance's config (API key, proxy password, credential headers, format
+  `env` values and key arguments) are replaced; any other private text in a request or response
+  reaches the extension as it is;
+- change an instance's configuration, including the upstream URL, which alone is enough to send
+  the user's prompts and API keys to another server;
+- start and stop instances and install updates;
+- call the control methods of format programs, which run natively.
+
+Outside the API it can reach any host on the network and call the window's internal commands
+directly. aProxy restricts none of this. Its only defense is a set of warnings shown before
+installation, and once a harmful extension is installed the damage is done. A review before
+installing is what protects the user; a review afterwards tells them whether to remove it.
 
 Collect evidence, judge it with the rules below, and give a verdict the user can act on. A review
 lowers risk; it never proves code safe. Say what you checked and what you could not.
@@ -65,11 +72,16 @@ gh api repos/OWNER/REPO/releases/tags/vVERSION --jq '.assets[] | {name, size, di
 ```
 
 Without `gh`, `curl -s https://api.github.com/repos/OWNER/REPO` and
-`.../releases/tags/TAG` give the same fields (60 requests an hour without a token). Hash the file
-being installed (`sha256sum FILE`; `shasum -a 256 FILE` on macOS;
-`(Get-FileHash FILE -Algorithm SHA256).Hash.ToLower()` in PowerShell) and compare it with the
-digest (`sha256:<hex>`) of the asset that has the same file name. If the API gives no digest,
-download the asset into its own directory and hash it. When the project publishes build
+`.../releases/tags/TAG` give the same fields (60 requests an hour without a token). Hash the
+original package file (`sha256sum FILE`; `shasum -a 256 FILE` on macOS;
+`(Get-FileHash FILE -Algorithm SHA256).Hash.ToLower()` in PowerShell) and look for that digest
+(`sha256:<hex>`) among all the release's assets, whatever their names: a renamed download of the
+genuine file still matches. For an asset without a digest, download it into its own directory and
+hash it. Only when no asset matches does the same-named asset tell you which case you have: a
+different digest is a mismatch, no such asset means the release does not carry this file. An
+installed extension is a folder, not the original archive: without the original file or a hash
+of it you trust, record the provenance as unverified and audit the installed files; that alone is
+not deception. When the project publishes build
 attestations, `gh attestation verify FILE --repo OWNER/REPO` shows that GitHub Actions built the
 file from a commit of that repository.
 
@@ -169,8 +181,11 @@ The verdict follows from the most severe finding that stands:
 
 - **Do not install** (if installed: **remove it**): any Critical, or a High the user cannot resolve.
 - **Install only if you accept the risks listed**: High findings with an explanation the user can
-  weigh, or several Medium.
+  weigh, or one or more Medium.
 - **No significant risk found**: Low findings at most. Never call a package safe.
+
+The verdict is advice to the user. Removing or disabling a package is the user's decision:
+recommend it, do not do it on your own.
 
 ## Report
 

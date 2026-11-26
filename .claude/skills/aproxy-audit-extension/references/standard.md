@@ -109,7 +109,8 @@ Each of these is a finding; SKILL.md's rules say how severe:
 
 ## Releases
 
-A release on GitHub is tagged `v<version>` or `<version>` and carries the package file as an
-asset. aProxy compares the sha256 of the file being installed with the digest of the asset that
-has the same file name, and warns when they differ or the asset is missing; you can do the same
+A release on GitHub is tagged `v<version>` or `<version>` and carries the package file as an asset.
+Before installing a file, aProxy looks for its sha256 among the digests of all the release's
+assets. With no match it warns: of a mismatch when an asset of the same file name has a different
+digest, otherwise that the release lacks the file or gives no digests; you can do the same
 (SKILL.md, step 3).

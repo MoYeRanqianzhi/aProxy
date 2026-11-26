@@ -1,6 +1,6 @@
 ---
 name: aproxy-audit-format
-description: Audit a format program for aProxy - the script or binary a [[format]] entry in config.toml starts and hands requests to - for security risks and conformance to format protocol 1 and aProxy's data standard, with a risk verdict backed by evidence. Covers open versus closed source (closed binaries are black boxes), release digests and attestations, network access, child processes, files and environment variables it reads, where it sends requests, rewriting of prompts, tool calls and model output, the stages and body access it asks for, credentials in state, reports or logs, data outside its data directory, control methods that hand out native powers, and programs posing as the official aproxy-format. Use whenever someone asks whether a third-party format, transform or plugin for aProxy, or an aproxy-format binary, is safe, trustworthy or compliant, before adding it to config.toml or after, or when an author checks their own format before publishing. To write or configure a format, use aproxy-format.
+description: Audit a format program for aProxy - the script or binary a [[format]] entry in config.toml starts and hands requests to - for security risks and conformance to format protocol 1 and aProxy's data standard, with a risk verdict backed by evidence. Covers open versus closed source, release digests and attestations, network access, child processes, files and environment variables it reads, where it sends requests, rewriting of prompts, tool calls and model output, the stages and body access it asks for, credentials in state, reports or logs, data outside its data directory, control methods that hand out native powers, and programs posing as the official aproxy-format. Use whenever someone asks whether a third-party format program (a transform or plugin a [[format]] entry starts) or an aproxy-format binary is safe, trustworthy or compliant, before adding it to config.toml or after, or when an author checks their own format before publishing. To write or configure a format, use aproxy-format.
 ---
 
 # Audit an aProxy format program
@@ -48,10 +48,23 @@ lowers risk; it never proves code safe. Say what you checked and what you could 
 ### 1. Find the program
 
 - **The entry**: in the user's config.toml, note `command`, `args`, the names (not the values) in
-  `env`, `process`, `stages` and `required`. A bare `command` is looked up in `<home>/bin/` first,
-  then on `PATH`. Resolve it as the system would (`Get-Command NAME` or `where NAME` on Windows,
-  `command -v NAME` elsewhere) and check that nothing earlier on `PATH` shadows the intended file.
-  Note every file `args` names: scripts, role and configuration files.
+  `env`, `process`, `stages` and `required`. Note every file `args` names: scripts, role and
+  configuration files.
+- **The file aProxy starts**: find it the way aProxy does, not the way your own shell would, or
+  you may hash and read a different file. The home is `APROXY_HOME` of the instance, or
+  `~/.aproxy`. A leading `~` in `command` is the user's home directory; any other path with a
+  directory part is resolved against the home, not the current directory. A bare name is looked up
+  in `<home>/bin/` first, then in each directory of the `PATH` in the entry's `env`, or, when `env`
+  sets none, of the `PATH` captured when the instance was started (it is in the instance's
+  `<home>/run/<port>.restore.json`; the same record holds any key passed with `--api-key`, so read
+  only `PATH`). On Windows a bare name without an extension means `NAME.exe`; on Unix a match
+  without execute permission is skipped. The worker's working directory is the home, so relative
+  paths in `args` resolve there too. A tool such as `Get-Command NAME`, `where NAME` or `command -v
+  NAME` follows the reviewing shell's `PATH` and rules; use it only to search the directories
+  above, and treat an earlier match there as shadowing the intended file. If you cannot establish
+  the instance's home or `PATH` (a `--foreground` instance keeps no record, a launcher may change
+  the environment), say that the audit covers a candidate file, not necessarily the one aProxy
+  runs.
 - **The program**: its repository, the release it came from, or the file on disk.
 
 ### 2. Classify it
@@ -79,10 +92,26 @@ release asset's `digest`. For a binary also check:
 - the code signature: `Get-AuthenticodeSignature FILE` on Windows, `codesign -dv --verbose=4 FILE`
   on macOS.
 
-A program called `aproxy-format` is the official one only if its bytes match an asset of a
-`format-v<version>` release of the aProxy repository
-(<https://github.com/MoYeRanqianzhi/aProxy/releases>, assets `aproxy-format-<target>[-v3][.exe]`,
-each with a `.sha256` file beside it). If a check could not run, say so. It did not pass.
+A program called `aproxy-format` comes officially through three channels, and each is checked
+its own way, so ask the user how it was installed before judging it:
+
+- **GitHub release**: its bytes match an asset of a `format-v<version>` release of the aProxy
+  repository (<https://github.com/MoYeRanqianzhi/aProxy/releases>, assets
+  `aproxy-format-<target>[-v3][.exe]`, each with a `.sha256` file beside it). Compare by hash
+  against every asset of the release, not only the one with the same file name.
+- **npm** (`@meowo/aproxy-format`): the launcher runs a binary from a platform package
+  (`@meowo/aproxy-format-<platform>`), packed from the same release run's builds. Hash that binary
+  and compare it with the assets of the matching `format-v<version>` release.
+- **crates.io** (`cargo install aproxy-format --locked`): a local build that matches no release
+  asset by design. `cargo install --list` shows where it came from: a crates.io
+  install prints only `aproxy-format v<version>:`, while a git or path install adds the URL or path
+  in parentheses. Check that the version has a matching `format-v<version>` tag.
+
+Keep three outcomes apart: **unverified** (the channel's check could not run or the user does not
+know how it was installed: a High risk the user cannot assess, not proof of anything), a
+**confirmed mismatch** (the file claims to be a specific release asset or npm build and its hash
+differs: Critical), and **evidenced impersonation** (signals.md section 14). If a check could not
+run, say so. It did not pass.
 
 ### 4. Check it against the standard
 
@@ -188,8 +217,11 @@ The verdict follows from the most severe finding that stands:
 - **Do not use** (if configured: **remove the entry**): any Critical, or a High the user cannot
   resolve.
 - **Use only if you accept the risks listed**: High findings with an explanation the user can
-  weigh, a black box the user chooses to trust, or several Medium.
+  weigh, a black box the user chooses to trust, or one or more Medium.
 - **No significant risk found**: Low findings at most. Never call a program safe.
+
+The verdict is advice to the user. Removing an entry, deleting a file or stopping an instance is
+the user's decision: recommend it, do not do it on your own.
 
 ## Report
 

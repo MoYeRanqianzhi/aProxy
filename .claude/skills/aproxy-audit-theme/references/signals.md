@@ -48,13 +48,40 @@ Rule 5. An image ends where its format says:
 | JPEG | `FF D9` |
 | GIF | `3B` |
 
-Anything after that, or a second format's signature inside the file (`PK\x03\x04`, `MZ`, `<script`),
-is a polyglot: Critical. A quick count of trailing bytes after a PNG's end, run from outside the
-package directory:
+Find that end by walking the format's structure, not by searching for the marker bytes: `IEND`
+or `FF D9` can occur inside compressed data, text chunks or an embedded thumbnail. For a PNG, walk
+the chunks from outside the package directory:
 
 ```sh
-python -I -c "import sys; d=open(sys.argv[1],'rb').read(); i=d.rfind(b'IEND'); print('trailing bytes:', len(d)-(i+8) if i>=0 else 'no IEND chunk')" FILE.png
+python -I -c '
+import sys, struct
+d = open(sys.argv[1], "rb").read()
+if d[:8] != b"\x89PNG\r\n\x1a\n": sys.exit("not a PNG")
+i, types = 8, []
+while i + 8 <= len(d):
+    n, t = struct.unpack(">I4s", d[i:i + 8])
+    types.append(t.decode("latin-1"))
+    i += 12 + n
+    if t == b"IEND":
+        print("chunks:", " ".join(types))
+        print("trailing bytes after IEND:", len(d) - i)
+        break
+else:
+    print("no IEND chunk: truncated, or data that is not a chunk sequence")
+' FILE.png
 ```
+
+Chunk types beyond the usual `IHDR`, `PLTE`, `IDAT`, `IEND` and the common ancillary ones (`tEXt`,
+`zTXt`, `iTXt`, `gAMA`, `sRGB`, `pHYs`, `iCCP`, `tIME`, `bKGD`, `cHRM`, `eXIf`) carry data worth
+opening.
+
+Trailing bytes, an unusual chunk, or a second format's signature inside the file (`PK\x03\x04`,
+`MZ`, `<script`) are leads, not a verdict: two letters such as `MZ` turn up in ordinary data.
+Extract the extra bytes into their own directory and find out whether they make a second valid
+file: a ZIP whose end-of-central-directory record is present, a PE header that `MZ` points to
+through a valid `PE\0\0` offset, readable script. A second valid file, or code in the package
+that reads the extra bytes, is a polyglot: Critical. Extra data that is neither: Medium, since a
+theme has no reason to carry it; say what you found and that its purpose is unknown.
 
 Also check the dimensions a PNG declares (bytes 16 to 23, width then height, big-endian): a small
 file that claims tens of thousands of pixels per side is a decompression bomb (rule 10).

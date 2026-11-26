@@ -34,13 +34,20 @@ closest to its job:
 |---|---|---|---|
 | choose or rotate keys | keys | `request`, `retry` | `none`; `full` only for sticky selection by conversation |
 | route by model, fail over between channels | route | `request`, `retry`; `response` with model aliases | `full` |
-| convert between protocols | convert | `request`, `retry`, `response`, `stream` | `full` |
+| convert between protocols | convert | `request`, `retry`, and `response` or `stream` (one entry cannot declare both) | `full` |
 | decide whether to retry | policy | `decide` | `none` |
 | learn which requests can be forwarded | adaptive | `request`, `decide`, `notify` | `digest` for `request` and `notify`, `none` for `decide` |
 | rewrite models, headers or fields | rewrite | `request`, `retry` | `none` for headers only, `full` for body fields |
 | style keep-alive beats | heartbeat | `heartbeat` | (no request body) |
 
-`request_body` is a privacy contract: a program that only votes never sees the conversation.
+`request_body` is a privacy contract for the request body only. Assess the two directions apart:
+
+- **Request**: `none` withholds the body, `digest` gives only its SHA-256, `full` gives the whole
+  conversation. A program that only votes (`decide`) and asks for `full` is asking for more than
+  voting needs: treat it as an expansion of access, not ordinary voting.
+- **Response**: `decide` receives the upstream response whatever `request_body` says, body
+  included (decoded and capped at 1 MiB, on success too), so a judge reads the model's answers.
+  `response` and `stream` entries see the replies they handle as well.
 
 ## Protocol promises about data
 

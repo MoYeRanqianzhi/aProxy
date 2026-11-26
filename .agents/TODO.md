@@ -77,6 +77,9 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   设计见 [plan/plugins.md](plan/plugins.md)「指定来由与备注」。
   进度（2026-11-26）：CLI、实例记录、日志、`status` 已合入 main；skill、README、CHANGELOG 已写。剩桌面实例页：
   Rust 侧把来由与备注带到实例卡片（t19b，Codex 在做），界面与演示数据已在主工作区改好未提交，等 t19b 一起合入。
+- [ ] **链路视图 `config show --chain`**（用户 2026-11-26 定下命令划分）：0.2.0 做 overrides 与 formats 两条（t20，Codex 在做）；
+  完成后主代理补 skill、README、CHANGELOG。`config check` 与其余链路排在之后。用户允许：若拖住 0.2.0，可移到 0.2.1。
+  设计见 [plan/format-chain-view.md](plan/format-chain-view.md)。
 - [ ] **实例详情页窄窗口英文排版**：720px 宽、英文界面时，在途请求卡片里的「waiting …」、客户端名等文字溢出到右侧配置摘要栏
   （演示数据 12346 可见）。与启动来由无关，2026-11-26 看截图时发现。
 
@@ -94,9 +97,6 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   （插件协议 1：请求一行 JSON，含合成后的完整配置；回复固定四行，末行 success 或 failure；插件压过用户配置，后面的覆盖前面的；
   不应答实例就启动失败；有试运行，数据相同、只是不当真启动；请求带启动来由 `reason` 与备注 `note`，`start`、`restart`、`restore`
   可用 `--reason`、`--note` 指定，这两个选项可早于插件单独做）。整体还只是想法，设计与待定问题见 [plan/plugins.md](plan/plugins.md)。
-- [ ] **format 链路视图**（用户 2026-11-26）：展示合成过程与 format 链，按声明与实际报告列出协议路径、转换次数、遮蔽等事实，
-  不下结论；只在用户或 agent 主动查看时做，从不阻止启动；随插件做完整版（桌面请求详情的协议路径已在 0.2.0 做完，72c887bd）。
-  命令怎么分待用户定。设计见 [plan/format-chain-view.md](plan/format-chain-view.md)。
 - [ ] **官方 format 的 UI 扩展样例**（用户 2026-11-23）：给一个官方角色（倾向 keys：看密钥池与冷却状态、临时停用一个 key、
   重启这个 format）做一个扩展样例，示范扩展与 format 的配对、control 进程与 `formats.*` 接口。前提是 t10c 的 control 与
   format 重启做完，且这个角色实现了 control。版本未定。

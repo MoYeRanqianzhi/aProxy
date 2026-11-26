@@ -1464,3 +1464,440 @@ fn migrate_keeps_linked_files_together() {
         assert!(!h.path().join("a.toml.0.1.bak").exists());
     }
 }
+
+/// 目录与 clap 的用法诊断不依赖文件；真正选择一条链才按 show 的规则加载配置。
+#[test]
+fn config_chain_catalog_usage_and_loading() {
+    let h = TestHome::unborn();
+    for flags in [
+        vec!["--chain", "elsewhere"],
+        vec!["--effective", "--chain"],
+        vec!["--chain", "formats", "--effective"],
+    ] {
+        let out = h
+            .cmd()
+            .args(["config", "show"])
+            .args(&flags)
+            .output()
+            .report_exit()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        if flags.contains(&"elsewhere") {
+            let err = String::from_utf8(out.stderr).unwrap();
+            assert!(
+                err.contains("overrides") && err.contains("formats"),
+                "{err}"
+            );
+        }
+        assert!(!h.path().exists());
+    }
+    let h = TestHome::new();
+    h.settings(r#"{"default_config":"missing-default.toml"}"#);
+    let output = run(&h, &["config", "show", "--chain"]);
+    let names: Vec<_> = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| l.split_once(": ").unwrap().0)
+        .collect();
+    assert_eq!(names, ["overrides", "formats"]);
+    let catalog = document(&run(&h, &["config", "show", "--chain", "--json"]));
+    assert_keys(&catalog, &["schema", "chains"]);
+    assert_eq!(catalog["chains"].as_array().unwrap().len(), 2);
+    // clap 默认拿枚举的 Rust 文档作长帮助；与目录逐行对照，不能串到另一种语言。
+    for lang in ["en", "zh-CN"] {
+        let output = |flag| {
+            let out = h
+                .cmd()
+                .env("APROXY_LANG", lang)
+                .args(["config", "show", flag])
+                .output()
+                .report_exit()
+                .unwrap();
+            assert!(out.status.success());
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let help = output("--help");
+        for line in output("--chain").lines() {
+            let (_, description) = line.split_once(": ").unwrap();
+            assert!(help.contains(description), "{help}");
+        }
+    }
+    for (row, name) in catalog["chains"].as_array().unwrap().iter().zip(names) {
+        assert_keys(row, &["name", "description"]);
+        assert_eq!(row["name"], name);
+        assert!(!row["description"].as_str().unwrap().is_empty());
+    }
+    for flags in [vec![], vec!["--config", "missing-explicit.toml"]] {
+        let mut args = vec!["config", "show", "--json"];
+        args.extend(flags);
+        let plain = failed_document(&h, &args, 4);
+        for chain in ["overrides", "formats"] {
+            let mut args = args.clone();
+            args.extend(["--chain", chain]);
+            assert_eq!(failed_document(&h, &args, 4), plain);
+        }
+    }
+    let path = h.path().join("config.toml");
+    h.settings("{}");
+    fs::write(
+        &path,
+        "base_url='http://localhost'\nlisten_addr='127.0.0.1:0'\nunknown_field=true",
+    )
+    .unwrap();
+    let plain = failed_document(&h, &["config", "show", "--json"], 3);
+    for chain in ["formats", "overrides"] {
+        let (doc, err) = failed_document(&h, &["config", "show", "--chain", chain, "--json"], 3);
+        assert_eq!(doc["diagnostics"], plain.0["diagnostics"]);
+        assert_eq!(err, plain.1);
+    }
+}
+
+/// 实际命令的每个键都与 --effective 的独立出口对照；头的大小写、目标绑定与环境是三种不同的合并规则。
+#[test]
+fn config_chain_overrides_matches_effective_and_masks_every_layer() {
+    let h = TestHome::new();
+    let path = h.path().join("chosen.toml");
+    fs::write(
+        &path,
+        r#"base_url='http://localhost/own'
+listen_addr='127.0.0.1:0'
+api_key='FAKE-file-key-1234'
+max_response_mb=11
+proxy='http://localhost:81'
+proxy_password='FAKE-file-password'
+[extra_headers]
+'X.TEAM'='same-file'
+'X.Team'='file'
+[override_headers]
+Authorization='FAKE-header-file'
+"#,
+    )
+    .unwrap();
+    h.settings(&json!({"default_config": path, "aliases": {"chosen":path}, "watchdog":{"enabled":false}, "defaults":{
+        "base_url":"http://localhost/default", "api_key":"FAKE-withheld-key", "max_response_mb":22, "disk_cache":true, "proxy":"http://localhost:81", "proxy_password":"FAKE-settings-password", "extra_headers":{"x.team":"settings", "x-token":"FAKE-withheld-header"}, "override_headers":{"authorization":"FAKE-withheld-auth"}
+    }}).to_string());
+    let cmd = |args: &[&str]| {
+        let out = h
+            .cmd()
+            .env("HTTPS_PROXY", "http://user:FAKE-env-password@localhost:82")
+            .args(["config", "show"])
+            .args(args)
+            .output()
+            .report_exit()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for bytes in [&out.stdout, &out.stderr] {
+            let text = String::from_utf8_lossy(bytes);
+            for secret in [
+                "FAKE-file-key-1234",
+                "FAKE-file-password",
+                "FAKE-header-file",
+                "FAKE-withheld-key",
+                "FAKE-settings-password",
+                "FAKE-withheld-header",
+                "FAKE-withheld-auth",
+                "FAKE-env-password",
+            ] {
+                assert!(!text.contains(secret), "{text}");
+            }
+        }
+        out
+    };
+    let effective = document(&cmd(&["--effective", "--json"]));
+    let doc = document(&cmd(&[
+        "--chain",
+        "overrides",
+        "--config",
+        "chosen",
+        "--json",
+    ]));
+    assert_keys(
+        &doc,
+        &[
+            "schema",
+            "chain",
+            "file",
+            "start_options_included",
+            "keys",
+            "diagnostics",
+        ],
+    );
+    assert_eq!(doc["chain"], "overrides");
+    assert_eq!(doc["start_options_included"], false);
+    assert_eq!(
+        fs::canonicalize(doc["file"].as_str().unwrap()).unwrap(),
+        fs::canonicalize(path).unwrap()
+    );
+    assert_eq!(doc["diagnostics"], effective["diagnostics"]);
+    let rows = doc["keys"].as_array().unwrap();
+    let row = |key: &str| rows.iter().find(|r| r["key"] == key).unwrap();
+    for key in effective["sources"].as_object().unwrap().keys() {
+        assert_eq!(row(key)["source"], effective["sources"][key]);
+    }
+    for r in rows {
+        assert_keys(
+            r,
+            &[
+                "key",
+                "source",
+                "value",
+                "shadowed",
+                "withheld",
+                "instance_only",
+            ],
+        );
+        let key = r["key"].as_str().unwrap();
+        assert_eq!(r["source"], effective["sources"][key]);
+        assert_eq!(
+            &r["value"],
+            aproxy::config::view::get(&effective["values"], key)
+                .unwrap()
+                .unwrap_or(&Value::Null)
+        );
+    }
+    assert_eq!(
+        row("max_response_mb")["shadowed"],
+        json!([{"source":"settings","value":22},{"source":"default","value":256}])
+    );
+    assert_eq!(
+        row("extra_headers.\"X.Team\"")["shadowed"],
+        json!([{"source":"settings","value":"settings"}])
+    );
+    assert_eq!(
+        row("proxy_password")["shadowed"][0]["value"]["secret"],
+        true
+    );
+    assert_eq!(
+        row("proxy")["shadowed"][1],
+        json!({"source":"env", "value":{"HTTPS_PROXY":"http://***@localhost:82"}})
+    );
+    for key in [
+        "api_key",
+        "extra_headers.x-token",
+        "override_headers.Authorization",
+    ] {
+        assert_eq!(row(key)["withheld"][0]["reason"], "base_url_differs");
+    }
+    for key in ["listen_addr", "log_file", "format"] {
+        assert_eq!(row(key)["instance_only"], true);
+        assert_eq!(row(key)["shadowed"], json!([]));
+    }
+    let text = String::from_utf8(cmd(&["--chain", "overrides"]).stdout).unwrap();
+    assert!(
+        text.contains("settings.json global default set 22 (shadowed)")
+            && text.contains("start options")
+    );
+    let key_block = text
+        .split_once("api_key ")
+        .unwrap()
+        .1
+        .split_once("delivery ")
+        .unwrap()
+        .0;
+    assert!(key_block.contains("not inherited") && key_block.contains("api_key  default target:"));
+
+    h.settings(r#"{"defaults":{"base_url":"http://localhost"}}"#);
+    let doc = document(&cmd(&["--chain", "overrides", "--json"]));
+    let proxy = doc["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "proxy")
+        .unwrap();
+    assert_eq!(proxy["source"], "env");
+    assert_eq!(proxy["value"], Value::Null);
+    assert_eq!(
+        proxy["environment"],
+        json!({"HTTPS_PROXY":"http://***@localhost:82"})
+    );
+}
+
+/// 没有这些可执行文件也能展示完整协议事实；若去握手，必定无法成功。
+const CHAIN_FORMATS: &str = r#"base_url='http://localhost'
+listen_addr='127.0.0.1:0'
+[[format]]
+name='keys'
+command='no-such-keys'
+stages=['request','response','decide']
+args=['--api-key','fakeArgKey','--url','http://u:fakeURL@localhost']
+env={CHAIN_KEY='fakeEnvValue'}
+[[format]]
+name='route'
+command='no-such-route'
+process='persistent'
+stages=['request','retry','stream','notify']
+required=false
+breaker_failures=2
+breaker_cooldown_secs=7
+worker_idle_secs=1
+[[format]]
+name='convert'
+command='no-such-convert'
+stages=['request','retry','response','decide']
+timeout_secs=12
+decide_timeout_secs=4
+[[format]]
+name='inspect'
+command='no-such-inspect'
+process='persistent'
+stages=['stream']
+"#;
+
+#[test]
+fn config_chain_formats_document_and_english_text() {
+    let h = TestHome::new();
+    fs::write(h.path().join("config.toml"), CHAIN_FORMATS).unwrap();
+    let doc = document(&run(
+        &h,
+        &["config", "show", "--chain", "formats", "--json"],
+    ));
+    assert_keys(
+        &doc,
+        &[
+            "schema",
+            "file",
+            "chain",
+            "diagnostics",
+            "entries",
+            "stages",
+            "facts",
+            "not_known",
+            "observe_at",
+        ],
+    );
+    assert_eq!(doc["chain"], "formats");
+    assert_eq!(doc["diagnostics"], json!([]));
+    assert_eq!(
+        doc["entries"],
+        json!([
+            {"name":"keys","command":"no-such-keys","args":["--api-key","<secret>","--url","http://***@localhost"],"env_names":["CHAIN_KEY"],"process":"spawn","required":true,"stages":["request","response","decide"]},
+            {"name":"route","command":"no-such-route","args":[],"env_names":[],"process":"persistent","required":false,"stages":["request","retry","stream","notify"],"worker_idle_secs":1,"breaker_failures":2,"breaker_cooldown_secs":7},
+            {"name":"convert","command":"no-such-convert","args":[],"env_names":[],"process":"spawn","required":true,"stages":["request","retry","response","decide"],"timeout_secs":12,"decide_timeout_secs":4},
+            {"name":"inspect","command":"no-such-inspect","args":[],"env_names":[],"process":"persistent","required":true,"stages":["stream"]}
+        ])
+    );
+    assert_eq!(
+        doc["stages"],
+        json!({"request":["keys","route","convert"],"retry":["route","convert"],"decide":["keys","convert"],"response":["convert","keys"],"stream":["inspect","route"],"heartbeat":[],"notify":["route"]})
+    );
+    assert_eq!(
+        doc["facts"],
+        json!({"first_answer":{"delivery":["keys","route","convert"],"decision":["keys","convert"],"reroute":["keys","convert"]},"last_content":{"request":"convert","response":"keys","stream":"route"},"request_on_retry":["route","convert"],"first_attempt_only":["keys"],"skip_on_failure_or_open_breaker":["route"],"notify_observes_only":true})
+    );
+    assert_eq!(
+        doc["not_known"],
+        json!(["content_effects", "final_protocol"])
+    );
+    assert_eq!(
+        doc["observe_at"],
+        json!(["desktop_request_detail.protocol_path", "aproxy logs"])
+    );
+    let text =
+        String::from_utf8(run(&h, &["config", "show", "--chain", "formats"]).stdout).unwrap();
+    for line in [
+        "request: keys → route → convert",
+        "response: convert → keys",
+        "stream: inspect → route",
+        "heartbeat: no program",
+        "notify: route (observe only)",
+        "first program to give a value",
+        "CHAIN_KEY",
+        "<secret>",
+        "Protocol path",
+    ] {
+        assert!(text.contains(line), "{text}");
+    }
+    for chain in ["overrides", "formats"] {
+        for mode in [vec![], vec!["--json"]] {
+            let mut args = vec!["config", "show", "--chain", chain];
+            args.extend(mode);
+            let output = String::from_utf8(run(&h, &args).stdout).unwrap();
+            for secret in ["fakeArgKey", "fakeURL", "fakeEnvValue"] {
+                assert!(!output.contains(secret));
+            }
+        }
+    }
+}
+
+#[test]
+fn config_chain_formats_chinese_text_and_empty_chain() {
+    let h = TestHome::new();
+    let cfg = h.path().join("config.toml");
+    fs::write(&cfg, CHAIN_FORMATS).unwrap();
+    let show = || {
+        let out = h
+            .cmd()
+            .env("APROXY_LANG", "zh-CN")
+            .args(["config", "show", "--chain", "formats"])
+            .output()
+            .report_exit()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let text = show();
+    for line in [
+        "各阶段的程序",
+        "stream: inspect → route",
+        "heartbeat: 没有程序",
+        "只观察",
+        "只在首次尝试调用的 request 程序：keys",
+        "协议路径",
+        "aproxy logs",
+    ] {
+        assert!(text.contains(line), "{text}");
+    }
+    fs::write(
+        cfg,
+        "base_url='http://localhost'\nlisten_addr='127.0.0.1:0'",
+    )
+    .unwrap();
+    assert_eq!(show().trim(), "这份配置没有 format 程序。");
+    let empty = document(&run(
+        &h,
+        &["config", "show", "--chain", "formats", "--json"],
+    ));
+    assert_eq!(empty["entries"], json!([]));
+    assert!(
+        empty["stages"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|v| v == &json!([]))
+    );
+}
+
+/// 回程方向也包括心跳；有诊断的 format 数组不能把被丢弃的程序或它的环境带进生效链。
+#[test]
+fn config_chain_heartbeat_order_and_rejected_entry() {
+    let h = TestHome::new();
+    let cfg = h.path().join("config.toml");
+    let text = CHAIN_FORMATS.replace("'response','decide'", "'response','decide','heartbeat'");
+    fs::write(&cfg, &text).unwrap();
+    let formats = document(&run(
+        &h,
+        &["config", "show", "--chain", "formats", "--json"],
+    ));
+    assert_eq!(formats["stages"]["heartbeat"], json!(["convert", "keys"]));
+    fs::write(&cfg, text + "\n[[format]]\ncommand='discarded'\nstages=['absent']\nenv={K=['FAKE-rejected-value']}\n").unwrap();
+    for chain in ["overrides", "formats"] {
+        let (doc, _) = failed_document(&h, &["config", "show", "--chain", chain, "--json"], 3);
+        assert!(!doc.to_string().contains("FAKE-rejected-value"));
+        let entries = if chain == "formats" {
+            &doc["entries"]
+        } else {
+            &doc["keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["key"] == "format")
+                .unwrap()["value"]
+        };
+        assert_eq!(entries.as_array().unwrap().len(), 4);
+    }
+}

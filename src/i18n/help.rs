@@ -204,6 +204,12 @@ message!(config_show(), en: "Print the values in the file. Credentials are shown
 
 message!(effective(), en: "Include settings.json and built-in defaults for missing keys. Show each value's source and list default credentials that were not inherited", zh: "打印生效的值：文件里没写的键补上 settings.json 的全局默认与内置默认，每个值 注明来自哪一层；全局默认里没有继承的凭据单独列出");
 
+message!(config_chain(), en: "Show how this configuration is put together, one chain at a time: overrides (which layer sets each value) or formats (the order the format programs run in). Shows facts only; nothing is started. Without NAME, list the chains. Reads the configuration as it would start now; does not contact running instances or run third-party programs.", zh: "按链路展示这份配置是怎样组合出来的：overrides（每个值由哪一层设定）或 formats（format 程序的执行顺序）。只列事实，不启动任何程序。不写 NAME 时列出链路。按现在启动时的配置解析，不联系运行中的实例，不执行第三方程序。");
+
+message!(chain_overrides(), en: "Which layer sets each value and which values it takes precedence over", zh: "每个值由哪一层设定，盖过了哪些值");
+
+message!(chain_formats(), en: "Which format programs run at each stage, and in what order", zh: "每个阶段有哪些 format 程序参与，按什么顺序执行");
+
 message!(config_get(), en: "Print the effective value of a dotted key such as base_url, timeouts.connect_secs or extra_headers.\"x-foo\"", zh: "打印一个键的生效值。键是点号路径，例如 base_url、timeouts.connect_secs、 extra_headers.\"x-foo\"");
 
 message!(source_json(), en: "Write a JSON document with the value and its source", zh: "输出一个 JSON 文档：值与它来自哪一层");

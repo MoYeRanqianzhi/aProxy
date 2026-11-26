@@ -291,7 +291,7 @@ config: --config -h --help
 config get: --config --json -h --help
 config help:
 config set: --config --json -h --help
-config show: --config --effective --json -h --help
+config show: --config --effective --chain --json -h --help
 config unset: --config --json -h --help
 desktop: -h --help
 doctor: --json -h --help

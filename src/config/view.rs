@@ -516,6 +516,28 @@ pub fn json_to_toml(value: &Value) -> Option<Toml> {
 /// `args` 里其余的参数过一遍 URL 打码（参数里常有带口令的地址）。这个形状只用来显示，
 /// 不能写回。`value` 是 [`redacted`] 之后的。
 pub fn for_display(mut value: Value) -> Value {
+    redact_arg_urls(&mut value);
+    placeholders_as_text(&mut value);
+    value
+}
+
+/// format 沿用生效文档里的文件形状；条目未通过解析时，只展示解析器实际接受的程序。
+/// 参数里的 URL 同样打码，但 JSON 中的密钥仍是占位对象，不转换成面向终端的文本。
+pub fn override_values(resolved: &Resolved, file: Option<&Value>) -> Value {
+    let mut values = effective_value(resolved, file);
+    if resolved.errors().any(|d| {
+        d.key
+            .as_deref()
+            .is_some_and(|k| k == "format" || k.starts_with("format["))
+    }) {
+        values["format"] = json!(resolved.config.formats);
+    }
+    let mut values = redacted(values);
+    redact_arg_urls(&mut values);
+    values
+}
+
+fn redact_arg_urls(value: &mut Value) {
     let formats = value.get_mut("format").and_then(Value::as_array_mut);
     for entry in formats.into_iter().flatten() {
         let args = entry.get_mut("args").and_then(Value::as_array_mut);
@@ -527,8 +549,6 @@ pub fn for_display(mut value: Value) -> Value {
             }
         }
     }
-    placeholders_as_text(&mut value);
-    value
 }
 
 fn placeholders_as_text(value: &mut Value) {

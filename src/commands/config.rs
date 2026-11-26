@@ -8,7 +8,7 @@ use aproxy_ipc::i18n::current;
 
 use std::path::{Path, PathBuf};
 
-use aproxy::cli::{ConfigArgs, ConfigCmd};
+use aproxy::cli::{ConfigArgs, ConfigChain, ConfigCmd};
 use aproxy::config::edit::{Change, EditError};
 use aproxy::config::{self, Source, view};
 use aproxy::settings;
@@ -18,6 +18,9 @@ use serde_json::{Value, json};
 use super::print_doc;
 
 use aproxy_ipc::redact::placeholder_text;
+
+mod chain;
+pub(crate) use chain::list_chains;
 
 /// 转换器 args 的展示打码：密钥旗标之后的值（或 `--flag=值` 的值）写成占位的文本形式；
 /// 其余参数走 URL 脱敏出口（参数里出现的 `user:pass@host`、`?key=` 一并遮掉，普通参数原样）。
@@ -65,7 +68,11 @@ pub(crate) async fn handle_config_cmd(args: ConfigArgs) {
         None => super::require_cfg_path(super::resolve_cfg_path(None), json),
     };
     match cmd {
-        ConfigCmd::Show { effective, json } => show(&path, explicit, effective, json),
+        ConfigCmd::Show {
+            effective,
+            chain,
+            json,
+        } => show(&path, explicit, effective, chain.flatten(), json),
         ConfigCmd::Get { key, json } => get(&path, &key, json),
         ConfigCmd::Set { key, value, json } => {
             let value = parse_value(&key, &value, json);
@@ -118,7 +125,7 @@ fn resolve(path: &Path, json: bool) -> config::Resolved {
 
 /// `config show`：文件里写了的值；`--effective` 时是生效的值、各自的来源与没有继承的凭据。
 /// 文件有 error 级诊断时照样显示，然后以 3 退出。
-fn show(path: &Path, explicit: bool, effective: bool, json: bool) {
+fn show(path: &Path, explicit: bool, effective: bool, chain: Option<ConfigChain>, json: bool) {
     let text = read_text(path, json);
     // 显式 --config 指向的文件不存在时，展示的只会是默认值（抬头却是用户给的路径）——纯粹
     // 的排障误导，报错而不是照样显示。默认路径豁免：还没有 config.toml 是首次配置之前的
@@ -131,8 +138,26 @@ fn show(path: &Path, explicit: bool, effective: bool, json: bool) {
             json!({"target": path.display().to_string()}),
         );
     }
-    let mut resolved = resolve(path, json);
+    let (mut resolved, trace) = config::resolve::resolve_file_view(
+        text.as_deref(),
+        path,
+        &global_defaults(),
+        chain == Some(ConfigChain::Overrides),
+    );
     aproxy::migrate::Kind::Config.append_hint(path, explicit, &mut resolved.diagnostics);
+    if let Some(chain) = chain {
+        match chain {
+            ConfigChain::Overrides => chain::overrides(
+                path,
+                &resolved,
+                trace,
+                text.as_deref().and_then(view::file_value).as_ref(),
+                json,
+            ),
+            ConfigChain::Formats => chain::formats(path, &resolved, json),
+        }
+        return show_diagnostics(&resolved);
+    }
     let file_values = text.as_deref().and_then(view::file_value);
     let values = view::redacted(if effective {
         view::effective_value(&resolved, file_values.as_ref())
@@ -181,6 +206,11 @@ fn show(path: &Path, explicit: bool, effective: bool, json: bool) {
         print!("{}", view::to_document(&view::for_display(values)));
     }
 
+    show_diagnostics(&resolved);
+}
+
+/// 展示的是哪条链不改变同一份配置的诊断或退出码。
+fn show_diagnostics(resolved: &config::Resolved) {
     for d in resolved
         .diagnostics
         .iter()

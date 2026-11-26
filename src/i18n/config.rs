@@ -117,3 +117,31 @@ message!(empty_table(table: &str), en: "{table:<26} = (empty)", zh: "{table:<26}
 message!(header(name: &str, value: &str, source: &str), en: "  {name} = {value}  ({source})", zh: "  {name} = {value}  （{source}）");
 
 message!(default_missing(path: std::path::Display<'_>), en: "Default configuration file in settings.json does not exist: {path}\nSet a new path with aproxy settings set default_config <path>, or remove the setting with aproxy settings unset default_config.", zh: "settings.json 指定的默认配置文件不存在: {path}\n用 aproxy settings set default_config <路径> 重新指定，或 aproxy settings unset default_config 取消");
+
+message!(chain_precedence(), en: "The effective value comes first. A running instance’s start options, kept in its launch spec, take precedence over these layers and are not shown here.", zh: "每个键先列生效值。运行中实例的 start 选项保存在启动规格里，优先于以下各层，这里不列出。");
+
+message!(instance_only(), en: " — per instance, not inherited", zh: " —— 属于单个实例，不继承");
+
+message!(lower_layer(source: &str, value: &str), en: "    {source} set {value} (shadowed)", zh: "    {source} 设为 {value}（被上层覆盖）");
+
+message!(no_formats(), en: "This configuration has no format programs.", zh: "这份配置没有 format 程序。");
+
+message!(format_entry(name: &str), en: "format {name}:", zh: "format {name}：");
+
+message!(stage_order(), en: "Programs by stage:", zh: "各阶段的程序：");
+
+message!(observers(names: &str), en: "notify: {names} (observe only)", zh: "notify: {names}（只观察）");
+
+message!(no_stage_program(stages: &str), en: "{stages}: no program", zh: "{stages}: 没有程序");
+
+message!(first_answer(field: &str, names: &str), en: "{field} — first program to give a value: {names}", zh: "{field} —— 取第一个给出值的程序：{names}");
+
+message!(last_upstream(name: &str), en: "request: changes accumulate; {name} is the last layer before upstream.", zh: "request：内容逐层传递，最后由 {name} 处理，再发往上游。");
+
+message!(last_client(stage: &str, name: &str), en: "{stage}: changes accumulate; {name} is the last layer before the client.", zh: "{stage}：内容逐层传递，最后由 {name} 处理，再回给客户端。");
+
+message!(retry_entries(retry: &str, first: &str), en: "Request programs called again when the retry segment runs: {retry}\nRequest programs on the first attempt only: {first}", zh: "重试段执行时再次调用的 request 程序：{retry}\n只在首次尝试调用的 request 程序：{first}");
+
+message!(optional_entries(names: &str), en: "Skipped on failure or while their breaker is open (required = false): {names}", zh: "执行失败或熔断期间跳过的程序（required = false）：{names}");
+
+message!(format_limits(), en: "Programs declare stages, not what they do to the content. This view cannot tell which protocol a request ends up in. For an actual request, see Protocol path in the desktop request detail and aproxy logs.", zh: "程序声明参与哪些阶段，不声明怎样修改内容。这里看不出请求最终使用哪种协议。要看一条请求实际走了哪条路，请看桌面请求详情的「协议路径」和 aproxy logs。");

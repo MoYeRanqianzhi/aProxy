@@ -27,7 +27,8 @@ use toml_edit::{Item, TableLike};
 /// 统一解释：非法值要在 validate() 里点名字段报错——若直接让 serde 解析成
 /// 枚举，settings.json 里的一个笔误会让整个文件解析失败、静默回退成全默认
 /// （连别名一起丢），用户看不到是哪个字段错了。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum KeepaliveTrigger {
     /// 客户端 Accept 头含 `text/event-stream`（0.1.0 之前的唯一判定）
     Accept,
@@ -118,7 +119,8 @@ pub fn compile_retry_pattern(pattern: &str) -> Result<regex::Regex, regex::Error
 }
 
 /// 请求的默认投递方式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Delivery {
     /// 边收边转，不缓冲、不重试
     Forward,
@@ -136,7 +138,8 @@ impl Delivery {
 }
 
 /// format 程序参与的阶段。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Stage {
     Request,
     Retry,
@@ -175,7 +178,8 @@ impl Stage {
 }
 
 /// format 程序的进程方式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Process {
     /// 每条消息起一个进程
     Spawn,
@@ -184,7 +188,7 @@ pub enum Process {
 }
 
 /// 一条 `[[format]]`。没写的键已经填上默认值。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct FormatEntry {
     /// 在列表内唯一；没写时取 `command` 的文件名主干
     pub name: String,
@@ -212,11 +216,13 @@ impl FormatEntry {
 }
 
 /// 一条 `[[retry.rules]]`。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RetryRule {
     /// 对客户端请求的「路径?查询串」整体匹配的正则（自动锚定）；没写 = 任何路径
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// 上游状态码；没写 = 任何状态码
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<Vec<u16>>,
     /// 第 N 次尝试失败、命中这条规则且 N ≥ 它，就停；0 = 不限（写在宽规则前面当豁免）
     pub max_attempts: u32,

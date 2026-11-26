@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use aproxy_ipc::diag::{Diagnostic, Level};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::Config;
 use super::file::{self, Delivery, FileConfig};
@@ -147,18 +147,81 @@ pub fn resolve_without_file(overrides: &Overrides, defaults: &Defaults) -> Resol
     )
 }
 
+const PROXY_VARS: &[&str] = &[
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+
 /// HTTP 客户端在没配置代理时会读的环境变量里，有没有设了值的。
 pub(crate) fn env_proxy_is_set() -> bool {
-    [
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ]
-    .iter()
-    .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+    PROXY_VARS
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+/// 低于生效来源的一层；值经过与生效配置相同的脱敏出口。
+#[derive(Debug, Serialize)]
+pub struct Layer {
+    /// 这一层在合并中的身份。
+    pub source: Source,
+    /// 这一层给出的配置值，不是一次请求实际采用的值。
+    pub value: Value,
+}
+
+/// 文件链路才收集的附加信息；正常启动不复制低优先级的值。
+#[derive(Default)]
+pub struct FileTrace {
+    /// 同一键内从高到低；头名沿用生效层的拼写。
+    pub shadowed: BTreeMap<String, Vec<Layer>>,
+    /// 环境代理按请求选择，没有一个可填入 Config.proxy 的 URL。
+    pub proxy_environment: BTreeMap<String, String>,
+}
+
+/// 从同一份文件快照解析展示值与诊断。只有查看覆盖链时才记录较低的层和代理环境，
+/// 不猜 HTTP 客户端会为某个请求选哪个变量。
+pub fn resolve_file_view(
+    text: Option<&str>,
+    path: &Path,
+    defaults: &Defaults,
+    trace_layers: bool,
+) -> (Resolved, FileTrace) {
+    let mut trace = FileTrace::default();
+    if !trace_layers {
+        return (
+            resolve_text(
+                text,
+                path,
+                &Overrides::default(),
+                defaults,
+                env_proxy_is_set(),
+            ),
+            trace,
+        );
+    }
+    for &name in PROXY_VARS {
+        // Windows 的环境变量不分大小写，同一个变量只列一次。
+        if cfg!(windows) && name.starts_with(|c: char| c.is_ascii_lowercase()) {
+            continue;
+        }
+        if let Some(v) = std::env::var_os(name).filter(|v| !v.is_empty()) {
+            trace
+                .proxy_environment
+                .insert(name.into(), aproxy_ipc::redact::url(&v.to_string_lossy()));
+        }
+    }
+    let resolved = resolve_inner(
+        text,
+        path,
+        &Overrides::default(),
+        defaults,
+        !trace.proxy_environment.is_empty(),
+        Some(&mut trace),
+    );
+    (resolved, trace)
 }
 
 /// 同 [`resolve`]，但文件内容与环境都由参数给出：不读文件系统，也不读环境变量。
@@ -170,6 +233,17 @@ pub fn resolve_text(
     defaults: &Defaults,
     env_proxy: bool,
 ) -> Resolved {
+    resolve_inner(text, path, overrides, defaults, env_proxy, None)
+}
+
+fn resolve_inner(
+    text: Option<&str>,
+    path: &Path,
+    overrides: &Overrides,
+    defaults: &Defaults,
+    env_proxy: bool,
+    trace: Option<&mut FileTrace>,
+) -> Resolved {
     let (f, mut diagnostics) = match text {
         Some(text) => file::parse(text, path),
         None => (FileConfig::default(), Vec::new()),
@@ -177,8 +251,11 @@ pub fn resolve_text(
     let d = &defaults.values;
     let o = overrides;
     let builtin = Config::default();
-    let mut sources = BTreeMap::new();
-    let s = &mut sources;
+    let mut selection = Selection {
+        winners: BTreeMap::new(),
+        trace,
+    };
+    let s = &mut selection;
 
     let base_url = pick(s, "base_url", &o.base_url, &f.base_url, &d.base_url);
     let listen_addr = pick(s, "listen_addr", &o.listen_addr, &f.listen_addr, &None);
@@ -240,8 +317,19 @@ pub fn resolve_text(
         }
     }
     let [default_extra_headers, default_override_headers] = default_headers;
-    if proxy.is_none() && env_proxy {
-        s.insert("proxy".to_string(), Source::Env);
+    if env_proxy {
+        if proxy.is_none() {
+            s.winners.insert("proxy".to_string(), Source::Env);
+        } else if let Some(trace) = &mut s.trace {
+            trace
+                .shadowed
+                .entry("proxy".into())
+                .or_default()
+                .push(Layer {
+                    source: Source::Env,
+                    value: json!(trace.proxy_environment),
+                });
+        }
     }
     for (key, value) in [
         ("proxy_username", &d.proxy_username),
@@ -306,7 +394,7 @@ pub fn resolve_text(
     let config = Config {
         base_url: base_url.unwrap_or_default(),
         listen_addr: listen_addr.unwrap_or_else(|| {
-            s.insert("listen_addr".to_string(), Source::Default);
+            s.winners.insert("listen_addr".to_string(), Source::Default);
             builtin.listen_addr.clone()
         }),
         api_key,
@@ -406,6 +494,7 @@ pub fn resolve_text(
         spool_dir_override: None,
     }
     .normalized();
+    let sources = selection.winners;
 
     // 合并之后的语义问题。文件解析已经报过的（同码同键）不再报一遍
     for problem in config.problems() {
@@ -558,44 +647,68 @@ fn reason_details(reason: &str) -> Map<String, Value> {
     details
 }
 
+/// 来源随实际选择记录；只有查看链路才构造供展示的值，密钥不以明文留在记录里。
+struct Selection<'a> {
+    winners: BTreeMap<String, Source>,
+    trace: Option<&'a mut FileTrace>,
+}
+
+impl Selection<'_> {
+    fn shadow(&mut self, key: &str, source: Source, value: impl FnOnce() -> Value) {
+        if let Some(trace) = &mut self.trace {
+            trace.shadowed.entry(key.into()).or_default().push(Layer {
+                source,
+                value: value(),
+            });
+        }
+    }
+}
+
 /// 取最高一层的值并记下来源；三层都没有时返回 None、不记来源。
-fn pick<T: Clone>(
-    sources: &mut BTreeMap<String, Source>,
+fn pick<T: Clone + Serialize>(
+    sources: &mut Selection<'_>,
     key: &str,
     over: &Option<T>,
     toml: &Option<T>,
     settings: &Option<T>,
 ) -> Option<T> {
-    let (value, source) = if let Some(value) = over {
-        (value, Source::Override)
-    } else if let Some(value) = toml {
-        (value, Source::Toml)
-    } else if let Some(value) = settings {
-        (value, Source::Settings)
-    } else {
-        return None;
-    };
-    sources.insert(key.to_string(), source);
+    let mut layers = [
+        (Source::Override, over),
+        (Source::Toml, toml),
+        (Source::Settings, settings),
+    ]
+    .into_iter()
+    .filter_map(|(source, value)| Some((source, value.as_ref()?)));
+    let (source, value) = layers.next()?;
+    sources.winners.insert(key.to_string(), source);
+    for (lower, v) in layers {
+        sources.shadow(key, lower, || {
+            super::view::redacted(json!({key: v}))[key].take()
+        });
+    }
     Some(value.clone())
 }
 
 /// 同 [`pick`]，用于没有启动覆盖、但有内置默认的键。
-fn pick_or<T: Clone>(
-    sources: &mut BTreeMap<String, Source>,
+fn pick_or<T: Clone + Serialize>(
+    sources: &mut Selection<'_>,
     key: &str,
     toml: &Option<T>,
     settings: &Option<T>,
     default: T,
 ) -> T {
-    pick(sources, key, &None, toml, settings).unwrap_or_else(|| {
-        sources.insert(key.to_string(), Source::Default);
+    if let Some(value) = pick(sources, key, &None, toml, settings) {
+        sources.shadow(key, Source::Default, || json!(default));
+        value
+    } else {
+        sources.winners.insert(key.to_string(), Source::Default);
         default
-    })
+    }
 }
 
 /// 头表按头名合并：全局默认打底，config.toml 的同名头（不分大小写）取代它。
 fn merge_headers(
-    sources: &mut BTreeMap<String, Source>,
+    sources: &mut Selection<'_>,
     table: &str,
     toml: &Option<BTreeMap<String, String>>,
     settings: &Option<BTreeMap<String, String>>,
@@ -611,7 +724,20 @@ fn merge_headers(
     merged
         .into_iter()
         .map(|(name, value, source)| {
-            sources.insert(format!("{table}.{}", super::quote_key(name)), source);
+            let key = format!("{table}.{}", super::quote_key(name));
+            // 同层也可能写了几种大小写；等生效拼写确定后，才把较低层挂在这个键上。
+            if source == Source::Toml && sources.trace.is_some() {
+                for (_, lower) in settings
+                    .iter()
+                    .flatten()
+                    .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+                {
+                    sources.shadow(&key, Source::Settings, || {
+                        super::view::redacted(json!({table: {name: lower}}))[table][name].take()
+                    });
+                }
+            }
+            sources.winners.insert(key, source);
             (name.clone(), value.clone())
         })
         .collect()

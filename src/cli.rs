@@ -549,6 +549,8 @@ pub enum ConfigCmd {
         #[arg(help = help::effective(current()))]
         #[arg(long)]
         effective: bool,
+        #[arg(long, value_enum, value_name = "NAME", conflicts_with = "effective", help = help::config_chain(current()))]
+        chain: Option<Option<ConfigChain>>,
         #[arg(help = help::json(current()))]
         #[arg(long)]
         json: bool,
@@ -579,6 +581,28 @@ pub enum ConfigCmd {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// 文件可以展示的链路。clap 的取值校验和目录都从这个枚举取名。
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigChain {
+    /// 每个配置键的来源及被遮住的值。
+    #[value(help = Self::Overrides.description(current()))]
+    Overrides,
+    /// 静态声明的程序及各阶段的执行顺序。
+    #[value(help = Self::Formats.description(current()))]
+    Formats,
+}
+
+impl ConfigChain {
+    /// 目录的一行说明；机器文档不随终端语言变化。
+    pub fn description(self, lang: Lang) -> &'static str {
+        match self {
+            Self::Overrides => help::chain_overrides(lang),
+            Self::Formats => help::chain_formats(lang),
+        }
+    }
 }
 
 /// 构造实际解析用的完整命令树，包括 clap 自己生成的 help 子树，再统一附上文档入口。

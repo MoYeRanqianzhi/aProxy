@@ -223,6 +223,21 @@ async fn run(cli: Cli) -> u8 {
         util::exit(0);
     }
 
+    // 链路目录描述本版本的能力，不依赖某份配置或设置能否加载。
+    if let Some(Commands::Config(aproxy::cli::ConfigArgs {
+        cmd:
+            aproxy::cli::ConfigCmd::Show {
+                chain: Some(None),
+                json,
+                ..
+            },
+        ..
+    })) = &cli.command
+    {
+        commands::config::list_chains(*json);
+        return 0;
+    }
+
     // 迁移必须见到磁盘原文，不能在旧设置上提前退出或触发安装续作。
     if let Some(Commands::Migrate {
         paths,

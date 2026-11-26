@@ -663,6 +663,14 @@
     flex-direction: column;
     gap: 12px;
   }
+  /* 窗口窄（接近最小宽度 900px，或屏幕小、窗口被缩进屏幕）时，右栏有 280px 的下限，左边的在途请求卡片
+     只剩三百多像素：英文的心跳数与等待时长被拆成两行，路径截得只剩几个字；再窄些，文字会挤出卡片、
+     压到配置摘要上。这时两栏改成上下排，在途请求拿到整行宽度，配置摘要与 format 程序排在下面 */
+  @media (max-width: 1000px) {
+    .grid {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
   .req {
     position: relative;
     display: grid;
@@ -749,9 +757,15 @@
     color: var(--sky-deep);
     font-variant-numeric: tabular-nums;
   }
+  /* 第四行放不下时按条目整体换行，不在「6 heartbeats」「waiting 1 min 40 s」这样的短语中间断开 */
   .r4 {
+    flex-wrap: wrap;
+    row-gap: 4px;
     font-size: var(--fs-xs);
     color: var(--text-3);
+  }
+  .r4 > span {
+    white-space: nowrap;
   }
   .beat {
     display: inline-flex;
@@ -767,8 +781,12 @@
   .heart :global(svg) {
     fill: var(--pink);
   }
+  /* 客户端名取自 User-Agent，长度不受控：单独占一行时也最多一行宽，超出用省略号 */
   .client {
     margin-left: auto;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .stale-note {
     display: flex;

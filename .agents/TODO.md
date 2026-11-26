@@ -72,11 +72,6 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
     0.1.x 形状的文件时提示 `aproxy migrate`。`upgrade_from_0_1_0` 的 CI 测试在重装后跑它再跑一条要读 settings 的命令。
     排在 t10d 之后交给 Codex（t13）；用户可以改这个决定。
 
-- [ ] **t19：启动来由与备注**（用户 2026-11-26 定进 0.2.0，Codex 在做）：`start`、`restart`、`restore` 加 `--reason`、`--note`，
-  看门狗、登录恢复、升级各记自己的来由；实例记录、日志与 `status` 显示「最近一次启动」。完成后主代理补 skill、README 与桌面实例页。
-  设计见 [plan/plugins.md](plan/plugins.md)「指定来由与备注」。
-  进度（2026-11-26）：CLI、实例记录、日志、`status` 已合入 main；skill、README、CHANGELOG 已写。剩桌面实例页：
-  Rust 侧把来由与备注带到实例卡片（t19b，Codex 在做），界面与演示数据已在主工作区改好未提交，等 t19b 一起合入。
 - [ ] **链路视图 `config show --chain`**（用户 2026-11-26 定下命令划分）：0.2.0 做 overrides 与 formats 两条（t20，Codex 在做）；
   完成后主代理补 skill、README、CHANGELOG。`config check` 与其余链路排在之后。用户允许：若拖住 0.2.0，可移到 0.2.1。
   设计见 [plan/format-chain-view.md](plan/format-chain-view.md)。

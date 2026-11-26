@@ -75,6 +75,10 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] **链路视图 `config show --chain`**（用户 2026-11-26 定下命令划分）：0.2.0 做 overrides 与 formats 两条（t20，Codex 在做）；
   完成后主代理补 skill、README、CHANGELOG。`config check` 与其余链路排在之后。用户允许：若拖住 0.2.0，可移到 0.2.1。
   设计见 [plan/format-chain-view.md](plan/format-chain-view.md)。
+- [ ] **Windows CI 上 `startup_probes_run_in_parallel_and_respect_worker_lifetimes` 连挂两次**（2026-11-26）：启动来由合入后，
+  run 45734971209（headless）与 45795726614（desktop）都在 `tests/format_protocol.rs:1633` 最后那次 GET 收到 10054 连接重置；之前
+  没挂过。任务书 t21（等 t20 编完再启动），查清是产品还是测试的问题再修。另：ubuntu desktop 上 `featureless_tree_stays_small`
+  两次因 CI 缓存缺 `windows-sys 0.52.0` 而 `cargo tree --offline` 失败，属 CI 环境，与代码无关，同在这里跟进。
 - [ ] **实例详情页窄窗口英文排版**：720px 宽、英文界面时，在途请求卡片里的「waiting …」、客户端名等文字溢出到右侧配置摘要栏
   （演示数据 12346 可见）。与启动来由无关，2026-11-26 看截图时发现。
 

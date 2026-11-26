@@ -44,8 +44,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]
 mod dependency_tests {
-    /// Check the normal dependency closure on *all* targets, not the feature-unified
-    /// workspace graph (which intentionally includes the asynchronous client).
+    /// 各平台只检查本机的常规依赖，确保不开特性时闭包仍小，不计入工作区启用的异步客户端。
+    /// CI 的 Windows、Linux 和 macOS 作业合起来覆盖三个平台，不要求本机缓存别的平台的包。
     #[test]
     fn featureless_tree_stays_small() {
         use std::collections::BTreeSet;
@@ -58,8 +58,6 @@ mod dependency_tests {
                 "-p",
                 "aproxy-ipc",
                 "--no-default-features",
-                "--target",
-                "all",
                 "-e",
                 "normal",
                 "--prefix",
@@ -77,7 +75,56 @@ mod dependency_tests {
             .lines()
             .filter_map(|l| l.split_whitespace().next())
             .collect();
-        let expected = "aproxy-ipc block-buffer cfg-if const-oid cpufeatures crypto-common digest hybrid-array itoa libc memchr proc-macro2 quote serde serde_core serde_derive serde_json sha2 syn typenum unicode-ident windows-sys windows-targets windows_aarch64_gnullvm windows_aarch64_msvc windows_i686_gnu windows_i686_gnullvm windows_i686_msvc windows_x86_64_gnu windows_x86_64_gnullvm windows_x86_64_msvc zmij";
-        assert_eq!(names, expected.split_whitespace().collect());
+        let mut expected: BTreeSet<_> = "aproxy-ipc block-buffer cfg-if const-oid crypto-common \
+            digest hybrid-array itoa memchr proc-macro2 quote serde serde_core serde_derive \
+            serde_json sha2 syn typenum unicode-ident zmij"
+            .split_whitespace()
+            .collect();
+        // sha2 只在这三个架构上链接 cpufeatures，与操作系统无关。
+        if cfg!(any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "aarch64"
+        )) {
+            expected.insert("cpufeatures");
+        }
+        let windows = ["windows-sys", "windows-targets"];
+        let linux_macos = ["libc"];
+        if cfg!(windows) {
+            // windows-targets 只链接与本机架构、ABI 对应的导入库，不放行其他架构的包。
+            let arch = match std::env::consts::ARCH {
+                "x86" => "i686",
+                "arm64ec" => "x86_64",
+                arch => arch,
+            };
+            let abi = if cfg!(target_abi = "llvm") {
+                "gnullvm"
+            } else if cfg!(target_env = "gnu") {
+                "gnu"
+            } else {
+                "msvc"
+            };
+            let import = format!("windows_{arch}_{abi}");
+            expected.extend(windows);
+            expected.insert(&import);
+            assert_eq!(names, expected);
+        } else if cfg!(any(target_os = "linux", target_os = "macos")) {
+            expected.extend(linux_macos);
+            assert_eq!(names, expected);
+        } else {
+            assert!(
+                expected.is_subset(&names),
+                "missing: {:?}",
+                &expected - &names
+            );
+            expected.extend(windows);
+            expected.insert("windows_x86_64_msvc");
+            expected.extend(linux_macos);
+            assert!(
+                names.is_subset(&expected),
+                "unexpected: {:?}",
+                &names - &expected
+            );
+        }
     }
 }

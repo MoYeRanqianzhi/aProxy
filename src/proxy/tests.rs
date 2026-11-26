@@ -493,6 +493,42 @@ async fn dropped_disk_spool_buffer_deletes_partial_file() {
     );
 }
 
+fn spool_test_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+}
+
+/// 占住唯一的阻塞线程，直到发送端被丢弃。收到就位通知时，排在它前面的文件操作都已返回。
+async fn hold_spool_worker() -> tokio::sync::oneshot::Sender<()> {
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (release, wait) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        started.send(()).unwrap();
+        let _ = wait.blocking_recv();
+    });
+    ready.await.unwrap();
+    release
+}
+
+#[test]
+fn spool_chunk_dropped_before_disk_create_leaves_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut buf = SpoolBuffer::Memory(vec![b'x'; RESIDENT_LIMIT]);
+    spool_test_runtime().block_on(async {
+        let hold = hold_spool_worker().await;
+        let mut fut = Box::pin(spool_chunk(&mut buf, b"y", Some(dir.path())));
+        assert!(futures_util::poll!(&mut fut).is_pending());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        drop(fut);
+        drop(hold);
+        // 让已排队的建文件操作跑完再查目录，不能把「还没创建」误判为「已清理」。
+        tokio::task::spawn_blocking(|| ()).await.unwrap();
+    });
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
 #[tokio::test]
 async fn spool_chunk_dropped_mid_disk_transition_leaves_no_file() {
     // 内存 → 磁盘迁移本身要好几次 await（建文件、写 1 MiB 内存前缀、写本块）；

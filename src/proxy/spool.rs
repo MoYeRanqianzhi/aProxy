@@ -13,6 +13,16 @@ use super::*;
 pub(crate) struct SpoolPath(pub(crate) PathBuf);
 
 impl SpoolPath {
+    /// 在建文件的阻塞任务里接管删除责任。等待方即使在任务排队时就被取消，任务仍会
+    /// 执行；无人领取的结果先关句柄再删文件，不能让等待方提前删一个还不存在的路径。
+    pub(crate) async fn create(path: PathBuf) -> std::io::Result<(tokio::fs::File, Self)> {
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::create(&path)?;
+            Ok((tokio::fs::File::from_std(file), Self(path)))
+        })
+        .await?
+    }
+
     /// 交出路径并解除删除责任（取走后自身成空路径，Drop 不再删）
     pub(crate) fn into_path(mut self) -> PathBuf {
         std::mem::take(&mut self.0)
@@ -133,13 +143,13 @@ pub(super) async fn spool_chunk(buf: &mut SpoolBuffer, chunk: &[u8], spool_dir: 
             // 文件一创建就交给 SpoolPath 守卫：下面两次 write_all（含 1 MiB 的
             // 内存前缀）期间本 future 随时可能被 drop（客户端断开），守卫保证
             // 迁移中途的半截文件同样被删
-            let path = SpoolPath(dir.join(format!(
+            let path = dir.join(format!(
                 "spool-{}-{}.spooltmp",
                 std::process::id(),
                 unique_seq()
-            )));
-            match tokio::fs::File::create(&path.0).await {
-                Ok(mut file) => {
+            ));
+            match SpoolPath::create(path).await {
+                Ok((mut file, path)) => {
                     if file.write_all(mem).await.is_ok() && file.write_all(chunk).await.is_ok() {
                         let len = (mem.len() + chunk.len()) as u64;
                         *buf = SpoolBuffer::Disk { file, path, len };

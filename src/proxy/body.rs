@@ -172,14 +172,14 @@ pub(super) async fn read_request_body(
                     // 溢写决策：有目录才落盘；无目录（disk_cache 关闭/目录不可用）
                     // 继续内存缓冲（limit 语义不受影响）
                     if let Some(dir) = spool_dir {
-                        let path = SpoolPath(dir.join(format!(
+                        let path = dir.join(format!(
                             "req-{}-{}.spooltmp",
                             std::process::id(),
                             unique_seq()
-                        )));
+                        ));
                         // 目录不可用（create 失败）：内存退化。写入失败时 file 与
                         // 守卫一起在本块末尾 drop——半截文件随之删除
-                        if let Ok(mut file) = tokio::fs::File::create(&path.0).await
+                        if let Ok((mut file, path)) = SpoolPath::create(path).await
                             && file.write_all(&mem).await.is_ok()
                             && file.write_all(&chunk).await.is_ok()
                         {

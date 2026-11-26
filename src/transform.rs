@@ -86,12 +86,12 @@ pub(crate) async fn spool_request_body(bytes: &[u8], spool_dir: Option<&Path>) -
     if bytes.len() > RESIDENT_LIMIT
         && let Some(dir) = spool_dir
     {
-        let path = SpoolPath(dir.join(format!(
+        let path = dir.join(format!(
             "req-{}-{}.spooltmp",
             std::process::id(),
             unique_seq()
-        )));
-        if let Ok(mut file) = tokio::fs::File::create(&path.0).await
+        ));
+        if let Ok((mut file, path)) = SpoolPath::create(path).await
             && file.write_all(bytes).await.is_ok()
             && file.flush().await.is_ok()
         {
@@ -110,12 +110,12 @@ pub(crate) async fn spool_response_body(bytes: &[u8], spool_dir: Option<&Path>) 
     if bytes.len() > RESIDENT_LIMIT
         && let Some(dir) = spool_dir
     {
-        let path = SpoolPath(dir.join(format!(
+        let path = dir.join(format!(
             "res-{}-{}.spooltmp",
             std::process::id(),
             unique_seq()
-        )));
-        if let Ok(mut file) = tokio::fs::File::create(&path.0).await
+        ));
+        if let Ok((mut file, path)) = SpoolPath::create(path).await
             && file.write_all(bytes).await.is_ok()
             && file.flush().await.is_ok()
         {

@@ -47,6 +47,10 @@ pub struct InstanceSummary {
     pub version: Option<String>,
     /// Run start time in Unix milliseconds, independent of the time it was discovered.
     pub started_at: Option<u64>,
+    /// Why this run started; keep future spellings, distinguish an old record from no record.
+    pub launch_reason: Option<String>,
+    /// Source-redacted note for this start; absent when no note was recorded.
+    pub launch_note: Option<String>,
     /// What the latest enumeration established.
     pub liveness: super::Presence,
     /// Whether this port is waiting for restoration.

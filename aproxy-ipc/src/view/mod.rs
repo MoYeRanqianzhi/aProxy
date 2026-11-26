@@ -172,7 +172,14 @@ fn instance_summary(i: enumerate::Enumerated) -> InstanceSummary {
         }),
         pid: i.instance.as_ref().map(|r| r.pid),
         started_at: i.instance.as_ref().map(|r| r.started_at),
-        version: i.instance.map(|r| r.version),
+        version: i.instance.as_ref().map(|r| r.version.clone()),
+        launch_reason: i.instance.as_ref().map(|r| match r.launch_reason.as_str() {
+            "" => "unknown".into(),
+            reason => reason.to_owned(),
+        }),
+        launch_note: i
+            .instance
+            .and_then(|r| (!r.launch_note.is_empty()).then_some(r.launch_note)),
         liveness,
         restore_pending: i.restore_pending,
         restore_reason: i.restore_reason,

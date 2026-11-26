@@ -110,6 +110,10 @@ pub struct Card {
     pub version: Option<String>,
     /// Recorded start in Unix milliseconds.
     pub started_at: Option<SafeUint>,
+    /// Recorded reason for this start, including unrecognized spellings; null without a trusted record.
+    pub launch_reason: Option<String>,
+    /// Display-scrubbed note from that same start, if one was supplied.
+    pub launch_note: Option<String>,
     /// Discovery result, not history-feed health.
     pub liveness: view::Presence,
     /// Whether the port wants to run again.
@@ -246,6 +250,8 @@ impl Projection<'_> {
             pid: r.pid,
             version: r.version.as_deref().map(|s| self.text(s)),
             started_at: r.started_at.map(epoch).transpose()?,
+            launch_reason: r.launch_reason,
+            launch_note: r.launch_note.as_deref().map(|s| self.text(s)),
             liveness: r.liveness,
             restore_pending: r.restore_pending,
             restore_reason: r.restore_reason.as_deref().map(|s| {
@@ -459,6 +465,8 @@ impl Survey {
         }
         item.run = None;
         item.version = None;
+        item.launch_reason = None;
+        item.launch_note = None;
         Projection::new(&redact::Secrets::default()).card(item, None, None)
     }
     /// Latest watchdog projection; an absent owner is distinct from a disabled setting.

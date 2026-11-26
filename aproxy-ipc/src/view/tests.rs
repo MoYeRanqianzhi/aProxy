@@ -22,6 +22,8 @@ fn instance(port: u16, id: &str, n: u64) -> InstanceSummary {
         }),
         pid: Some(42),
         started_at: Some(1),
+        launch_reason: Some("start".into()),
+        launch_note: None,
         version: None,
         liveness: Presence::Live,
         restore_pending: false,
@@ -363,6 +365,80 @@ fn both_eviction_limits_keep_in_flight_records() {
         .collect();
     trim(&mut active, 2);
     assert_eq!(active.len(), 4);
+}
+
+#[cfg(feature = "desktop")]
+#[test]
+fn card_launch_provenance_follows_the_sampled_run() {
+    use crate::desktop::{LocalFacts, Survey};
+    use crate::redact::Secrets;
+
+    let observe = |member: &enumerate::Enumerated| {
+        let facts = LocalFacts {
+            secrets: Arc::new(Secrets::new(["local-key"])),
+            aliases: vec![],
+            restore: None,
+        };
+        Survey::observe(
+            std::slice::from_ref(member),
+            None,
+            [(member.port, facts)].into(),
+        )
+    };
+    let check = |survey: &Survey, member, reason: Value, note: Value| {
+        let card = survey.card(instance_summary(member)).unwrap();
+        let out = serde_json::to_value(card).unwrap();
+        assert_eq!(out.get("launchReason"), Some(&reason));
+        assert_eq!(out.get("launchNote"), Some(&note));
+    };
+    let mut record = json!({"pid":42,"start":"s","instance_id":"000000000000000a","version":"v",
+        "listen_addr":"local","base_url":"","started_at":1,"foreground":true});
+    let mut status = state(0);
+    status["features"] = json!([crate::wire::FEATURE_REDACTED_CLIENT_FIELDS]);
+    status["ops"] = json!(["ping"]);
+    status["behavior"] = json!({"delivery":"retry","disk_cache":false,"retry_rules":0,
+        "keepalive":{"trigger":"any","interval_secs":0}});
+    let live = |record: &Value| {
+        decode(json!({"port":80,"liveness":"live","instance":record,"status":status})).unwrap()
+    };
+    let older = live(&record);
+    check(&observe(&older), older, json!("unknown"), Value::Null);
+
+    record["launch_reason"] = json!("watchdog");
+    record["launch_note"] = json!("missed heartbeat");
+    let member = live(&record);
+    let survey = observe(&member);
+    check(
+        &survey,
+        member,
+        json!("watchdog"),
+        json!("missed heartbeat"),
+    );
+    record["launch_note"] = json!("recover local-key");
+    check(
+        &survey,
+        live(&record),
+        json!("watchdog"),
+        json!("recover <secret>"),
+    );
+
+    record["instance_id"] = json!("000000000000000b");
+    record["launch_reason"] = json!("Future-Spelling");
+    record["launch_note"] = json!("");
+    let successor = live(&record);
+    check(
+        &observe(&successor),
+        successor,
+        json!("Future-Spelling"),
+        Value::Null,
+    );
+    // A newer summary can reach the window before its matching display facts.
+    record["launch_note"] = json!("local-key");
+    check(&survey, live(&record), Value::Null, Value::Null);
+
+    let down = decode(json!({"port":80,"liveness":"down","instance":null,"restore_pending":true}))
+        .unwrap();
+    check(&observe(&down), down, Value::Null, Value::Null);
 }
 
 #[test]

@@ -70,6 +70,10 @@ export interface Card {
   pid: number | null;
   version: string | null;
   startedAt: Time | null;
+  /** 本次启动的来由：旧记录没有来由时为 unknown，没有可信记录时为 null；未来的拼写原样传递 */
+  launchReason: string | null;
+  /** 本次启动的备注，显示前已脱敏；没有备注或可信记录时为 null */
+  launchNote: string | null;
   liveness: Liveness;
   /** 实例不在了、但留着「应当在运行」的记录：等待恢复 */
   restorePending: boolean;

@@ -497,3 +497,5 @@ type FormatCommands = {
 ### Instance launch provenance
 
 Window starts and whole-instance restarts record `start` and `restart`, respectively. Restarting formats does not start an instance: it leaves `instance.launch_reason` and `instance.launch_note` unchanged. The CLI flags for an instance launch do not attach metadata to a format process.
+
+The desktop `Card` carries `launchReason` and `launchNote` from that run. A legacy record with no reason yields `"unknown"`; future reason strings pass through. No note means `null`. Without a matching record and display context, both fields are `null`, including on a restore-pending port. The note uses the same desktop display scrubbing as `version`.

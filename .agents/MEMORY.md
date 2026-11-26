@@ -53,3 +53,4 @@
 - [Legacy migration validation](memory/migration-validation-boundary.md) -- Why identifying a legacy file, inventorying its paths and certifying a rewrite use different readers.
 - [Parallel Codex tasks](memory/parallel-codex-tasks.md) -- 用户允许没有冲突的任务并行：各用独立 worktree、分支与 CARGO_TARGET_DIR；改同一批文件的仍排队（2026-11-26）。
 - [Launch provenance](memory/launch-provenance.md) -- Why one-start evidence belongs outside the spec even when an older binary receives it.
+- [Desktop card display context](memory/desktop-card-display-context.md) -- Why source-redacted run text still needs a matching desktop survey.

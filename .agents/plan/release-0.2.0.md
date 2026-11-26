@@ -1341,3 +1341,4 @@
     this affects reporting, not which processes are killed. Ordinary install compares native path components.
   - **Boundary:** workflow changes are proposals, not evidence of a hosted CI gate or an interactive desktop test.
 - **Instance launch provenance.** `start`, `restart` and `restore` accept `--reason` and `--note`. Status, the instance record and the log show the most recent launch; login, watchdog and rolling install carry their own reasons. The restore record and cross-version `__serve` arguments stay unchanged. This covers instance starts, not plugin execution.
+- **Desktop card launch provenance.** The window backend supplies the last start’s reason and display-scrubbed note for the sampled run. A waiting restore does not borrow the previous run’s explanation. See the [card contract](w5e-extensions.md#instance-launch-provenance).

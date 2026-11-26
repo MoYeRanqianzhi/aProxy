@@ -225,6 +225,9 @@ impl Responder {
         head_rx: Option<HeadRx>,
         during: &str,
     ) -> Option<F::Output> {
+        // 请求与响应转换的 future 很大。固定在这一层，下面的驱动器与 select 只传指针；
+        // 按值逐层传会让调试构建的 poll 栈帧叠到 Windows 的 1 MiB 主线程栈之外。
+        let fut = std::pin::pin!(fut);
         match self {
             Self::Buffered { .. } => Some(fut.await),
             Self::Keepalive {
@@ -246,6 +249,8 @@ impl Responder {
         preserve_non_sse: bool,
         during: &str,
     ) -> Option<F::Output> {
+        // 两条分支都借用同一份操作，尤其不要把整个转换 future 再按值传进 wait。
+        let fut = std::pin::pin!(fut);
         if preserve_non_sse
             && let Self::Keepalive { sink, .. } = self
             && !sink.is_committed()

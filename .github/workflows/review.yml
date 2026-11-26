@@ -30,4 +30,4 @@ jobs:
         with:
           persist-credentials: false
       # 检查维度与豁免口径见仓库根 deny.toml
-      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.3

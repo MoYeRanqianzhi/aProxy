@@ -29,6 +29,7 @@ compatibility.md, "Converting the files with aproxy migrate".
 
 ```
 aproxy config [--config ALIAS|PATH] show [--effective] [--json]
+aproxy config [--config ALIAS|PATH] show --chain [overrides|formats] [--json]
 aproxy config [--config ALIAS|PATH] get KEY [--json]
 aproxy config [--config ALIAS|PATH] set KEY VALUE|- [--json]
 aproxy config [--config ALIAS|PATH] unset KEY [--json]
@@ -47,6 +48,25 @@ absent before the first configuration).
   `built-in default` or `not set`), and lists credentials withheld from a global default. If the file has
   errors, `show` still prints the values, then lists the diagnostics on stderr as
   `file:line:col: key: message [code]` and exits 3.
+- **`show --chain NAME`** shows how the file is put together, one chain at a time. It reads the
+  file only: it starts no program, contacts no instance and judges nothing, so use it to answer
+  "where does this value come from" or "in which order do my formats run", not "is this right"
+  (for that, `doctor`). Without a name it lists the chains this version has.
+  - `overrides`: every key with its effective value and layer, followed by the values lower layers
+    set that it shadows (`settings.json global default set "blue" (shadowed)`), withheld
+    credentials on their key, and `per instance, not inherited` on `listen_addr`, `log_file` and
+    `format`. A running instance's `start` options (in its launch spec) sit above all of these and
+    are not shown; `status` shows its effective listen address and upstream.
+  - `formats`: each `[[format]]` entry (command, masked args, the names of its `env`, process,
+    `required`, stages, non-default timeouts), then the programs per stage in the order they run
+    (`response`, `stream` and `heartbeat` in reverse), which programs can give each decision
+    (`delivery`, `decision`, `reroute`: the first that answers wins), the last program before the
+    upstream and before the client, which request programs rerun before a retry, and which are
+    skipped when they fail (`required = false`). Programs declare stages, not what they do, so it
+    cannot tell which protocol a request ends up in; for that, look at one actual request in the
+    desktop request detail ("Protocol path") or `aproxy logs`.
+  - `--json` gives the same facts as one document with `chain` naming the view; parse it rather
+    than the text.
 - **`get KEY`** prints one key's effective value, with the layer it comes from.
 - **`set KEY VALUE`** changes one key; **`unset KEY`** removes one key. One key per command, so
   setting several keys takes several commands.

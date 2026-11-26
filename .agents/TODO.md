@@ -72,8 +72,8 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
     0.1.x 形状的文件时提示 `aproxy migrate`。`upgrade_from_0_1_0` 的 CI 测试在重装后跑它再跑一条要读 settings 的命令。
     排在 t10d 之后交给 Codex（t13）；用户可以改这个决定。
 
-- [ ] **链路视图 `config show --chain`**（用户 2026-11-26 定下命令划分）：0.2.0 做 overrides 与 formats 两条（t20，Codex 在做）；
-  完成后主代理补 skill、README、CHANGELOG。`config check` 与其余链路排在之后。用户允许：若拖住 0.2.0，可移到 0.2.1。
+- [ ] **链路视图其余部分**（用户 2026-11-26 定下命令划分）：`config show --chain` 的 overrides 与 formats 已做完（2026-11-26）；
+  `config check` 与其余链路（source、programs、spec，其后 network、headers、retry）未做。用户允许：若拖住 0.2.0，可移到 0.2.1。
   设计见 [plan/format-chain-view.md](plan/format-chain-view.md)。
 - [ ] **Windows CI 上 `startup_probes_run_in_parallel_and_respect_worker_lifetimes` 连挂两次**（2026-11-26）：启动来由合入后，
   run 45734971209（headless）与 45795726614（desktop）都在 `tests/format_protocol.rs:1633` 最后那次 GET 收到 10054 连接重置；之前

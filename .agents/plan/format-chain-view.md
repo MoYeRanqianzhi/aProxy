@@ -1,7 +1,7 @@
 # format 链路视图
 
-**状态（2026-11-26）**：命令划分已由用户定下（见「用户定下的」）。0.2.0 做 `config show --chain` 的 overrides 与 formats 两条
-（任务书 t20，Codex 在做）；其余链路与 `config check` 排在之后，hello 的 `effects` 与插件相关部分随插件一起做（[plugins](plugins.md)）。
+**状态（2026-11-26）**：命令划分已由用户定下（见「用户定下的」）。0.2.0 的 `config show --chain` overrides 与 formats 两条
+已做完（2026-11-26）；其余链路与 `config check` 排在之后，hello 的 `effects` 与插件相关部分随插件一起做（[plugins](plugins.md)）。
 
 ## 来由
 

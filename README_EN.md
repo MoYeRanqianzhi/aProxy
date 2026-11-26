@@ -375,7 +375,7 @@ timeout (for Claude Code, `API_TIMEOUT_MS`).
 | `aproxy alias add\|remove\|list` | Manage config aliases (stored in settings.json) |
 | `aproxy doctor` | Check settings.json and every config by the rules `start` applies, plus home and config permissions and unreadable records; exits 3 when it finds an error |
 | `aproxy find [keyword]` | Discover all configs in configured directories; `--aliased/--unaliased --port PORT` filters |
-| `aproxy config show\|get\|set\|unset` | View or modify the config: `show` prints the values written in the file, `--effective` adds the global and built-in defaults with each value's source; `set`/`unset` change one key per command |
+| `aproxy config show\|get\|set\|unset` | View or modify the config: `show` prints the values written in the file, `--effective` adds the global and built-in defaults with each value's source, `--chain overrides\|formats` shows which layer sets each value and what it shadows, or the order the format programs run in at each stage (reads the file only, lists facts); `set`/`unset` change one key per command |
 | `aproxy settings show\|get\|set\|unset` | View or modify the global settings (`~/.aproxy/settings.json`): aliases, `defaults` global defaults, watchdog, logs, install updates; works even when settings.json has errors, to repair it |
 | `aproxy install [VERSION]` | Install or upgrade (alias `upgrade`), rolling-restarting instances after a precheck of each; `--check` only looks for a newer version, `--variant` switches the build, `--force` forces an install; see the upgrade notes under Getting started |
 | `aproxy desktop` | Open the desktop window (see below) |

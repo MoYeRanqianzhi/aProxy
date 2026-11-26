@@ -529,40 +529,30 @@ fn spool_chunk_dropped_before_disk_create_leaves_no_file() {
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
-#[tokio::test]
-async fn spool_chunk_dropped_mid_disk_transition_leaves_no_file() {
-    // 内存 → 磁盘迁移本身要好几次 await（建文件、写 1 MiB 内存前缀、写本块）；
-    // future 恰在这期间被 drop（客户端断开）时，已建出的文件也必须删除。
-    // 逐次 poll，文件一出现就丢弃 future——正落在迁移中途
+#[test]
+fn spool_chunk_dropped_mid_disk_transition_leaves_no_file() {
     let dir = tempfile::tempdir().unwrap();
     let mut buf = SpoolBuffer::Memory(vec![b'x'; RESIDENT_LIMIT]);
-    let chunk = vec![b'y'; 1024];
     let count = || std::fs::read_dir(dir.path()).unwrap().count();
-    {
-        let fut = spool_chunk(&mut buf, &chunk, Some(dir.path()));
-        tokio::pin!(fut);
-        loop {
-            let polled = std::future::poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await;
-            assert!(polled.is_pending(), "前提：迁移不应在文件出现前就一次完成");
-            if count() > 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    }
-    // 阻塞池里在途的写操作可能还持着句柄：删除已发出，等它收尾
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while count() > 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "迁移中途被丢弃的 spool 文件必须删除"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    spool_test_runtime().block_on(async {
+        let hold_create = hold_spool_worker().await;
+        let mut fut = Box::pin(spool_chunk(&mut buf, b"y", Some(dir.path())));
+        assert!(futures_util::poll!(&mut fut).is_pending());
+        drop(hold_create);
+
+        // 建文件已返回，此时才推进迁移：写前缀只能入队，写下一块必定在等前缀。
+        let hold_write = hold_spool_worker().await;
+        assert_eq!(count(), 1);
+        assert!(futures_util::poll!(&mut fut).is_pending());
+        drop(fut);
+        drop(hold_write);
+    });
+    // 运行时退出已等在途写释放句柄；buf 仍存活，不能靠丢弃整个缓冲来通过断言。
+    assert_eq!(count(), 0, "迁移中途被丢弃的 spool 文件必须删除");
 }
 
-#[tokio::test]
-async fn request_body_dropped_mid_upload_leaves_no_file() {
+#[test]
+fn request_body_dropped_mid_upload_leaves_no_file() {
     // 客户端上传到一半断开：hyper 直接 drop handler future，read_request_body
     // 停在「等下一块」的 await 上、走不到任何显式出错分支——已溢写的
     // req-*.spooltmp 也必须当场删除。首块超过驻留阈值触发溢写，之后流
@@ -570,10 +560,15 @@ async fn request_body_dropped_mid_upload_leaves_no_file() {
     use futures_util::StreamExt as _;
     let dir = tempfile::tempdir().unwrap();
     let first = Bytes::from(vec![b'x'; RESIDENT_LIMIT + 1]);
-    let stream = futures_util::stream::iter([Ok::<_, std::io::Error>(first)])
-        .chain(futures_util::stream::pending());
+    let (waiting, next_chunk) = tokio::sync::oneshot::channel();
+    let stream = futures_util::stream::iter([Ok::<_, std::io::Error>(first)]).chain(
+        futures_util::stream::once(async move {
+            waiting.send(()).unwrap();
+            std::future::pending().await
+        }),
+    );
     let count = || std::fs::read_dir(dir.path()).unwrap().count();
-    {
+    spool_test_runtime().block_on(async {
         let fut = read_request_body(
             Body::from_stream(stream),
             usize::MAX,
@@ -582,28 +577,14 @@ async fn request_body_dropped_mid_upload_leaves_no_file() {
             None,
         );
         tokio::pin!(fut);
-        // 逐次 poll：文件出现后再推进一段时间，让溢写写完、future 停到
-        // 「等下一块」上（这正是客户端上传中途停住再断开的形态）
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut settled_polls = 0;
-        while settled_polls < 50 {
-            let polled = std::future::poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await;
-            assert!(polled.is_pending(), "前提：请求体流未结束，读取不应完成");
-            assert!(std::time::Instant::now() < deadline, "溢写文件始终未出现");
-            if count() > 0 {
-                settled_polls += 1;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        // 只有处理完首块、再次索取数据才会收到通知；此时取消，覆盖等客户端续传的分支。
+        tokio::select! {
+            _ = &mut fut => panic!("前提：请求体流未结束，读取不应完成"),
+            result = next_chunk => result.unwrap(),
         }
-    }
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while count() > 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "上传中途被丢弃的请求体临时文件必须删除"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+        assert_eq!(count(), 1, "前提：请求体已溢写磁盘");
+    });
+    assert_eq!(count(), 0, "上传中途被丢弃的请求体临时文件必须删除");
 }
 
 #[tokio::test]

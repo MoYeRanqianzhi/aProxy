@@ -31,6 +31,12 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
     （第 14 轮暴露的是另一个端口复用竞态，已修）。CI 的 Windows 任务现在会在失败时上传转储与 PDB
     （artifact `crash-dumps-windows-<variant>`）；启动失败的断言现在带上日志与台账。**下一次出现先取转储看调用栈**。
     在此之前 alpha.4 是否照发由用户定
+  - **又出现两次，都没有转储**：run 44983308513，以及 2026-11-26 的 run 45830004506
+    （`program_before_the_retry_segment_is_not_called_again_on_retries`，本该成功的 `start --json`，stdout 为空，
+    实例本身已起来并写了日志）。artifact 里只有 exe 与 PDB，没有 `.dmp`。runner 镜像没有禁用 WER
+    （`Configure-Diagnostics.ps1` 只设了 DontShowUI、ForceQueue），原因未明。CI 的 Windows 任务现在在测试前打印并放开
+    WerSvc，失败后打印 aproxy 的应用错误事件（1000/1001）并把 WER 排队目录里 aproxy 的报告拷进转储 artifact。
+    下一次出现先看这一步的输出：事件 1000 的出错模块与偏移，事件 1001 说明转储去了哪里
 - [ ] **协议转换的两条已知限制**（出在 `switchyard-translation` 里，记在 [format-roles](plan/format-roles.md)）：写进给用户的文档
   （`aproxy-format` 技能与 README），并报给上游。Messages 的 thinking 签名过不了 Chat 这一条，以后可以考虑在 convert 里
   按工具调用 ID 暂存签名、下一轮请求转回 Messages 时补上（跨请求的进程内状态，worker 重启就丢），0.2.0 不做。

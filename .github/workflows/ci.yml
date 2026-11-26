@@ -98,7 +98,29 @@ jobs:
             Set-ItemProperty -Path $key -Name DumpType -Type DWord -Value 2
             Set-ItemProperty -Path $key -Name DumpCount -Type DWord -Value 4
           }
+          # 两次堆损坏都没留下 .dmp。先把 WER 服务的状态打出来，被禁用就改成手动启动，
+          # 否则 LocalDumps 不会生效；镜像本身只关了弹窗、把报告改成排队（ForceQueue）。
+          Get-Service WerSvc | Format-List Name, Status, StartType
+          if ((Get-Service WerSvc).StartType -eq 'Disabled') { Set-Service WerSvc -StartupType Manual }
       - run: cargo test --workspace ${{ matrix.flags }} --locked --no-fail-fast --verbose
+      # 没有转储时，系统应用日志里的崩溃事件至少给出异常码、出错模块与偏移（事件 1000），
+      # 以及 WER 把报告与转储放到了哪里（事件 1001）。只挑提到 aproxy 的事件。
+      - name: Show crash events of aproxy
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-Service WerSvc | Format-List Name, Status, StartType
+          Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Id = 1000, 1001, 1026 } -MaxEvents 200 -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match 'aproxy' } |
+            Format-List TimeCreated, Id, ProviderName, Message
+          Get-ChildItem -Recurse -ErrorAction SilentlyContinue "$env:ProgramData\Microsoft\Windows\WER" |
+            Where-Object { $_.FullName -match 'aproxy' } |
+            Format-Table FullName, Length -AutoSize
+          # 排队的报告目录可能带着小转储；拷进转储目录，随下一步一起上传（上传步骤只认一个盘）
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\dumps\wer" | Out-Null
+          Get-ChildItem -Directory -ErrorAction SilentlyContinue "$env:ProgramData\Microsoft\Windows\WER\ReportQueue", "$env:ProgramData\Microsoft\Windows\WER\ReportArchive" |
+            Where-Object { $_.Name -match 'aproxy' } |
+            ForEach-Object { Copy-Item -Recurse -Force $_.FullName "$env:RUNNER_TEMP\dumps\wer\" }
       # 转储要配上同一次构建的可执行文件与符号才读得出调用栈
       - name: Upload crash dumps
         if: failure()

@@ -104,6 +104,12 @@ Every other client, the reasoning behind the timeouts, and how to verify the set
   (`--api-key`) travel in a launch-spec file, not on the instance's command line.
 - A `--foreground` instance writes no record: closing its console ends it, `restore` does not
   revive it, and `restart` refuses it.
+- When you start, restart or restore an instance, say why with `--note`, for example
+  `aproxy restart 12346 --note "Claude Code agent: applying the new retry rules the user asked for"`.
+  `status` shows it on the instance's `Last start:` line and the log records it, so the user, or
+  the next agent, can tell later who restarted the instance and why. Keep secrets out of the note.
+  When an instance restarted on its own, its `Last start:` line names the watchdog or an upgrade
+  and why: commands.md, status.
 - `aproxy desktop` opens the desktop window for the user: the same instances, logs and configs
   the CLI sees, plus themes and extensions. You work through the CLI; open the window only when the
   user asks for it. Details: commands.md, desktop.

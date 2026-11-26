@@ -387,6 +387,15 @@ multi-instance), `--listen-addr <ADDR>`, `--base-url <URL>`,
 `--log-file <PATH>`, `--foreground`. A bare `aproxy` with no command only prints the
 help and exits 2.
 
+`start`, `restart` and `restore` also take `--note <TEXT>`: one line (at most 512 bytes, no
+secrets) saying who started the instance and why, for example
+`aproxy restart 12346 --note "new retry rules"`. It belongs to that one start, goes into the
+instance log, and `aproxy status` shows it on the instance's `Last start:` line. Without a note the
+reason is still recorded: a manual start, restart or restore, a restore at login, a watchdog
+relaunch after a crash or hang (with the previous process's exit code), or a restart for an
+upgrade (with the old and new versions). Use `--reason plugin` when starting on behalf of a
+plugin.
+
 ## Desktop window
 
 `aproxy desktop` opens the desktop window. It is a separate process that exits when its window is

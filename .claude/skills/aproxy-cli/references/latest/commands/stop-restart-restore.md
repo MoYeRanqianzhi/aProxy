@@ -64,8 +64,8 @@ asking.
 ## restart
 
 ```
-aproxy restart [PORT|ALIAS|PATH|default|all] [--force] [--json]
-aproxy restart idle [--idle-threshold-secs SECS] [--force] [--json]
+aproxy restart [PORT|ALIAS|PATH|default|all] [--force] [--reason R] [--note TEXT] [--json]
+aproxy restart idle [--idle-threshold-secs SECS] [--force] [--reason R] [--note TEXT] [--json]
 aproxy restart [PORT|ALIAS|PATH|default|all|idle] --format all|NAME... [--json]
 ```
 
@@ -73,7 +73,8 @@ Restarts running instances from their launch specs, which is how config.toml edi
 Targets are resolved the same way as for [stop](#stop), but `restart` never starts a non-running
 target and never deletes a desired-state record. The same caution applies: restarting the instance
 your own client uses drops its in-flight requests, and if the new instance fails to start you lose
-your connection to the model.
+your connection to the model. Say why you restart with `--note`; `--reason` and `--note` are
+described in [start](start.md#options-for-start), "Reason and note".
 
 - **Only running instances.** A target that is not running exits 4 (`target_not_running`), and
   so does `restart` with no target when nothing is running; use `start` for that.
@@ -151,14 +152,15 @@ is the gentle option when the instance carries your own session.
 ## restore
 
 ```
-aproxy restore [--json]
+aproxy restore [--reason R] [--note TEXT] [--json]
 ```
 
 Starts every instance that has a desired-state record but is not running: instances that crashed,
 were killed, or were running when the machine lost power or rebooted. A graceful `stop`, a
 `stop --force`, or `stop` on an instance that had already crashed deletes the record, so stopped
 instances are not revived. Each instance is started from the launch spec in its record and gets the
-same 30 s readiness check.
+same 30 s readiness check. Each restored instance records the reason `restore` (or `--reason`)
+and the `--note`, as described in [start](start.md#options-for-start), "Reason and note".
 
 | Output | Meaning |
 |---|---|

@@ -17,6 +17,8 @@ Only `start` takes start options; each other command lists its own options with 
 | `--api-key KEY\|-` | overrides `api_key`; `-` reads one line from stdin |
 | `--log-file PATH` | log file for the instance being started; overrides `log_file` |
 | `--foreground` | run in this console instead of the background |
+| `--reason start\|restart\|restore\|plugin` | why this start happens; default `start`. See below |
+| `--note TEXT` | a one-line note recorded with this start, such as who started it and why. See below |
 | `-h, --help` / `-V, --version` | help / print `aproxy v<version> (<variant>; <target>[; x86-64-v3])` (compatibility.md) |
 
 - The positional target, `--config`, `--foreground` and the overrides all belong to `start`.
@@ -37,6 +39,29 @@ Only `start` takes start options; each other command lists its own options with 
 - `start` expands `~` and turns a relative config path into an absolute one against the current
   directory; the instance records that absolute path. `--log-file` expands `~` and resolves a
   relative path against `<home>`, like `log_file`.
+
+**Reason and note.** `start`, `restart` and `restore` accept `--reason` and `--note`. They describe
+one start, not the instance: they are not part of the launch spec, so a later restart or a watchdog
+respawn records its own reason instead of repeating yours. The instance writes both to its log
+(`Instance started launch_reason=… launch_note=…`), to its registry record and to `status`
+(`Last start: restarted (…)`; `launch_reason` and `launch_note` under `instance` in `--json`).
+
+- `--reason` defaults to the command (`start`, `restart`, `restore`). Of the other values only
+  `plugin` can be given; aProxy sets the rest itself: `login` (restored by the logon task),
+  `watchdog` (respawned after a crash or hang; the note says `previous process exited with code
+  <n>`, `previous process exited` or `previous process stopped responding`), `upgrade` (restarted
+  by `aproxy install`; the note is `<old> -> <new>` when the old version is known) and `unknown`
+  (started by a version that predates this, or with no reason passed). Any other value is a usage
+  error (exit 2) and nothing starts. `install --force` ends with a plain `restore`, so instances it
+  brings back show `restored`.
+- `--note` is 1 to 512 bytes of UTF-8 on one line, without control characters; anything else, an
+  empty note included, is a usage error and nothing starts. The instance replaces the secrets it
+  knows (from its config and launch spec) before recording the note, but anything else in it is
+  shown as written: never put keys or private details there.
+- `restart all`, `restart idle` and a `restore` of several instances give each the same reason and
+  note. `restart --format` does not start an instance and records nothing.
+- An instance of an older version accepts the start but records nothing; `status` shows its
+  reason as `unknown`.
 
 **Which config file a command uses:** `start` uses its positional target, else `--config`, else
 `default_config` from settings.json, else `<home>/config.toml`. `config …` uses its own `--config`

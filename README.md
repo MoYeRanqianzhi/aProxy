@@ -203,6 +203,8 @@ Codex 的 `stream_idle_timeout_ms` 默认 300000（5 分钟），按 SSE 事件�
 
 `start` 的参数：`<别名|路径>` 或 `--config <PATH>`（指定配置文件，多开用；两者等价）、`--listen-addr <ADDR>`、`--base-url <URL>`、`--proxy <URL>`、`--api-key <KEY|->`（只记录进这次启动的拉起规格，`restart`/`restore` 沿用，不写进 config.toml；`-` 表示从 stdin 读一行）、`--log-file <PATH>`、`--foreground`。不带命令的 `aproxy` 只打印帮助并以退出码 2 结束。
 
+`start`、`restart`、`restore` 还接受 `--note <文字>`：一行说明（至多 512 字节，不要写密钥），说清谁、为什么启动这个实例，例如 `aproxy restart 12346 --note "换上新的重试规则"`。它只属于这一次启动，记进实例日志，`aproxy status` 在 `Last start:` 一行显示（中文界面为「最近一次启动」）。不写时也会记下来由：手动的启动、重启、恢复，登录时恢复，看门狗在崩溃或卡死后重拉（附上一个进程的退出码），升级后重启（附新旧版本）。代插件启动时用 `--reason plugin` 标明。
+
 ## 桌面界面
 
 `aproxy desktop` 打开桌面界面。它是一个独立的窗口进程，关掉窗口就退出，实例照常运行，与窗口开没开无关。和其余 aproxy 命令一样，它发现上次的安装没做完时会在后台把安装续完，续作可能逐个重启实例。

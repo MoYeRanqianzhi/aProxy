@@ -45,7 +45,14 @@ upstream, config path (`(no configuration file)` when it was started without one
 `Requests <n>  in flight <n>  retries <n>  rescued <n>  last error: …`: requests received, requests still in flight
 (waiting for the upstream, backing off, retrying or still being delivered), upstream retries,
 requests that succeeded only after a retry ("rescued"), and the latest error as
-`"<code>: <message>" (<age> ago)` or `none`. Extra lines can appear:
+`"<code>: <message>" (<age> ago)` or `none`. Each running and each unresponsive instance also has
+`Last start: <reason>` with the note in parentheses when one was given, for example
+`Last start: relaunched by the watchdog (previous process exited with code 3)` or
+`Last start: restarted (Claude Code agent: applying new retry rules)`. The reasons read `started`,
+`restarted`, `restored`, `restored at login`, `relaunched by the watchdog`, `restarted for an
+upgrade`, `started by a plugin` and `unknown` (an older instance, or a start that gave none); a
+spelling this version does not know, from a newer instance, is shown as it is. The fields and their
+meaning: [start](start.md#options-for-start), "Reason and note". Extra lines can appear:
 
 - `Starting (not accepting requests yet)`.
 

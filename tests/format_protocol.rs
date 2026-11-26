@@ -4024,17 +4024,27 @@ async fn client_disconnect_aborts_open_streams_on_their_own_workers() {
     assert_eq!(prefix, b"[[first");
     drop(res);
     for name in ["outer", "inner"] {
-        let messages = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let pid_log = format!("{name}-pids");
+        let (messages, pids) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let messages = observed_stage(&home, name, "stream", 1).await;
                 if messages.last().is_some_and(|v| v["event"] == "abort") {
-                    break messages;
+                    // 夹具先记录帧，再往另一个文件写 pid；看到 abort 还不能断言 pid 已写齐。
+                    let pids: Vec<_> = frames(&home, &pid_log)
+                        .into_iter()
+                        .filter(|v| v["event"] == "stream")
+                        .collect();
+                    if pids.len() >= messages.len() {
+                        break (messages, pids);
+                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|_| {
+            panic!("{name}: timed out waiting for abort and its worker observations")
+        });
         assert_eq!(
             messages.last().unwrap()["reason"],
             serde_json::json!({"code":"client_gone"})
@@ -4043,10 +4053,6 @@ async fn client_disconnect_aborts_open_streams_on_their_own_workers() {
             assert_eq!(frame["seq"], idx + 1);
             assert_eq!(frame["stream_id"], messages[0]["stream_id"]);
         }
-        let pids: Vec<_> = frames(&home, &format!("{name}-pids"))
-            .into_iter()
-            .filter(|v| v["event"] == "stream")
-            .collect();
         assert_eq!(pids.len(), messages.len());
         assert!(pids.iter().all(|v| v["pid"] == pids[0]["pid"]));
     }

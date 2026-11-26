@@ -232,10 +232,10 @@ function loadConfig(inst: Instance) {
   inst.keepalive.trigger = doc.trigger === 'body-stream' ? 'body_stream' : (doc.trigger ?? 'any');
 }
 
-async function bringUp(inst: Instance): Promise<Run> {
+async function bringUp(inst: Instance, reason: 'start' | 'restore'): Promise<Run> {
   restorePending.delete(inst.port);
   loadConfig(inst);
-  await engine.start(inst.port);
+  await engine.start(inst.port, reason);
   return runOf(inst)!;
 }
 
@@ -420,7 +420,7 @@ const handlers: Handlers = {
     } else if (inst.status !== 'stopped') {
       throw fault('desktop_port', { port: inst.port });
     }
-    return bringUp(inst);
+    return bringUp(inst, 'start');
   },
 
   async stop_instance({ run }) {
@@ -452,7 +452,7 @@ const handlers: Handlers = {
   async restore_instance({ port, expectedRestore }) {
     const inst = engine.instance(port);
     if (!inst || !restorePending.has(port) || expectedRestore !== restoreToken(port)) throw fault('desktop_changed', {});
-    return bringUp(inst);
+    return bringUp(inst, 'restore');
   },
 
   async forget_restore({ port, expectedRestore }) {

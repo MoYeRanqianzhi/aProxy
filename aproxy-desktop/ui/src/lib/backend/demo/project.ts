@@ -128,6 +128,8 @@ export function cardOf(inst: Instance, logs: SimEntry[], restorePending: boolean
     pid: inst.pid,
     version: inst.version,
     startedAt: down ? null : inst.startedAt,
+    launchReason: down ? null : inst.launch.reason,
+    launchNote: down ? null : inst.launch.note,
     liveness: down ? 'down' : stuck ? 'unresponsive' : 'live',
     restorePending: down && restorePending,
     restoreReason: null,

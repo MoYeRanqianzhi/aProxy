@@ -5,7 +5,7 @@
 -->
 <script lang="ts">
   import { untrack } from 'svelte';
-  import { t, ago, durLong, uptime, fmtNum } from '../lib/i18n';
+  import { t, ago, durLong, uptime, fmtNum, hasMessage } from '../lib/i18n';
   import { ui } from '../lib/state.svelte';
   import { refKey, runKey, store } from '../lib/store.svelte';
   import { overlays } from '../lib/overlays.svelte';
@@ -26,6 +26,34 @@
   const inst = $derived(store.card(ui.instancePort));
   const status = $derived(inst ? statusOf(inst) : null);
   const busy = $derived(status === 'starting' || status === 'restarting' || status === 'stopping');
+
+  // ---------------------------------------------------------------------------
+  // 最近一次启动：实例自己记下的来由与备注。来由是固定拼写，这里认得的才翻译，更新版本的实例
+  // 可能带来界面不认识的拼写，原样显示。看门狗与升级的备注是实例用固定英文写的，认得的句式翻译成
+  // 界面语言；其余备注是启动它的人或 agent 写的，原样显示
+  // ---------------------------------------------------------------------------
+
+  const launch = $derived.by(() => {
+    const reason = inst?.launchReason;
+    if (!inst?.run || !reason) return null;
+    const key = `launch.${reason}`;
+    return { label: hasMessage(key) ? t(key) : reason, note: launchNote(reason, inst.launchNote) };
+  });
+
+  function launchNote(reason: string, note: string | null): string | null {
+    if (!note) return null;
+    if (reason === 'watchdog') {
+      const code = /^previous process exited with code (-?\d+)$/.exec(note);
+      if (code) return t('launch.exitedCode', { code: code[1] });
+      if (note === 'previous process exited') return t('launch.exited');
+      if (note === 'previous process stopped responding') return t('launch.hung');
+    }
+    if (reason === 'upgrade') {
+      const v = /^(\S+) -> (\S+)$/.exec(note);
+      if (v) return t('launch.versions', { from: v[1], to: v[2] });
+    }
+    return note;
+  }
 
   // ---------------------------------------------------------------------------
   // 这次运行的请求：在途的那几条从这里来。快照里的最近 50 条是整个 home 的，不能当成这次运行的列表，
@@ -244,6 +272,12 @@
       {#if inst.version}<span class="chip">v{inst.version}</span>{/if}
       {#if inst.startedAt !== null && inst.run}<span class="chip">{t('card.uptime', { d: uptime(store.now - inst.startedAt) })}</span>{/if}
     </div>
+    {#if launch}
+      <p class="launch">
+        <Icon name="clock" size={14} stroke={2.2} /><span class="launch-label">{t('launch.title')}</span><span
+          class="launch-reason">{launch.label}</span>{#if launch.note}<span class="launch-note">{launch.note}</span>{/if}
+      </p>
+    {/if}
     <div class="actions">
       <button class="btn sm" onclick={openLogs}><Icon name="list" size={14} />{t('inst.openLogs')}</button>
       <button class="btn sm" disabled={!inst.run} onclick={() => ui.go('config', inst.port)}><Icon name="sliders" size={14} />{t('inst.editConfig')}</button>
@@ -493,6 +527,36 @@
     gap: 6px;
     color: var(--text-2);
     margin-right: 4px;
+  }
+  /* 最近一次启动：备注可能是一整句话，按文字自然折行、不截断；悬挂缩进让折下来的行与文字对齐 */
+  .launch {
+    margin: 0;
+    padding-left: 22px;
+    text-indent: -22px;
+    color: var(--text-2);
+    font-size: var(--fs-sm);
+    line-height: 1.5;
+  }
+  .launch :global(svg) {
+    display: inline-block;
+    vertical-align: -2px;
+    margin-right: 8px;
+  }
+  .launch-label {
+    color: var(--text-3);
+    margin-right: 8px;
+  }
+  .launch-reason {
+    color: var(--text);
+    font-weight: 560;
+  }
+  .launch-note {
+    overflow-wrap: anywhere;
+  }
+  .launch-note::before {
+    content: '·';
+    margin: 0 8px;
+    color: var(--text-3);
   }
   .actions {
     display: flex;

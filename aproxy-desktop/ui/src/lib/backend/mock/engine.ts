@@ -193,7 +193,7 @@ export class Engine {
   }
 
   /** 模拟一个需要时间的状态切换：先进入「正在重启」，过一会儿落到目标状态 */
-  private cycle(port: number, after: Instance['status'], ms: number): Promise<void> {
+  private cycle(port: number, after: Instance['status'], ms: number, reason: string): Promise<void> {
     const inst = this.instance(port);
     if (!inst) return Promise.resolve();
     inst.status = 'restarting';
@@ -204,6 +204,8 @@ export class Engine {
         inst.status = after;
         inst.pid = 20000 + Math.floor(this.r() * 9000);
         inst.startedAt = Date.now();
+        // 演示窗口里的启动、重启、恢复都由用户点按钮发起，没有备注
+        inst.launch = { reason, note: null };
         this.emitInstances();
         resolve();
       }, ms),
@@ -212,11 +214,11 @@ export class Engine {
 
   restart(port: number): Promise<void> {
     this.cutInflight(port);
-    return this.cycle(port, 'active', 1600);
+    return this.cycle(port, 'active', 1600, 'restart');
   }
 
-  start(port: number): Promise<void> {
-    return this.cycle(port, 'idle', 1200);
+  start(port: number, reason: 'start' | 'restore' = 'start'): Promise<void> {
+    return this.cycle(port, 'idle', 1200, reason);
   }
 
   setPinned(key: string, pinned: boolean) {

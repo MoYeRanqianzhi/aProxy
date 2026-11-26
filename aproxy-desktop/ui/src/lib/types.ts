@@ -41,6 +41,8 @@ export interface Instance {
   configPath: string;
   proxy: string | null;
   startedAt: number;
+  /** 这一次启动的来由（start、restart、restore、login、watchdog、upgrade、plugin、unknown）与备注 */
+  launch: { reason: string; note: string | null };
   lastRequestAt: number | null;
   req1h: number;
   retry1h: number;

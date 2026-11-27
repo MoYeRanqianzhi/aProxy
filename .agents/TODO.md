@@ -14,10 +14,9 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 计划：[plan/release-0.2.0.md](plan/release-0.2.0.md)，执行顺序、tag 节点与进度在它的「执行顺序与进度」一节（2026-11-11 用户：
 做完 0.2.0、过程中持续提交与打 tag）；定调：[0.2.0-direction](memory/2026-10-11-0.2.0-direction.md)。
 **接下来做什么、谁在做，看 [plan/codex-tasks-0.2.0.md](plan/codex-tasks-0.2.0.md)**（交给 Codex 的任务清单，按先后排好）。
-已发：alpha.1（2026-10-13）、alpha.2（2026-11-17）、alpha.3（2026-11-19）。下一个：alpha.4（format 一线做完）。
+已发：alpha.1（2026-10-13）、alpha.2（2026-11-17）、alpha.3（2026-11-19）、alpha.4（2026-11-21，format 一线做完）。下一个：beta.1。
 
-- [ ] **W2 契约实现**（按设计稿 §14）：P1–P5 与 B0–B9 已做完（alpha.3）；剩 B10a–B10d、B11 与 W2c，即 format 协议 1 与官方
-  aproxy-format，任务 t06 在做，做完打 alpha.4。实现落地后重写永久接口清单
+- [ ] **W2 契约实现**（按设计稿 §14）：全部做完（B10a–B10d、B11、W2c 随 alpha.4 发出）；剩实现落地后重写永久接口清单
 - [ ] **性能**（用户 2026-11-20）：在服务器上严格测出基线，功能都接入之后重测，rc.1 之前做优化。见
   [plan/perf-0.2.0.md](plan/perf-0.2.0.md)
 - [ ] **已知缺口**（B9 留下，归 W6）：`start_failed` 的 `details.code` 没填；没有路径产生 `instance_incompatible`；

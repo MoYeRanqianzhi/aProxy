@@ -64,6 +64,57 @@ async fn spawn_from_spec_reports_an_early_exit_at_once_and_waits_for_a_healthy_i
         "启动即死应立即报告，不空等到时限（用了 {elapsed:?}）"
     );
 
+    // 极短命的程序在第一次就绪轮询前就可能退出。Windows 的高位状态不是负数，
+    // Unix 的信号也不是 shell 报告的 128 + 信号号。
+    let mut stub_spec = spec.clone();
+    #[cfg(windows)]
+    let (stub, cases) = {
+        use common::ReportExit as _;
+        let source = home.path().join("exit.rs");
+        let exe = home.path().join("exit.exe");
+        std::fs::write(&source, r#"fn main() { std::process::exit(std::env::var("STUB_STATUS").unwrap().parse::<u32>().unwrap() as i32); }"#).unwrap();
+        let built = home
+            .cmd_with("rustc")
+            .arg(source)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .report_exit()
+            .unwrap();
+        assert!(built.status.success(), "{built:?}");
+        (exe, [("3", Some(3)), ("3221226356", Some(0xc0000374))])
+    };
+    #[cfg(unix)]
+    let (stub, cases) = {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = home.path().join("exit");
+        std::fs::write(
+            &exe,
+            "#!/bin/sh\nif [ \"$STUB_STATUS\" = signal ]; then kill -TERM $$; fi\nexit 3\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (exe, [("3", Some(3)), ("signal", None)])
+    };
+    for (status, expected) in cases {
+        stub_spec
+            .env
+            .insert("STUB_STATUS".into(), Some(status.into()));
+        let error = spawn_from_spec(
+            home.path(),
+            &stub,
+            &stub_spec,
+            &spec::Launch::new("start"),
+            READY_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, SpawnError::Exited { code, .. } if code == expected),
+            "{error:?}"
+        );
+    }
+
     // 2. 监听端口 0：由系统分配，等到就绪并报出实际端口
     let cfg = home.path().join("port-zero.toml");
     std::fs::write(

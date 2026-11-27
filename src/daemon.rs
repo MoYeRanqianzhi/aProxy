@@ -619,111 +619,124 @@ pub fn spawn_detached_with(
 ) -> io::Result<u32> {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
-        use windows_sys::Win32::System::Threading::{
-            CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
-            CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
-        };
-
-        /// Windows 命令行引号规则：含空格/制表符/引号的参数包引号；
-        /// 参数内的 `"` 转成 `""`，引号前的连续 `\` 翻倍（闭引号前同样翻倍）。
-        fn quote_arg(arg: &str) -> String {
-            if !arg.is_empty()
-                && !arg
-                    .chars()
-                    .any(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c' | '"'))
-            {
-                return arg.to_string();
-            }
-            let mut out = String::with_capacity(arg.len() + 2);
-            out.push('"');
-            let mut backslashes = 0usize;
-            for c in arg.chars() {
-                match c {
-                    '\\' => backslashes += 1,
-                    '"' => {
-                        out.push_str(&"\\".repeat(backslashes * 2 + 1));
-                        out.push('"');
-                        backslashes = 0;
-                    }
-                    _ => {
-                        out.push_str(&"\\".repeat(backslashes));
-                        out.push(c);
-                        backslashes = 0;
-                    }
-                }
-            }
-            // 闭引号前的 `\` 同样要翻倍，否则会被当作转义引号
-            out.push_str(&"\\".repeat(backslashes * 2));
-            out.push('"');
-            out
-        }
-
-        let mut cmdline = quote_arg(&exe.display().to_string());
-        for arg in args {
-            cmdline.push(' ');
-            cmdline.push_str(&quote_arg(arg));
-        }
-        let exe_wide: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
-        let mut cmdline_wide: Vec<u16> = cmdline.encode_utf16().chain(Some(0)).collect();
-        // 没有要改的变量时传 NULL（继承），省掉一次整块复制
-        let env_block = (!launch.env.is_empty()).then(|| windows_env_block(launch.env));
-        let env_ptr = env_block
-            .as_ref()
-            .map_or(std::ptr::null(), |block| block.as_ptr().cast());
-        let cwd_wide: Option<Vec<u16>> = launch
-            .cwd
-            .map(|dir| dir.as_os_str().encode_wide().chain(Some(0)).collect());
-        let cwd_ptr = cwd_wide
-            .as_ref()
-            .map_or(std::ptr::null(), |dir| dir.as_ptr());
-
-        let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
-        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-        let mut create = |flags: u32| -> Result<(), u32> {
-            let ok = unsafe {
-                CreateProcessW(
-                    exe_wide.as_ptr(),
-                    cmdline_wide.as_mut_ptr(),
-                    std::ptr::null(), // lpProcessAttributes：默认安全描述符
-                    std::ptr::null(), // lpThreadAttributes：默认安全描述符
-                    0,                // bInheritHandles=FALSE：核心目的，杜绝句柄泄漏
-                    flags,
-                    env_ptr,
-                    cwd_ptr,
-                    &si,
-                    &mut pi,
-                )
-            };
-            if ok == 0 {
-                Err(unsafe { GetLastError() })
-            } else {
-                Ok(())
-            }
-        };
-        let base = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
-        if create(base | CREATE_BREAKAWAY_FROM_JOB).is_err() {
-            // 作业不允许脱出（或别的原因）：去掉标志再试。这一次的错误才是要报的错误——
-            // 可执行文件不在、没有权限这类原因两次都会失败
-            create(base).map_err(|code| io::Error::from_raw_os_error(code as i32))?;
-            append_startup_log(&format!(
-                "warning: pid {} could not leave the launcher's job object and stays inside it; ending that job ends this process too",
-                pi.dwProcessId
-            ));
-        }
-        let pid = pi.dwProcessId;
-        // 守护进程只关心 pid；句柄持有会导致进程退出通知与资源泄漏
-        unsafe {
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-        }
-        Ok(pid)
+        spawn_detached_process(exe, args, launch).map(|(pid, _)| pid)
     }
     #[cfg(unix)]
     {
         Ok(detached_command(exe, args, launch).spawn()?.id())
+    }
+}
+
+/// 把原始进程句柄交给需要观察退出状态的拉起者；只要 pid 的路径立即释放句柄。
+#[cfg(windows)]
+pub(crate) fn spawn_detached_process(
+    exe: &std::path::Path,
+    args: &[String],
+    launch: &Launch<'_>,
+) -> io::Result<(u32, std::os::windows::io::OwnedHandle)> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows_sys::Win32::System::Threading::{
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+        PROCESS_INFORMATION, STARTUPINFOW,
+    };
+
+    /// Windows 命令行引号规则：含空格/制表符/引号的参数包引号；
+    /// 参数内的 `"` 转成 `""`，引号前的连续 `\` 翻倍（闭引号前同样翻倍）。
+    fn quote_arg(arg: &str) -> String {
+        if !arg.is_empty()
+            && !arg
+                .chars()
+                .any(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c' | '"'))
+        {
+            return arg.to_string();
+        }
+        let mut out = String::with_capacity(arg.len() + 2);
+        out.push('"');
+        let mut backslashes = 0usize;
+        for c in arg.chars() {
+            match c {
+                '\\' => backslashes += 1,
+                '"' => {
+                    out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                    out.push('"');
+                    backslashes = 0;
+                }
+                _ => {
+                    out.push_str(&"\\".repeat(backslashes));
+                    out.push(c);
+                    backslashes = 0;
+                }
+            }
+        }
+        // 闭引号前的 `\` 同样要翻倍，否则会被当作转义引号
+        out.push_str(&"\\".repeat(backslashes * 2));
+        out.push('"');
+        out
+    }
+
+    let mut cmdline = quote_arg(&exe.display().to_string());
+    for arg in args {
+        cmdline.push(' ');
+        cmdline.push_str(&quote_arg(arg));
+    }
+    let exe_wide: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut cmdline_wide: Vec<u16> = cmdline.encode_utf16().chain(Some(0)).collect();
+    // 没有要改的变量时传 NULL（继承），省掉一次整块复制
+    let env_block = (!launch.env.is_empty()).then(|| windows_env_block(launch.env));
+    let env_ptr = env_block
+        .as_ref()
+        .map_or(std::ptr::null(), |block| block.as_ptr().cast());
+    let cwd_wide: Option<Vec<u16>> = launch
+        .cwd
+        .map(|dir| dir.as_os_str().encode_wide().chain(Some(0)).collect());
+    let cwd_ptr = cwd_wide
+        .as_ref()
+        .map_or(std::ptr::null(), |dir| dir.as_ptr());
+
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let mut create = |flags: u32| -> Result<(), u32> {
+        let ok = unsafe {
+            CreateProcessW(
+                exe_wide.as_ptr(),
+                cmdline_wide.as_mut_ptr(),
+                std::ptr::null(), // lpProcessAttributes：默认安全描述符
+                std::ptr::null(), // lpThreadAttributes：默认安全描述符
+                0,                // bInheritHandles=FALSE：核心目的，杜绝句柄泄漏
+                flags,
+                env_ptr,
+                cwd_ptr,
+                &si,
+                &mut pi,
+            )
+        };
+        if ok == 0 {
+            Err(unsafe { GetLastError() })
+        } else {
+            Ok(())
+        }
+    };
+    let base = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
+    if create(base | CREATE_BREAKAWAY_FROM_JOB).is_err() {
+        // 作业不允许脱出（或别的原因）：去掉标志再试。这一次的错误才是要报的错误——
+        // 可执行文件不在、没有权限这类原因两次都会失败
+        create(base).map_err(|code| io::Error::from_raw_os_error(code as i32))?;
+        append_startup_log(&format!(
+            "warning: pid {} could not leave the launcher's job object and stays inside it; ending that job ends this process too",
+            pi.dwProcessId
+        ));
+    }
+    // SAFETY: CreateProcessW 成功后两个句柄都归本进程；主线程句柄不再使用，
+    // 进程句柄保留到观测结束，哪怕子进程在首次轮询前就已退出也不会丢失退出码。
+    unsafe {
+        CloseHandle(pi.hThread);
+        Ok((
+            pi.dwProcessId,
+            OwnedHandle::from_raw_handle(pi.hProcess as _),
+        ))
     }
 }
 

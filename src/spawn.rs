@@ -39,6 +39,8 @@ pub enum SpawnError {
     /// 不必空等到时限
     Exited {
         pid: u32,
+        /// 拉起者从自己的子进程取得的退出码；旁观者或 Unix 信号退出时没有数值。
+        code: Option<u32>,
         startup_log: StartupLog,
         /// 子进程离开前写回交接文件的格式诊断，与别的实例的日志无关。
         format: Option<Box<crate::transform::StartupError>>,
@@ -323,8 +325,25 @@ async fn launch_and_wait(
     #[cfg(unix)]
     let pid = child.id().expect("刚拉起、尚未收割的子进程有 pid");
     #[cfg(windows)]
-    let pid = daemon::spawn_detached_with(exe, &args, &launch).map_err(SpawnError::Spawn)?;
-    let result = wait_ready(home, pid, spec_path, None, mark, timeout).await;
+    let (pid, child) =
+        daemon::spawn_detached_process(exe, &args, &launch).map_err(SpawnError::Spawn)?;
+    let mut result = wait_ready(home, pid, spec_path, None, mark, timeout).await;
+    if let Err(SpawnError::Exited { code, .. }) = &mut result {
+        #[cfg(unix)]
+        {
+            *code = child
+                .try_wait()
+                .ok()
+                .flatten()
+                .and_then(|s| s.code())
+                .map(|n| n as u32);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            *code = crate::process::handle_exit_code(child.as_raw_handle() as isize);
+        }
+    }
     if matches!(on_timeout, OnReadyTimeout::StopBeforeRollback)
         && matches!(result, Err(SpawnError::TimedOut { .. }))
     {
@@ -352,7 +371,7 @@ async fn launch_and_wait(
     result
 }
 
-/// Windows 的分离启动不保留句柄；只能在同一句柄上核验最初的创建时间并终止。
+/// Windows 回滚前按最初的创建时间核验身份并终止，不依据就绪超时单独判死。
 #[cfg(windows)]
 async fn reap_unready_child(pid: u32, start: Option<u64>) {
     let Some(start) = start else {
@@ -460,6 +479,7 @@ async fn wait_ready(
         if exited || format.is_some() {
             return Err(SpawnError::Exited {
                 pid,
+                code: None,
                 format,
                 report,
                 startup_log: StartupLog::since(home, mark),

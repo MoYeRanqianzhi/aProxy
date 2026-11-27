@@ -327,6 +327,7 @@ mod tests {
         );
         let err = super::super::SpawnError::Exited {
             pid: 1,
+            code: None,
             format: None,
             report: Some(Box::new(report)),
             startup_log: super::super::StartupLog {

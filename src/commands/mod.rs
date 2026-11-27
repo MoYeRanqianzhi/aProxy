@@ -210,7 +210,12 @@ impl Failure {
         }
         use aproxy_ipc::code::ExitCode;
         match aproxy_ipc::code::lookup(self.code).and_then(|code| code.exit) {
-            Some(ExitCode::Fixed(code) | ExitCode::ChildOr(code)) => code,
+            Some(ExitCode::Fixed(code)) => code,
+            Some(ExitCode::ChildOr(fallback)) => self.details["code"]
+                .as_u64()
+                .and_then(|n| u8::try_from(n).ok())
+                .filter(|&n| n != 0)
+                .unwrap_or(fallback),
             None => aproxy_ipc::code::EXIT_CONFIG,
         }
     }
@@ -366,7 +371,14 @@ pub(crate) fn spawn_failure(
                 .startup_log()
                 .map(|log| log.lines.clone())
                 .unwrap_or_default();
-            Failure::rendered("start_failed", message, json!({"startup_log": lines}))
+            let mut details = json!({"startup_log": lines});
+            if let SpawnError::Exited {
+                code: Some(code), ..
+            } = error
+            {
+                details["code"] = json!(code);
+            }
+            Failure::rendered("start_failed", message, details)
         }
     }
 }
@@ -467,6 +479,37 @@ mod tests {
             2
         );
         assert_eq!(Results::new(None).finish(false), 0);
+    }
+
+    #[test]
+    fn start_failed_preserves_child_status_but_only_exits_with_portable_failure_codes() {
+        use aproxy::spawn::{SpawnError, StartupLog};
+        for (code, exit) in [
+            (Some(3), 3),
+            (Some(255), 255),
+            (Some(0), 1),
+            (Some(256), 1),
+            (Some(0xc0000374), 1),
+            (None, 1),
+        ] {
+            let error = SpawnError::Exited {
+                pid: 7,
+                code,
+                format: None,
+                report: None,
+                startup_log: StartupLog {
+                    path: "startup.log".into(),
+                    lines: Vec::new(),
+                },
+            };
+            let failure = spawn_failure(&error, |lang| error.render(lang));
+            assert_eq!(failure.code, "start_failed");
+            assert_eq!(
+                failure.details.get("code").map(|v| v.as_u64().unwrap()),
+                code.map(u64::from)
+            );
+            assert_eq!(failure.exit_code(), exit);
+        }
     }
 
     #[test]

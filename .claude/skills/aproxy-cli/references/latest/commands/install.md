@@ -40,7 +40,7 @@ copy.
 | `--cpu x86-64-v3\|baseline` | which x86-64 build to download; default `x86-64-v3` when the CPU has AVX2 and the target publishes one (x86_64 Windows, x86_64 Linux gnu and x86_64 macOS), baseline otherwise |
 | `--download-proxy URL` | proxy for downloads only; default `update.download_proxy` in settings.json (not read by `--force`), then the environment's proxy settings. Unrelated to config.toml's `proxy` |
 | `--no-skills` | skip the skill update this time (permanently: `update.skill_auto_update` in settings.json). Not with `--force`, which never updates skills |
-| `--from PATH` | install a local binary; its `--version` output decides the version, with no downgrade check (below 0.2.0 is still refused) |
+| `--from PATH` | install a local binary; its `--version` output decides the version. A version older than the running CLI needs `--allow-downgrade`, as online; below 0.2.0 is always refused |
 | `--adopt` | copy the binary you are running into `<home>/bin/`, move running instances onto it, then add `<home>/bin` to the user's `PATH` and, for the desktop build, an app menu entry that opens the window ([What --adopt sets up](#what---adopt-sets-up)) |
 | `--no-path` | with `--adopt`: leave `PATH` alone |
 | `--no-shortcut` | with `--adopt`: create no app menu entry |

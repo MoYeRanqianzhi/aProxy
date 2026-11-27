@@ -35,6 +35,14 @@ asking.
   `Instance on port <port> (pid <pid>) is running but does not respond on the control channel. Use --force to terminate it.`
   and exits 1. `stop all`
   without `--force` stops the answering instances, reports each hung one the same way, and exits 5.
+- **An instance whose reply cannot be accepted** (it answers the control channel, but with another
+  protocol version or an identity that does not match its record) is left alone by `stop` and
+  `restart`, `--force` included: aProxy will not terminate a process or delete a record on the word
+  of a reply it cannot trust. Naming it prints
+  `The instance on port <port> answered, but its reply could not be accepted: it may run another aProxy version, or it may not be the instance recorded for this port. Manage it with the aProxy version that started it. Nothing was stopped, and its desired-state record was kept.`
+  and fails with `instance_incompatible` (exit 1, `details.port` and `details.reason`); `stop all`
+  and `restart all` report it the same way among their results. Run the aProxy version shown for
+  that port in `aproxy status` (its own `stop` or `restart`).
 - **`--force`:** terminates the process immediately, without the 10 s grace, after verifying by
   pid plus process start time that the pid still belongs to that instance (a reused pid is
   refused). It deletes the desired-state record before terminating, so the watchdog does not race

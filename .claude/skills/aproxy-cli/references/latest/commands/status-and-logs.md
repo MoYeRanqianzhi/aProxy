@@ -106,6 +106,10 @@ log files get a new random name at every start.
   directly. The same path is the `log_path` field of the instance record
   `<home>/run/<port>.instance.json` (one line of JSON; `null` for a foreground instance).
 - Several instances and no target, and `all` (`aproxy logs does not support all. …`), exit 2.
+- An instance whose reply cannot be accepted (another protocol version or a mismatched identity)
+  is not treated as stopped: `logs` does not fall back to the log of its last run, prints
+  `The instance on port <port> answered, but its reply could not be accepted: it may run another aProxy version, or it may not be the instance recorded for this port. Manage it with the aProxy version that started it. Nothing was stopped, and its desired-state record was kept.`
+  and exits 1.
 - A `--foreground` instance has no log file and exits 1:
   `The instance on port <port> runs with --foreground. Its logs go to its console, not to a file.`
 - **A target that is not running but still has its desired-state record** (it crashed or was

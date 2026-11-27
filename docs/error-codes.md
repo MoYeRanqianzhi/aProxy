@@ -25,9 +25,9 @@ How a proxied request finally ended when aproxy itself ended it. The code is in 
 | `format_unavailable` | 503 | The circuit breaker is temporarily blocking calls to a required request-side format program, so the request cannot proceed. | `format` (string), `stage` (string), `kind` (string), `probe_at` (Unix milliseconds) |
 | `format_failed` | 502 | In forward mode, a request-side format program failed or asked for a retry, and the request was not switched to retry mode. | `format` (string), `stage` (string), `kind`? (string), `fail_code`? (string) |
 | `upstream_failed` | 502 | In forward mode, the upstream attempt failed, and the request was not switched to retry mode. | `last_code` (code) |
-| `decode_failed` | SSE event only | Response headers had already been sent to the client without a content encoding, so the upstream body had to be decoded, and decoding failed. | `encoding` (string) |
+| `decode_failed` | SSE event only | Response headers had already been sent to the client without a content encoding, and the body could not be decoded to match. | `encoding` (string) |
 | `shutting_down` | 503 | The instance is shutting down. | — |
-| `internal` | 500 | A defect in aproxy itself. | — |
+| `internal` | 500 | A defect in aProxy itself. | — |
 
 ## Attempt failure codes
 
@@ -38,7 +38,7 @@ Why one upstream attempt did not succeed. By default every one of them is retrie
 | `upstream_connect_failed` | Could not connect to the upstream server, for example because the DNS lookup failed, the connection was refused or the TLS handshake failed. | `reason` (string) |
 | `upstream_connect_timeout` | Connecting to the upstream timed out. | `timeout_ms` (milliseconds) |
 | `upstream_first_byte_timeout` | The request was sent but no response headers arrived in time. | `timeout_ms` (milliseconds) |
-| `upstream_read_idle_timeout` | Too long passed between two reads of the response body. | `timeout_ms` (milliseconds), `received_bytes` (bytes) |
+| `upstream_read_idle_timeout` | No data arrived on the response body for too long. | `timeout_ms` (milliseconds), `received_bytes` (bytes) |
 | `upstream_body_interrupted` | The response body broke off midway. | `received_bytes` (bytes), `reason` (string) |
 | `upstream_status` | The upstream answered 4xx or 5xx. | `status` (integer) |
 | `upstream_error_body` | The upstream answered 2xx but the body is an error. | `status` (integer) |
@@ -52,7 +52,7 @@ The `code` of the error object an instance returns on its control endpoint.
 
 | Code | When | `details` |
 |---|---|---|
-| `internal` | A defect in aproxy itself. | — |
+| `internal` | A defect in aProxy itself. | — |
 | `bad_request` | Not JSON, missing v or op, line too long, or an argument of the wrong type or value. | `reason` (string), `arg`? (string) |
 | `unsupported_version` | The protocol version v is not supported. | `supported` (integer list) |
 | `format_control_error` | The dedicated format control channel did not deliver a valid reply. | `reason` (string) |
@@ -70,7 +70,7 @@ Why an operation started from the command line or the desktop window failed. Wit
 
 | Code | Exit code | When | `details` |
 |---|---|---|---|
-| `internal` | 1 | A defect in aproxy itself. | — |
+| `internal` | 1 | A defect in aProxy itself. | — |
 | `usage` | 2 | A usage error found outside the argument parser. | `reason` (string) |
 | `home_invalid` | 2 | aProxy could not determine its home directory. Set APROXY_HOME to an absolute path. | `value` (string) |
 | `target_ambiguous` | 2 | Several instances are running and no target was given. | `ports` (integer list) |
@@ -79,11 +79,11 @@ Why an operation started from the command line or the desktop window failed. Wit
 | `config_invalid` | 3 | The configuration has error-level diagnostics. | `diagnostics` (diagnostic list) |
 | `command_failed` | 1 | The command could not complete. | — |
 | `write_conflict` | 1 | The config file was modified externally while writing, and retrying still conflicted. | `file` (path) |
-| `port_in_use` | 1 | The port is taken. | `port` (integer), `owner` (string) |
-| `start_failed` | the child's code, else 1 | The daemon could not start. | `code`? (integer), `startup_log` (string list) |
-| `ready_timeout` | 1 | The instance did not become ready to accept requests within the time limit. | `timeout_ms` (milliseconds) |
+| `port_in_use` | 1 | The port is already in use. | `port` (integer), `owner` (string) |
+| `start_failed` | the child's code, else 1 | The instance could not start. | `code`? (integer), `startup_log` (string list) |
+| `ready_timeout` | 1 | aProxy could not confirm within the time limit that the instance was ready to accept requests. | `timeout_ms` (milliseconds) |
 | `format_restart_failed` | 1 | The format restart operation was not completed. | `port` (integer), `reason` (string) |
-| `restart_unsupported` | 1 | There is no desired-state record for this instance (for example, it runs in the foreground), so it cannot be restarted automatically. | `port` (integer) |
+| `restart_unsupported` | 1 | There is no usable desired-state record for this instance (for example, it runs in the foreground), so it cannot be restarted automatically. | `port` (integer) |
 | `instance_unresponsive` | 1 | The instance's process is there but it does not answer. | `port` (integer), `pid` (integer) |
 | `instance_incompatible` | 1 | The instance answered, but its protocol is incompatible or its identity does not match. | `port` (integer), `reason` (string) |
 | `stop_failed` | 1 | The instance could not be stopped. | `port` (integer), `reason` (string) |
@@ -103,19 +103,19 @@ Problems found in config.toml and settings.json. Each diagnostic is an object wi
 | `config_invalid_value` | error | A value is not allowed. | `reason` (string) |
 | `config_missing_key` | error | A required key is missing. | — |
 | `config_legacy_shape` | info | A file uses the 0.1.x configuration shape; preview its migration before writing. | — |
-| `config_unknown_key` | error | A key that is not recognized. | — |
+| `config_unknown_key` | error | The key is not recognized. | — |
 | `config_not_supported` | error | This version recognizes the setting but does not support it yet. | — |
 | `format_name_reserved` | error | The format name is reserved for selecting all entries. | `name` (string) |
-| `config_conflict` | error | A combination of settings that exclude each other. | — |
+| `config_conflict` | error | Settings that cannot be used together are both set. | — |
 | `secret_placeholder_unmatched` | error | A secret placeholder written back does not match any original value. | — |
 | `default_credential_withheld` | warning | A credential in the settings defaults was not inherited because the target differs, and this config has none of its own. | `key` (string), `reason` (string) |
-| `default_header_shared` | info | These default headers are sent to every target. If one carries a credential, set it only in the configurations that need it. | — |
+| `default_header_shared` | info | These default headers apply to every configuration that does not set them itself. If one carries a credential, set it only in the configurations that need it. | — |
 | `forward_default_unguarded` | warning | The default delivery is forward while the chain has a decide program or an optional request program: when they are unavailable, requests are not retried. | — |
 | `forward_response_buffered` | info | The default delivery is forward and the chain has a response program; that layer gathers each response, so those responses are not streamed. Declare stream instead where the program supports it. | `format` (string) |
 | `settings_schema_too_new` | error | settings.json has a schema newer than this version understands. | — |
 | `format_handshake_failed` | varies | A format's handshake failed at startup. | `format` (string), `kind` (string) |
 | `format_stage_unsupported` | error | A format does not support a stage the config declares for it. | `format` (string), `stages` (string list) |
-| `file_permissions_too_open` | warning | The group or others can access the home or a config file. | — |
+| `file_permissions_too_open` | warning | Other users can access the aProxy home or a configuration file. | — |
 | `listen_not_loopback` | warning | The config listens on a non-loopback address, so other hosts can reach the proxy. | `listen_addr` (string) |
 | `port_shared` | warning | Several config files listen on the same port, so they cannot run at the same time. | `port` (integer), `files` (string list) |
 | `config_dir_missing` | warning | A directory listed in settings.json `config_dirs` does not exist. | `dir` (path) |
@@ -131,8 +131,8 @@ Why a persistent record under the home could not be used. Such records are repor
 
 | Code | When | `details` |
 |---|---|---|
-| `record_unreadable` | A persistent record cannot be parsed. | — |
-| `record_schema_too_new` | A persistent record has a schema newer than this version understands. | `schema` (integer) |
+| `record_unreadable` | A saved record cannot be read. | — |
+| `record_schema_too_new` | A saved record was written by a newer aProxy version. | `schema` (integer) |
 
 ## Desktop faults
 
@@ -141,7 +141,7 @@ Faults returned to the bundled desktop page. They do not change CLI exit codes.
 | Code | When | `details` |
 |---|---|---|
 | `desktop_format` | The format operation on the selected instance could not be completed. | `reason` (string) |
-| `desktop_format_fail` | The program returned its own control failure. | `code` (string), `reason` (string) |
+| `desktop_format_fail` | The format program reported that the control operation failed. | `code` (string), `reason` (string) |
 | `desktop_package` | Package validation or a package operation failed. | `reason` (string), `field`? (string), `path`? (path), `limit`? (string), `max`? (integer) |
 | `desktop_toml` | The desktop preferences file could not be edited. | `kind` (string), `line`? (integer), `column`? (integer), `key`? (string) |
 

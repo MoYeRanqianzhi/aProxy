@@ -135,7 +135,9 @@
    - 之后依次：**t13-migrate**（`aproxy migrate`，已做完）、**t14-english-text**（审查 v26 的英文文案，49 条，
      裁定：记录统一叫 desired-state record，launch spec 不改，因为 README 与 skill 都这么叫）。用户 2026-11-27 定：文字工作
      一律不交给 Codex 写，只能让它审查，所以 t14 由主代理自己改文案；Codex 只跑门槛、把钉住旧文案的测试照搬成新文案，
-     并审查改后的文字。
+     并审查改后的文字。**做完（2026-11-27，推到 main 的 `856dbf71`）**：v26 的 49 条、其余命令行英文的通读、错误码说明的
+     通读都由主代理改；Codex 的 t25、t25b 对齐测试并两轮审查（57 条，成立的约 40 条由主代理改，其余裁定不改，理由写在
+     `t25b-text-tests.md`）。
 9a. **随 t10b 顺带**：`cargo update -p url`（到 ≥2.5.9）。RUSTSEC-2026-0592（`Url::origin()` 对嵌套
    `blob:` 递归、栈溢出），2026-11-22 起 main 的 Review 工作流（cargo-deny）因此失败；aproxy-format 的 convert/keys/route
    对配置与上游地址调用 `origin()`，都不是客户端给的输入，风险低。只动 Cargo.lock，验收是 cargo-deny 过、两个变体全量过。
@@ -150,7 +152,7 @@
     - 分工：Codex 做机制与迁移，中文与英文的文案由主代理写；Codex 只搬运、不翻译。
     - 2026-11-23 主代理审了 Codex 起草的 156 条中文（清单在私有的 `t11-i18n.strings.md`，按回执里各段列出的标识符找），
       质量可用，只改了 4 条用词（forward 诊断的「投递方式」、TooLarge、ipc 的 run_changed、stop 的 generation）。英文草稿只抽看了
-      diagnostic、ipc、help、format_fault 几个模块，没发现要改的；其余约 700 条英文还没逐条过，排在 W5d 的文字通读里。
+      diagnostic、ipc、help、format_fault 几个模块，没发现要改的；其余约 700 条英文已在 2026-11-27 随 t14 由主代理逐条通读并改写。
       注意 `src/i18n/data.rs` 的英文会写进 HTTP、SSE 与快照，清点时按整句比对还原，改它会让旧记录还原不出中文，不要随手改。
     - 连带：doctor 给人看的诊断现在直接显示登记表里的英文摘要（第四段的审查指出，新加的两条 forward 提示也是）；
       随这一项改成按语言显示，`--json` 里的英文不动。

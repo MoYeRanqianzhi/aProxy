@@ -19,9 +19,9 @@ message!(successor_missing(), en: "The installer that took over reported a failu
 
 message!(aborted(), en: "Installation was aborted (--abort).", zh: "安装已被中止（--abort）");
 
-message!(halted(cause: &str), en: "The last installation stopped after an instance failed and will not retry automatically ({cause}). Correct the problem and run aproxy install again.", zh: "上次安装因实例级失败已中止，不自动重试（{cause}）。排除原因后重新执行 aproxy install");
+message!(halted(cause: &str), en: "The last installation stopped after an instance failed and will not retry automatically ({cause}). Correct the problem and run aproxy install <target-version> again.", zh: "上次安装因实例级失败已中止，不自动重试（{cause}）。排除原因后重新执行 aproxy install <目标版本>");
 
-message!(owner(pid: u32, phase: InstallPhase, reason: &str), en: "The installer that took over (pid {pid}) exited with the installation still in phase {phase:?}: {reason}. Run the same aproxy install command again to finish the installation.", zh: "接手进程（pid {pid}）已退出但安装停在 {phase:?}：{reason}；重新执行同一条 aproxy install 命令即可装完");
+message!(owner(pid: u32, phase: InstallPhase, reason: &str), en: "The installer that took over (pid {pid}) exited with the installation still in phase {phase:?}: {reason}. Run aproxy install <target-version> to finish the installation.", zh: "接手进程（pid {pid}）已退出但安装停在 {phase:?}：{reason}；执行 aproxy install <目标版本> 即可装完");
 
 message!(timeout(secs: u64), en: "Could not confirm that the installation finished within {secs} seconds. It may still be running. Use aproxy status to check instance versions.", zh: "{secs} 秒内未确认安装完成（可能仍在后台进行）；可用 aproxy status 查看实例版本");
 
@@ -54,7 +54,7 @@ message!(unknown(), en: "unknown", zh: "未知");
 
 message!(asset_failed(asset:&str,e:&str), en: "{asset} cannot run on this system ({e})", zh: "{asset} 在本机不可运行（{e}）");
 
-message!(cannot_abort(phase:InstallPhase), en: "The installation has reached binary replacement (phase {phase:?}) and cannot roll back. Some instances may already run the target version. Interrupted installations resume automatically. For manual recovery, follow the manual update instructions in the aproxy-cli skill.", zh: "安装已进入交换阶段（phase {phase:?}），无法回滚——实例可能已开始滚动到新版本。\n中断的安装会自动续作完成；如需手动干预，按 skill 的手动更新兜底路径操作。");
+message!(cannot_abort(phase:InstallPhase), en: "The installation is in phase {phase:?} and can no longer be rolled back. Some instances may already run the target version. Interrupted installations resume automatically. For manual recovery, follow the manual update instructions in the aproxy-cli skill.", zh: "安装处于 {phase:?} 阶段，已不能回滚——实例可能已开始滚动到新版本。\n中断的安装会自动续作完成；如需手动干预，按 skill 的手动更新兜底路径操作。");
 
 /// 安装接手者留下的私有排版参数，不是事件码，也不进入公开的 details。
 #[derive(Clone, Debug, Serialize, Deserialize)]

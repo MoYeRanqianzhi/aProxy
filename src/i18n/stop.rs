@@ -24,7 +24,7 @@ message!(forgot_config(path: std::path::Display<'_>, ports: &str), en: "The inst
 
 message!(none_idle(idle_secs: u64), en: "No instances have been idle for more than {idle_secs} seconds.", zh: "没有闲置超过 {idle_secs} 秒的实例。");
 
-message!(not_idle(pid: u32, port: &str, idle_secs: u64), en: "Pid {pid} on port {port} received a request in the meantime (it had been idle for {idle_secs} seconds), so it is no longer idle and was not stopped.", zh: "pid {pid}（端口 {port}）刚才又收到了请求（已闲置 {idle_secs} 秒），不再算闲置，未停止");
+message!(not_idle(pid: u32, port: &str, idle_secs: u64), en: "Pid {pid} on port {port} received a request in the meantime and has been idle for only {idle_secs} seconds, so it was not stopped.", zh: "pid {pid}（端口 {port}）刚才又收到了请求（已闲置 {idle_secs} 秒），不再算闲置，未停止");
 
 message!(cleaned(ports: &str), en: "Removed desired-state records left by stopped instances (ports {ports}).", zh: "已删除不在运行的实例留下的期望状态记录（端口 {ports}）。");
 

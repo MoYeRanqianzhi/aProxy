@@ -118,7 +118,7 @@ message!(header(name: &str, value: &str, source: &str), en: "  {name} = {value} 
 
 message!(default_missing(path: std::path::Display<'_>), en: "Default configuration file in settings.json does not exist: {path}\nSet a new path with aproxy settings set default_config <path>, or remove the setting with aproxy settings unset default_config.", zh: "settings.json 指定的默认配置文件不存在: {path}\n用 aproxy settings set default_config <路径> 重新指定，或 aproxy settings unset default_config 取消");
 
-message!(chain_precedence(), en: "The effective value comes first. A running instance's start options, kept in its launch spec, take precedence over these layers and are not shown here.", zh: "每个键先列生效值。运行中实例的 start 选项保存在启动规格里，优先于以下各层，这里不列出。");
+message!(chain_precedence(), en: "The effective value comes first. A background instance's start options, kept in its launch spec, take precedence over these layers and are not shown here.", zh: "每个键先列生效值。后台实例的 start 选项保存在启动规格里，优先于以下各层，这里不列出。");
 
 message!(instance_only(), en: " — per instance, not inherited", zh: " —— 属于单个实例，不继承");
 

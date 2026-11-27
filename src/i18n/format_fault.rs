@@ -2,7 +2,7 @@
 
 use aproxy_ipc::message;
 
-message!(open(), en: "circuit breaker open: this program gets no new calls until its cooldown ends", zh: "熔断器已打开");
+message!(open(), en: "circuit breaker open: requests are not sent to this program until its cooldown ends", zh: "熔断器已打开");
 
 message!(spawn(), en: "could not start the program", zh: "无法启动程序");
 

@@ -12,7 +12,7 @@ message!(lock_failed(path: &str, e: &str), en: "Cannot acquire installation lock
 message!(lock_task(e: &str), en: "The task waiting for the installation lock ended unexpectedly: {e}", zh: "等安装锁的任务异常结束: {e}");
 
 message!(jurisdiction(port: &str, dir: &str, image: &str), en: "The binary for the instance on port {port} is outside the installation directory ({dir}): {image}.\nUpgrade it with the tool that installed it (for example npm or Cargo), or run `aproxy install --adopt` with that binary to install it in the standard location.", zh: "实例 {port} 的二进制不在安装管辖目录（{dir}）下：{image}。\n\
-                 该实例由其他渠道安装（包管理器/npm/cargo），请用对应渠道升级，\
+                 该实例可能由其他渠道安装（包管理器/npm/cargo），请用对应渠道升级，\
                  或用那个二进制执行 `aproxy install --adopt`，把它装到标准位置");
 
 message!(concurrent(target: &str, phase: InstallPhase, pid: u32, secs: u64), en: "Installation is already in progress (target {target}, phase {phase:?}, pid {pid}). Wait for it to finish, or, if interrupted, allow {secs} seconds for the record to expire.", zh: "已有安装进行中（target {target}，phase {phase:?}，pid {pid}）。\
@@ -67,7 +67,7 @@ message!(not_prepared(state: &aproxy_ipc::wire::InstanceState), en: "The instanc
 
 message!(converge(port: &str, e: &str), en: "Could not restart the instance on port {port} to get its confirmation that the binary can be replaced: {e}", zh: "为让实例 {port} 确认可以替换二进制而重启它，重启失败: {e}");
 
-message!(unacked(unacked: &[String]), en: "These instances still have not confirmed that the binary can be replaced, even after retries and restarts: {unacked:?}", zh: "重试并重启之后，这些实例仍未确认可以替换二进制: {unacked:?}");
+message!(unacked(unacked: &[String]), en: "These instances still have not confirmed that the binary can be replaced, even after retries (and restarts where possible): {unacked:?}", zh: "重试（并在可行时重启）之后，这些实例仍未确认可以替换二进制: {unacked:?}");
 
 message!(rolling(port: &str, e: &str), en: "Rolling restart failed for the instance on port {port}: {e}", zh: "实例 {port} 滚动重启失败: {e}");
 

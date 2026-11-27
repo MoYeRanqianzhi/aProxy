@@ -731,7 +731,7 @@ pub const TABLE: &[Code] = &[
     diagnostic(
         "config_conflict",
         Severity::Error,
-        "Settings that cannot be used together are both set.",
+        "The configuration contains entries that conflict with each other.",
         &[],
     ),
     diagnostic(
@@ -846,7 +846,7 @@ pub const TABLE: &[Code] = &[
     plain(
         "record_schema_too_new",
         RECORD,
-        "A saved record was written by a newer aProxy version.",
+        "A saved record uses a newer format than this version understands.",
         &[req("schema", T::Integer)],
     ),
     // ----- 安装码 -----

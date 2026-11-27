@@ -106,7 +106,7 @@ Problems found in config.toml and settings.json. Each diagnostic is an object wi
 | `config_unknown_key` | error | The key is not recognized. | — |
 | `config_not_supported` | error | This version recognizes the setting but does not support it yet. | — |
 | `format_name_reserved` | error | The format name is reserved for selecting all entries. | `name` (string) |
-| `config_conflict` | error | Settings that cannot be used together are both set. | — |
+| `config_conflict` | error | The configuration contains entries that conflict with each other. | — |
 | `secret_placeholder_unmatched` | error | A secret placeholder written back does not match any original value. | — |
 | `default_credential_withheld` | warning | A credential in the settings defaults was not inherited because the target differs, and this config has none of its own. | `key` (string), `reason` (string) |
 | `default_header_shared` | info | These default headers apply to every configuration that does not set them itself. If one carries a credential, set it only in the configurations that need it. | — |
@@ -132,7 +132,7 @@ Why a persistent record under the home could not be used. Such records are repor
 | Code | When | `details` |
 |---|---|---|
 | `record_unreadable` | A saved record cannot be read. | — |
-| `record_schema_too_new` | A saved record was written by a newer aProxy version. | `schema` (integer) |
+| `record_schema_too_new` | A saved record uses a newer format than this version understands. | `schema` (integer) |
 
 ## Desktop faults
 

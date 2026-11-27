@@ -93,7 +93,7 @@ pub enum DiagCode {
     ConfigUnknownKey,
     /// This version recognizes the setting but does not support it yet.
     ConfigNotSupported,
-    /// Settings that cannot be used together are both set.
+    /// The configuration contains entries that conflict with each other.
     ConfigConflict,
     /// A secret placeholder written back does not match any original value.
     SecretPlaceholderUnmatched,

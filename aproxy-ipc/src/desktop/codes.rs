@@ -32,19 +32,19 @@ pub enum HistoryCode {
     RetryStopped,
     /// A request-side format answered fail with retry:false.
     FormatRejected,
-    /// A required format's circuit is open, so a request-direction stage cannot use it.
+    /// The circuit breaker is temporarily blocking calls to a required request-side format program, so the request cannot proceed.
     FormatUnavailable,
-    /// A forward request's request-side format failed or asked for a retry, and the request was not upgraded to retry.
+    /// In forward mode, a request-side format program failed or asked for a retry, and the request was not switched to retry mode.
     FormatFailed,
-    /// A forward request's upstream attempt failed and the request was not upgraded to retry.
+    /// In forward mode, the upstream attempt failed, and the request was not switched to retry mode.
     UpstreamFailed,
-    /// The stream is already committed, the upstream's content encoding cannot be carried, and decoding failed.
+    /// Response headers had already been sent to the client without a content encoding, so the upstream body had to be decoded, and decoding failed.
     DecodeFailed,
     /// The instance is shutting down.
     ShuttingDown,
     /// A defect in aproxy itself.
     Internal,
-    /// Could not connect to the upstream: DNS, refused, TLS.
+    /// Could not connect to the upstream server, for example because the DNS lookup failed, the connection was refused or the TLS handshake failed.
     UpstreamConnectFailed,
     /// Connecting to the upstream timed out.
     UpstreamConnectTimeout,
@@ -91,7 +91,7 @@ pub enum DiagCode {
     ConfigLegacyShape,
     /// A key that is not recognized.
     ConfigUnknownKey,
-    /// A form whose shape is defined but which is not implemented yet.
+    /// This version recognizes the setting but does not support it yet.
     ConfigNotSupported,
     /// A combination of settings that exclude each other.
     ConfigConflict,
@@ -99,7 +99,7 @@ pub enum DiagCode {
     SecretPlaceholderUnmatched,
     /// A credential in the settings defaults was not inherited because the target differs, and this config has none of its own.
     DefaultCredentialWithheld,
-    /// The defaults' header tables contain non-secret headers, which are sent to every target.
+    /// These default headers are sent to every target. If one carries a credential, set it only in the configurations that need it.
     DefaultHeaderShared,
     /// The default delivery is forward while the chain has a decide program or an optional request program: when they are unavailable, requests are not retried.
     ForwardDefaultUnguarded,
@@ -148,7 +148,7 @@ pub enum InstallCode {
     InstallInProgress,
     /// The requested version does not exist.
     InstallVersionNotFound,
-    /// The requested version is older than the oldest one this home can be moved to.
+    /// The requested version is too old to use this aProxy home's file layout and control protocol.
     InstallBelowFloor,
     /// Downloading the binary failed.
     InstallDownloadFailed,
@@ -379,7 +379,7 @@ pub enum Fault {
     InstallInProgress {},
     /// The requested version does not exist.
     InstallVersionNotFound {},
-    /// The requested version is older than the oldest one this home can be moved to.
+    /// The requested version is too old to use this aProxy home's file layout and control protocol.
     InstallBelowFloor {},
     /// Downloading the binary failed.
     InstallDownloadFailed {},

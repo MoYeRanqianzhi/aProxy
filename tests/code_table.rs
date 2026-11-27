@@ -27,7 +27,7 @@ fn http_cell(code: &Code) -> String {
 fn exit_cell(code: &Code) -> String {
     match code.exit.expect("操作码与安装码都带退出码") {
         ExitCode::Fixed(n) => n.to_string(),
-        ExitCode::ChildOr(n) => format!("the child's code, else {n}"),
+        ExitCode::ChildOr(n) => format!("the child's code if 1–255, else {n}"),
     }
 }
 

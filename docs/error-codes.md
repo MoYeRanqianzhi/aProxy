@@ -80,7 +80,7 @@ Why an operation started from the command line or the desktop window failed. Wit
 | `command_failed` | 1 | The command could not complete. | — |
 | `write_conflict` | 1 | The config file was modified externally while writing, and retrying still conflicted. | `file` (path) |
 | `port_in_use` | 1 | The port is already in use. | `port` (integer), `owner` (string) |
-| `start_failed` | the child's code, else 1 | The instance could not start. | `code`? (integer), `startup_log` (string list) |
+| `start_failed` | the child's code if 1–255, else 1 | The instance could not start. | `code`? (integer), `startup_log` (string list) |
 | `ready_timeout` | 1 | aProxy could not confirm within the time limit that the instance was ready to accept requests. | `timeout_ms` (milliseconds) |
 | `format_restart_failed` | 1 | The format restart operation was not completed. | `port` (integer), `reason` (string) |
 | `restart_unsupported` | 1 | There is no usable desired-state record for this instance (for example, it runs in the foreground), so it cannot be restarted automatically. | `port` (integer) |

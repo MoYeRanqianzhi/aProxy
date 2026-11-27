@@ -93,7 +93,8 @@ pub enum HttpStatus {
 pub enum ExitCode {
     /// 固定的退出码
     Fixed(u8),
-    /// 子进程报了退出码就用它的，没有时用这个
+    /// 子进程的退出码在 1 到 255 之间就用它的；没有退出码（被信号结束、拿不到）、是 0 或超出
+    /// 这个范围（例如 Windows 的 NTSTATUS）时用这个。原始的码另放在 `details.code` 里
     ChildOr(u8),
 }
 

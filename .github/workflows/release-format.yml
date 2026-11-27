@@ -257,7 +257,7 @@ jobs:
             done
           } > ../release_body.md
       - name: Publish release
-        uses: softprops/action-gh-release@v3.0.3
+        uses: softprops/action-gh-release@v3.0.4
         with:
           files: artifacts/*
           body_path: release_body.md

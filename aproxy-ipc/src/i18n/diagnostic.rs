@@ -346,8 +346,8 @@ reasons! {
         en: "{message} (alias {aliases})",
         zh: "{message}（别名 {aliases}）";
     OwnedHome { who: String },
-        en: "other users can access the aProxy home directory ({who}); aProxy will restrict its permissions the next time it writes there",
-        zh: "同组或其他用户可以访问主目录（{who}）；aproxy 将在下次写入时收紧权限";
+        en: "other users can access the aProxy home directory ({who}); aProxy will try to restrict its permissions the next time it writes there",
+        zh: "同组或其他用户可以访问主目录（{who}）；aproxy 会在下次写入时尝试收紧权限";
     OtherHome { who: String },
         en: "other users can access the aProxy home directory ({who}); it belongs to another user, so aProxy leaves it alone",
         zh: "同组或其他用户可以访问主目录（{who}）；目录属于其他用户，aproxy 不会修改其权限";

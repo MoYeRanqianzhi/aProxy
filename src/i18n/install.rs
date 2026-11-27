@@ -31,7 +31,7 @@ message!(download(target: &str, variant: &str, chain: &str), en: "Downloading aP
 
 message!(next(previous: &str, asset: &str), en: "{previous}. Trying {asset}...", zh: "{previous}，改用 {asset}...");
 
-message!(unavailable(), en: "The default variant includes the desktop interface. If this release has no desktop build for this system, use --variant headless. Alternatively, aproxy install --force checks the release manifest and chooses headless if no desktop build exists. It stops the current user's aProxy processes in this home and interrupts requests in progress through them.", zh: "没写 --variant，要装的是带桌面界面的版本。若这一版没有为本机发布它，可加 --variant headless 改装无界面版本；或者用 aproxy install --force（会先结束这个主目录下当前用户的全部 aproxy 进程、中断经过它们的在途请求），它按发布清单判断，确实没有带界面的版本时改装 headless。");
+message!(unavailable(), en: "The default variant includes the desktop interface. If this release has no desktop build for this system, use --variant headless. Alternatively, aproxy install --force [<version>] reads that release's manifest and installs the headless build if it has no desktop build for this system. It stops the current user's aProxy processes in this home and interrupts requests in progress through them.", zh: "没写 --variant，要装的是带桌面界面的版本。若这一版没有为本机发布它，可加 --variant headless 改装无界面版本；或者用 aproxy install --force [<版本>]（会先结束这个主目录下当前用户的全部 aproxy 进程、中断经过它们的在途请求），它按那一版的发布清单判断，确实没有为本机发布带界面的版本时改装 headless。");
 
 message!(loader(), en: "The desktop build cannot run on this system. See the dynamic loader error above. Check system libraries such as WebKitGTK and glibc. To install without the desktop interface, run aproxy install --variant headless.", zh: "带桌面界面的版本在本机起不来：动态加载器的报错见上，多半是缺 WebKitGTK 等系统库、这些库太旧，或者 glibc 太旧。不需要窗口，就改装无界面版本：aproxy install --variant headless");
 
@@ -45,13 +45,12 @@ message!(handoff(), en: "The target version has taken over the installation. Wai
 
 message!(done(path: std::path::Display<'_>), en: "Installation complete: {path}. The binary is in place and the instances are running the target version.", zh: "安装完成：{path}（二进制已落位，实例已滚动到新版本）");
 
-message!(halted(), en: "Rolling restarts stopped and will not retry automatically. aProxy brought the failing instance back with the old binary, or kept its desired-state record if that failed. Instances restarted before it stay on the target version; the rest were not changed. Check whether the target version accepts the configuration. Correct the problem and rerun aproxy install, or reinstall the old version with aproxy install <old-version> --allow-downgrade.", zh: "滚动已中止，不会自动重试：出问题的实例已用旧二进制拉回（拉回失败时其期望状态记录已保留）；\
-             在它之前已重启的实例留在目标版本，尚未轮到的实例未动。常见原因是新版本不接受现有配置——按上方原因修正后重新执行 aproxy install 完成升级；\
+message!(halted(), en: "Rolling restarts stopped and will not retry automatically. aProxy brought the failing instance back with the old binary, or kept its desired-state record if that failed. Instances that were already restarted are not rolled back, and instances not yet reached were not touched; aproxy status shows each instance's version. Check whether the target version accepts the configuration. Correct the problem and run the same aproxy install command again, or reinstall the old version with aproxy install <old-version> --allow-downgrade.", zh: "滚动已中止，不会自动重试：出问题的实例已用旧二进制拉回（拉回失败时其期望状态记录已保留）；\
+             已经重启过的实例不会回退，尚未轮到的实例未动，可用 aproxy status 查看各实例的版本。常见原因是新版本不接受现有配置——按上方原因修正后重新执行同一条 aproxy install 命令完成升级；\
              若要留在旧版本，用 `aproxy install <旧版本> --allow-downgrade` 把规范位置的二进制换回。");
 
-message!(retained(), en: "Installation state was retained. Rerun the same command to resume. The watchdog, or any command that changes instances or settings (such as start, stop, restart or restore), can also resume the installation in the background. Before the binary is replaced, use aproxy install --abort to roll back.", zh: "现场已保留：重新执行同一条命令即可接着装完；看护者，以及会改动实例或设置的 aproxy 命令\
-             （start、stop、restart、restore 等），也会在后台接着装。交换二进制之前可以用 \
-             `aproxy install --abort` 回滚。");
+message!(retained(), en: "Installation state was retained. Run the same command again to finish the installation. The watchdog, or any command that changes instances or settings (such as start, stop, restart or restore), can also resume it in the background.", zh: "现场已保留：重新执行同一条命令即可装完；看护者，以及会改动实例或设置的 aproxy 命令\
+             （start、stop、restart、restore 等），也会在后台接着装。");
 
 message!(install(target: &str), en: "Installing aProxy {target}...", zh: "开始安装 aProxy {target}...");
 

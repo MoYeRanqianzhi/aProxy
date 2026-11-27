@@ -382,7 +382,7 @@ pub const TABLE: &[Code] = &[
     terminal(
         "decode_failed",
         SseOnly,
-        "Response headers had already been sent to the client without a content encoding, so the upstream body had to be decoded, and decoding failed.",
+        "Response headers had already been sent to the client without a content encoding, and the body could not be decoded to match.",
         &[req("encoding", T::String)],
     ),
     terminal(
@@ -613,7 +613,7 @@ pub const TABLE: &[Code] = &[
         "ready_timeout",
         OPERATION,
         Exit(EXIT_FAILED),
-        "The instance did not become ready to accept requests within the time limit.",
+        "aProxy could not confirm within the time limit that the instance was ready to accept requests.",
         &[req("timeout_ms", T::Millis)],
     ),
     exiting(
@@ -627,7 +627,7 @@ pub const TABLE: &[Code] = &[
         "restart_unsupported",
         OPERATION,
         Exit(EXIT_FAILED),
-        "There is no desired-state record for this instance (for example, it runs in the foreground), so it cannot be restarted automatically.",
+        "There is no usable desired-state record for this instance (for example, it runs in the foreground), so it cannot be restarted automatically.",
         &[req("port", T::Integer)],
     ),
     exiting(
@@ -749,7 +749,7 @@ pub const TABLE: &[Code] = &[
     diagnostic(
         "default_header_shared",
         Severity::Info,
-        "These default headers are sent to every target. If one carries a credential, set it only in the configurations that need it.",
+        "These default headers apply to every configuration that does not set them itself. If one carries a credential, set it only in the configurations that need it.",
         &[],
     ),
     diagnostic(

@@ -21,13 +21,13 @@ message!(stop_state(), en: "stop not confirmed; no new instance was started", zh
 
 message!(start_state(), en: "the old instance stopped and its replacement is not ready; service is interrupted", zh: "旧实例已停止、新实例未就绪，服务已中断");
 
-message!(failed_count(total: usize, failed: usize), en: "\nRestart failed for {failed} of {total} instances. Details for the failed instances:", zh: "\n{total} 个实例中有 {failed} 个重启失败，其余照常重启。失败的实例：");
+message!(failed_count(total: usize, failed: usize), en: "\nRestart failed for {failed} of the {total} instances attempted. Failed instances:", zh: "\n尝试重启的 {total} 个实例中有 {failed} 个失败，其余已重启。失败的实例：");
 
 message!(state(port: &str, state: &str), en: "  Port {port}: {state}", zh: "  端口 {port}：{state}");
 
 message!(starting(port: &str), en: "Instance on port {port} is still starting; retry once it is ready to accept requests.", zh: "端口 {port} 的实例仍在启动；开始提供服务后再试。");
 
-message!(unsupported(port: &str), en: "Port {port} was not restarted: there is no desired-state record for this instance, so aProxy cannot restart it automatically. A foreground instance must be restarted in its own terminal. The old instance is still running.", zh: "端口 {port} 未重启：这个实例没有可用来重新拉起它的记录（前台运行的实例要在它自己的终端里重启），旧实例保持运行。");
+message!(unsupported(port: &str), en: "Port {port} was not restarted: there is no desired-state record for this instance, so aProxy cannot restart it automatically. To restart a foreground instance, stop it and start it again yourself. The old instance is still running.", zh: "端口 {port} 未重启：这个实例没有可用来重新拉起它的记录（前台运行的实例请自行停止后重新启动），旧实例保持运行。");
 
 message!(precheck(port: &str, cause: &str), en: "Port {port} was not restarted: preflight failed. The old instance is still running.\n{cause}", zh: "端口 {port} 未重启：预检未通过，旧实例保持运行。\n{cause}");
 

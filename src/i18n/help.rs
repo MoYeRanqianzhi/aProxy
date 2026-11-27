@@ -14,7 +14,7 @@ message!(invalid_launch_note(), en: "Use 1 to 512 UTF-8 bytes without control ch
 
 message!(start_target(), en: "Configuration alias from settings.json or path to a configuration file. Defaults to default_config in settings.json, otherwise ~/.aproxy/config.toml", zh: "配置别名（settings.json 中的别名表）或配置文件路径；不写时用默认配置文件（settings.json 的 default_config，否则 ~/.aproxy/config.toml）");
 
-message!(start_config(), en: "Path to the configuration file, equivalent to passing a path after start. Instances in the same aProxy home must listen on different ports", zh: "配置文件路径，与把路径直接写在 start 后面等价。多开不同配置的实例时各自指定（同一个主目录下各实例的监听端口须互不相同）");
+message!(start_config(), en: "Path to the configuration file; unlike the argument after start, it is never read as an alias. Instances in the same aProxy home must listen on different ports", zh: "配置文件路径（只当作路径，不按别名解析）。多开不同配置的实例时各自指定（同一个主目录下各实例的监听端口须互不相同）");
 
 message!(start_url(), en: "Override base_url for this instance without editing the file. Restart, restore and the watchdog reuse the override", zh: "上游 API base URL，覆盖配置文件中的 base_url（只对这个实例生效，不写入配置； restart、restore 与看护者重拉时沿用）");
 
@@ -91,7 +91,7 @@ message!(port(), en: "Filter by listening port", zh: "按监听端口过滤");
 
 message!(find_json(), en: "Write a JSON document with matching configurations, aliases and diagnostics", zh: "输出一个 JSON 文档（给程序读）：匹配的配置、别名与错误诊断");
 
-message!(install(), en: "Install or upgrade aProxy under ~/.aproxy/bin/. Instances are restarted one at a time to minimize disruption to clients. `upgrade` is an alias. Online installs try github, npm, cargo-binstall and cargo in order. Configure download_chain and URL templates in settings, or use --download-proxy. Interrupted installs resume automatically. If an instance cannot start on the new version, the installer tries to bring it back with the old binary, stops the rollout and exits with an error. If installation fails or stalls, `install --force` stops all aProxy processes for this home before replacing the binary", zh: "安装/升级 aProxy 到规范位置（~/.aproxy/bin/）：全程对客户端 ≈ 无感（逐实例滚动重启，任一时刻至多一个实例在重启）。`upgrade` 是它的别名。在线安装走下载链条（github → npm → cargo-binstall → cargo，可配 settings 的 download_chain/url 模板与 --download-proxy）；中断自动续作。某实例在新版本下起不来时用旧二进制把它拉回并中止滚动（命令返回非零）。普通安装失败或卡住时，`install --force` 结束全部 aproxy 进程后直接换二进制。");
+message!(install(), en: "Install or upgrade aProxy under ~/.aproxy/bin/. Instances are restarted one at a time to minimize disruption to clients. `upgrade` is an alias. Online installs try github, npm, cargo-binstall and cargo in order. Configure download_chain and URL templates in settings, or use --download-proxy. Interrupted installs resume automatically. If an instance cannot start on the new version, the installer tries to bring it back with the old binary, stops the rollout and exits with an error. If installation fails or stalls, `install --force` stops all aProxy processes for this home before replacing the binary", zh: "安装/升级 aProxy 到规范位置（~/.aproxy/bin/）：全程对客户端 ≈ 无感（逐实例滚动重启，任一时刻至多一个实例在重启）。`upgrade` 是它的别名。在线安装走下载链条（github → npm → cargo-binstall → cargo，可配 settings 的 download_chain/url 模板与 --download-proxy）；中断自动续作。某实例在新版本下起不来时尝试用旧二进制把它拉回，并中止滚动（命令返回非零）。普通安装失败或卡住时，`install --force` 结束这个主目录下的全部 aproxy 进程后直接换二进制。");
 
 message!(skill(), en: "Install, list or read the skill documents for aProxy", zh: "安装、列出或读取与 aProxy 配套的 skill 文档");
 
@@ -110,7 +110,7 @@ message!(watchdog_home(), en: "Absolute path to the monitored home", zh: "看护
 message!(settings(), en: "View or edit ~/.aproxy/settings.json, including aliases, configuration defaults, watchdog, logging and update settings. Also works with invalid settings so you can inspect and repair them", zh: "查看或修改全局设置（~/.aproxy/settings.json）：别名、config.toml 键的全局默认、看护者、日志、安装更新。settings.json 有错误时也能用，用来查看与修复它");
 
 #[cfg(feature = "desktop")]
-message!(desktop(), en: "Open the desktop window in a separate process to view and manage local proxy instances and their requests. Closing it does not stop the instances", zh: "打开桌面窗口（独立进程），查看和管理本机的代理实例与请求；关掉窗口不影响运行中的实例。");
+message!(desktop(), en: "Open the desktop window to view and manage local proxy instances and inspect their requests. Closing it does not stop the instances", zh: "打开桌面窗口，查看和管理本机的代理实例并查看请求；关掉窗口不影响运行中的实例。");
 
 message!(install_version(), en: "Install `latest` (default) from the selected update channel (see --pre) or specify a version such as 0.2.0-alpha.1. Stable excludes pre-releases; pre includes them. If latest is not newer than the running version, nothing is installed. Use --allow-downgrade for older versions; versions below 0.2.0 are not supported. With --force, reinstall even if already current. Cannot be combined with --from or --adopt", zh: "安装目标版本：`latest`（默认，按更新通道取最大版本——stable 通道只取正式版，pre 通道含预发布；通道见 --pre）或具体版本号（如 0.2.0-alpha.1）。latest 不高于当前版本时提示「已是最新」不重装。默认拒绝降级（--allow-downgrade 放行）；低于 0.2.0 的版本一律拒绝。加 --force 时不与当前版本比较，总是安装。与 --from/--adopt 互斥。");
 
@@ -122,7 +122,7 @@ message!(adopt(), en: "Install the running aProxy binary (for example, one insta
 
 message!(abort(), en: "Abort an installation before the binary is replaced, removing its temporary files and state. Once the binary has been replaced, the installation can only be completed", zh: "中止进行中的安装：仅 swapping 前可完全回滚（此后只进不退）。清理状态文件与 staging 现场。");
 
-message!(force_install(), en: "Stop the current user's aProxy processes registered in this home (instances, the watchdog, installers and the desktop window), replace the binary, then restore instances from their launch specifications. Use if a normal install fails or stalls or the installation is damaged. This bypasses handover and interrupts all in-flight requests through those instances; confirm first. Use --yes in noninteractive mode. Install VERSION, or a local binary with --from; without either, latest is installed, and it must not be older than the running version. An explicit version can downgrade, but never below 0.2.0. Does not update skills. Exit codes: 0 complete; 10 no process stopped; 11 processes stopped but binary not replaced; 12 binary replaced but not all instances restored", zh: "强制安装：不走交接，结束这个 home 下登记在册的、当前用户的全部 aproxy 进程（实例、看护者、安装者、桌面界面），换上新二进制，再用新版本的 restore 按原来的拉起规格恢复实例。普通安装失败、卡住，或装着的版本坏了时用；会中断所有经 aproxy 的在途请求，先确认（非交互环境加 --yes）。目标取 VERSION（默认 latest，不低于当前版本）或 --from；写明的版本号可以降级，低于 0.2.0 的版本仍不装；不更新 skill 文档。退出码：0 完成； 10 一个进程都没结束；11 结束过进程、二进制没换；12 二进制已换、有实例没恢复");
+message!(force_install(), en: "Stop the current user's aProxy processes registered in this home (instances, the watchdog, installers and the desktop window), replace the binary, then restore instances from their launch specifications. Use if a normal install fails or stalls or the installation is damaged. This bypasses handover and interrupts all in-flight requests through those instances; confirm first. Use --yes in noninteractive mode. Install VERSION, or a local binary with --from; without either, latest is installed, and it must not be older than the running version. An explicit version can downgrade, but never below 0.2.0. Does not update skills. Exit codes: 0 complete; 10 no process stopped; 11 processes stopped but binary not replaced; 12 binary replaced but not all instances restored", zh: "强制安装：不走交接，结束这个 home 下登记在册的、当前用户的全部 aproxy 进程（实例、看护者、安装者、桌面界面），换上新二进制，再用新版本的 restore 按原来的拉起规格恢复实例。普通安装失败、卡住，或装着的版本坏了时用；会中断经过这些实例的在途请求，先确认（非交互环境加 --yes）。目标取 VERSION（默认 latest，不低于当前版本）或 --from；写明的版本号可以降级，低于 0.2.0 的版本仍不装；不更新 skill 文档。退出码：0 完成； 10 一个进程都没结束；11 结束过进程、二进制没换；12 二进制已换、有实例没恢复");
 
 message!(yes(), en: "Skip the force-install confirmation (required for noninteractive use). First confirm that interrupting requests through aProxy is acceptable", zh: "强制安装不再询问确认（非交互环境必须加）。加之前先向用户确认可以中断经 aproxy 的在途请求");
 
@@ -172,7 +172,7 @@ message!(files(), en: "List only this skill's file names", zh: "只列出这个 
 
 message!(alias_add(), en: "Add or replace an alias. If PATH is omitted, use ~/.aproxy/config.toml", zh: "添加/覆盖别名（path 省略时指向默认配置 ~/.aproxy/config.toml）");
 
-message!(alias_new_name(), en: "Alias name. Cannot be empty or a number (read as a port), or one of the reserved names all, idle, default and defult (a common misspelling of default)", zh: "别名。不能为空或纯数字（会被当作端口），也不能是保留字 all、idle、default、defult（default 的常见笔误）");
+message!(alias_new_name(), en: "Alias name. Cannot be empty, a port number, or one of the reserved names all, idle, default and defult (a common misspelling of default)", zh: "别名。不能为空或是端口号，也不能是保留字 all、idle、default、defult（default 的常见笔误）");
 
 message!(alias_path(), en: "Path to config.toml; supports ~ expansion", zh: "指向的 config.toml 路径（支持 ~ 展开）");
 

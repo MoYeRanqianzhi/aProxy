@@ -11,9 +11,9 @@ message!(lock_failed(path: &str, e: &str), en: "Cannot acquire installation lock
 
 message!(lock_task(e: &str), en: "The task waiting for the installation lock ended unexpectedly: {e}", zh: "等安装锁的任务异常结束: {e}");
 
-message!(jurisdiction(port: &str, dir: &str, image: &str), en: "The binary for the instance on port {port} is outside the installation directory ({dir}): {image}.\nUpgrade it with the tool that installed it (for example npm or Cargo), or run `aproxy install --adopt` to move it to the standard location.", zh: "实例 {port} 的二进制不在安装管辖目录（{dir}）下：{image}。\n\
+message!(jurisdiction(port: &str, dir: &str, image: &str), en: "The binary for the instance on port {port} is outside the installation directory ({dir}): {image}.\nUpgrade it with the tool that installed it (for example npm or Cargo), or run `aproxy install --adopt` with that binary to install it in the standard location.", zh: "实例 {port} 的二进制不在安装管辖目录（{dir}）下：{image}。\n\
                  该实例由其他渠道安装（包管理器/npm/cargo），请用对应渠道升级，\
-                 或执行 `aproxy install --adopt` 显式收编到标准位置");
+                 或用那个二进制执行 `aproxy install --adopt`，把它装到标准位置");
 
 message!(concurrent(target: &str, phase: InstallPhase, pid: u32, secs: u64), en: "Installation is already in progress (target {target}, phase {phase:?}, pid {pid}). Wait for it to finish, or, if interrupted, allow {secs} seconds for the record to expire.", zh: "已有安装进行中（target {target}，phase {phase:?}，pid {pid}）。\
              等待其完成，或确认其已中断后等待 {secs} 秒自动失效");
@@ -43,11 +43,11 @@ message!(prepare(e: &str), en: "Not all instances confirmed they were ready for 
 
 message!(fresh(e: &str), en: "A newly started instance did not confirm it was ready for the binary to be replaced: {e}", zh: "新启动的实例没有确认已准备好替换二进制: {e}");
 
-message!(rolled_back(reason: &str, path: &str, pid: u32), en: "The new version failed to start ({reason}). The old binary {path} restored the instance with its original configuration (pid {pid}). Rolling restarts stopped; instances not yet reached are unchanged.", zh: "新版本启动失败（{reason}）；已用旧二进制 {path} 按原来的规格拉回实例（pid {pid}），\
+message!(rolled_back(reason: &str, path: &str, pid: u32), en: "The new version failed to start ({reason}). The old binary {path} brought the instance back (pid {pid}). Rolling restarts stopped; instances not yet reached are unchanged.", zh: "新版本启动失败（{reason}）；已用旧二进制 {path} 拉回实例（pid {pid}），\
                  滚动已中止，尚未轮到的实例未动");
 
-message!(down(reason: &str, fallback_error: &str), en: "The new version failed to start ({reason}), and the old binary could not restore the instance ({fallback_error}). The instance is offline. Its desired-state record was kept; correct the cause and run `aproxy restore`.", zh: "新版本启动失败（{reason}），旧二进制拉回也失败（{fallback_error}）；\
-                 实例当前下线，期望状态记录已保留，排除原因后执行 `aproxy restore` 恢复");
+message!(down(reason: &str, fallback_error: &str), en: "The new version failed to start ({reason}), and the old binary could not restore the instance ({fallback_error}). The instance did not come back. Its desired-state record was kept; correct the cause and run `aproxy restore`.", zh: "新版本启动失败（{reason}），旧二进制拉回也失败（{fallback_error}）；\
+                 实例没有恢复，期望状态记录已保留，排除原因后执行 `aproxy restore` 恢复");
 
 message!(no_restore(port: &str), en: "The instance on port {port} has no desired-state record (it may be a foreground instance).", zh: "实例 {port} 没有期望状态记录（前台实例？）");
 

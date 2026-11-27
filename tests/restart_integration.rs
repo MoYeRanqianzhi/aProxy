@@ -408,7 +408,7 @@ fn restart_all_skips_failed_instance_and_exits_nonzero() {
         "有成有败时应以 5 退出: {stderr}"
     );
     assert!(
-        stderr.contains("Restart failed for 1 of 2 instances"),
+        stderr.contains("Restart failed for 1 of the 2 instances attempted."),
         "应汇总失败实例: {stderr}"
     );
     let a = ipc_ping_in_dir(&rt, port_a, home).expect("A 应已重启并运行");

@@ -286,7 +286,7 @@ fn status_json_document() {
     let plain = run(&home, &["status"]);
     let stdout = String::from_utf8_lossy(&plain.stdout);
     assert!(
-        stdout.contains("Instances awaiting restore (1)"),
+        stdout.contains("Instances waiting to be restored (1)"),
         "{stdout}"
     );
     assert!(
@@ -854,7 +854,7 @@ fn log_replay_is_independent_of_notice_language() {
     };
     aproxy::spec::write_restore_in(&run, &port, &spec).unwrap();
     for (lang, notice, pending) in [
-        ("en", "Log file:", "Instances awaiting restore (1)"),
+        ("en", "Log file:", "Instances waiting to be restored (1)"),
         ("zh-CN", "日志文件:", "等待恢复的实例 (1)"),
     ] {
         let out = home

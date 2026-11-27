@@ -185,7 +185,10 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) -> u8 {
     if !cfg.base_url.is_empty() {
         // 与上一行同一出口：这一行同样会被整段粘贴求助
         let base = aproxy_ipc::redact::url(cfg.base_url.trim_end_matches('/'));
-        println!("{}", text::client(current(), &info.instance.listen_addr));
+        println!(
+            "{}",
+            text::client(current(), &client_addr(&info.instance.listen_addr))
+        );
         println!("{}", text::upstream(current(), &base));
     }
     // 仅转发模式是放弃重试保障的取舍，启动提示里必须显式说出来
@@ -323,6 +326,20 @@ pub(crate) async fn handle_serve_cmd(spec_path: &Path) -> u8 {
     0
 }
 
+/// 通配地址只能用于绑定；客户端连接同族环回地址，端口取自已经绑定的实例应答。
+fn client_addr(listen: &str) -> String {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    match listen.parse::<SocketAddr>() {
+        Ok(SocketAddr::V4(addr)) if addr.ip().is_unspecified() => {
+            SocketAddr::from((Ipv4Addr::LOCALHOST, addr.port())).to_string()
+        }
+        Ok(SocketAddr::V6(addr)) if addr.ip().is_unspecified() => {
+            SocketAddr::from((Ipv6Addr::LOCALHOST, addr.port())).to_string()
+        }
+        _ => listen.to_owned(),
+    }
+}
+
 /// 把监听地址里的端口换成 `port`（地址部分原样保留，含 IPv6 的方括号）。
 fn replace_port(listen_addr: &str, port: u16) -> String {
     match listen_addr.rsplit_once(':') {
@@ -334,6 +351,21 @@ fn replace_port(listen_addr: &str, port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_addr_preserves_the_bound_port_and_only_rewrites_wildcards() {
+        let bound = replace_port("0.0.0.0:0", 41002);
+        for (listen, client) in [
+            (bound.as_str(), "127.0.0.1:41002"),
+            ("[::]:41003", "[::1]:41003"),
+            ("127.0.0.1:7", "127.0.0.1:7"),
+            ("[0:0:0:0:0:0:0:1]:7", "[0:0:0:0:0:0:0:1]:7"),
+            ("192.168.1.100:9", "192.168.1.100:9"),
+            ("proxy.local:8", "proxy.local:8"),
+        ] {
+            assert_eq!(client_addr(listen), client);
+        }
+    }
 
     #[test]
     fn replace_port_keeps_the_host_part() {

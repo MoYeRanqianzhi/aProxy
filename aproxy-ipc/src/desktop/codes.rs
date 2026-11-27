@@ -38,11 +38,11 @@ pub enum HistoryCode {
     FormatFailed,
     /// In forward mode, the upstream attempt failed, and the request was not switched to retry mode.
     UpstreamFailed,
-    /// Response headers had already been sent to the client without a content encoding, so the upstream body had to be decoded, and decoding failed.
+    /// Response headers had already been sent to the client without a content encoding, and the body could not be decoded to match.
     DecodeFailed,
     /// The instance is shutting down.
     ShuttingDown,
-    /// A defect in aproxy itself.
+    /// A defect in aProxy itself.
     Internal,
     /// Could not connect to the upstream server, for example because the DNS lookup failed, the connection was refused or the TLS handshake failed.
     UpstreamConnectFailed,
@@ -50,7 +50,7 @@ pub enum HistoryCode {
     UpstreamConnectTimeout,
     /// The request was sent but no response headers arrived in time.
     UpstreamFirstByteTimeout,
-    /// Too long passed between two reads of the response body.
+    /// No data arrived on the response body for too long.
     UpstreamReadIdleTimeout,
     /// The response body broke off midway.
     UpstreamBodyInterrupted,
@@ -89,17 +89,17 @@ pub enum DiagCode {
     ConfigMissingKey,
     /// The file uses the 0.1.x configuration shape; its migration can be previewed.
     ConfigLegacyShape,
-    /// A key that is not recognized.
+    /// The key is not recognized.
     ConfigUnknownKey,
     /// This version recognizes the setting but does not support it yet.
     ConfigNotSupported,
-    /// A combination of settings that exclude each other.
+    /// Settings that cannot be used together are both set.
     ConfigConflict,
     /// A secret placeholder written back does not match any original value.
     SecretPlaceholderUnmatched,
     /// A credential in the settings defaults was not inherited because the target differs, and this config has none of its own.
     DefaultCredentialWithheld,
-    /// These default headers are sent to every target. If one carries a credential, set it only in the configurations that need it.
+    /// These default headers apply to every configuration that does not set them itself. If one carries a credential, set it only in the configurations that need it.
     DefaultHeaderShared,
     /// The default delivery is forward while the chain has a decide program or an optional request program: when they are unavailable, requests are not retried.
     ForwardDefaultUnguarded,
@@ -113,7 +113,7 @@ pub enum DiagCode {
     FormatHandshakeFailed,
     /// A format does not support a stage the config declares for it.
     FormatStageUnsupported,
-    /// The group or others can access the home or a config file.
+    /// Other users can access the aProxy home or a configuration file.
     FilePermissionsTooOpen,
     /// The config listens on a non-loopback address, so other hosts can reach the proxy.
     ListenNotLoopback,

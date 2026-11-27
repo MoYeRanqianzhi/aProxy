@@ -476,6 +476,70 @@ fn events(out: &Output) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// 同一个可执行探针在备料、交换后的规范位置都能自报版本，不依赖脚本扩展名。
+#[test]
+fn local_downgrade_requires_consent_and_never_overrides_the_floor() {
+    let h = TestHome::new();
+    let from = h.path().join(aproxy::install::staging::binary_name());
+    let source = h.path().join("probe.rs");
+    fs::write(&source, r#"fn main() { assert_eq!(std::env::args().nth(1).as_deref(), Some("--version")); println!("aproxy v{} (headless; fake)", std::env::var("PROBE_VERSION").unwrap()); }"#).unwrap();
+    let built = h
+        .cmd_with("rustc")
+        .arg(&source)
+        .arg("-o")
+        .arg(&from)
+        .output()
+        .report_exit()
+        .unwrap();
+    assert!(built.status.success(), "{built:?}");
+    let older = "0.2.0-alpha.1";
+    let bin = swap::bin_path_in(h.path());
+    fs::create_dir(bin.parent().unwrap()).unwrap();
+    fs::write(&bin, b"original image").unwrap();
+    for (version, allow, error) in [
+        (older, false, Some("install_failed")),
+        ("0.1.5", false, Some("install_below_floor")),
+        ("0.1.5", true, Some("install_below_floor")),
+        (older, true, None),
+    ] {
+        let mut cmd = h.cmd();
+        cmd.args(["install", "--json", "--no-skills", "--from"])
+            .arg(&from)
+            .env("PROBE_VERSION", version);
+        if allow {
+            cmd.arg("--allow-downgrade");
+        }
+        let out = cmd.output().report_exit().unwrap();
+        let lines = events(&out);
+        let result = lines.last().unwrap();
+        assert_eq!(result["event"], "result");
+        assert_eq!(result["version"], version);
+        if let Some(code) = error {
+            assert_eq!(out.status.code(), Some(1), "{out:?}");
+            assert_eq!(lines.len(), 1);
+            assert_eq!(result["outcome"], "failed");
+            assert_eq!(result["error"]["code"], code);
+            assert_eq!(result["error"]["details"], serde_json::json!({}));
+            if version == older {
+                assert_eq!(
+                    result["error"]["message"],
+                    format!(
+                        "Target version {older} is older than the current version {}. Use --allow-downgrade to downgrade.",
+                        env!("CARGO_PKG_VERSION")
+                    )
+                );
+            }
+            assert_eq!(fs::read(&bin).unwrap(), b"original image");
+            assert_eq!(fs::read_dir(bin.parent().unwrap()).unwrap().count(), 1);
+            assert!(!h.path().join("install").exists());
+        } else {
+            assert!(out.status.success(), "{out:?}");
+            assert_eq!(result["outcome"], "installed");
+            assert_eq!(fs::read(&bin).unwrap(), fs::read(&from).unwrap());
+        }
+    }
+}
+
 /// 一次从规范镜像运行的真实滚动跨过交棒，验证完整的相位、实例和最终应答。
 #[tokio::test]
 async fn install_json_reports_plan_phases_instances_and_result() {

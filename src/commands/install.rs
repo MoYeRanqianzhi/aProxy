@@ -218,7 +218,7 @@ async fn install(args: InstallArgs) {
         return;
     }
 
-    // --from <路径>：目标版本 = 源二进制自报版本；版本下限与在线安装同一道
+    // --from <路径>：目标版本 = 源二进制自报版本；版本下限与降级确认和在线安装同一道
     // （见 aproxy::install::INSTALL_FLOOR）。同时给了 --variant 时是核对：文件必须正是
     // 这个变体（与 install --force --from 同一语义）
     if let Some(from) = &args.from {
@@ -248,9 +248,12 @@ async fn install(args: InstallArgs) {
                 ));
             }
         }
-        let version = semver::Version::parse(&target).expect("validated version must be semver");
-        if let Err(e) = aproxy::install::install_floor(&version) {
-            fail(InstallFailure::because("install_below_floor", e.into()));
+        let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("build version must be semver");
+        if let Err(e) =
+            aproxy::install::download::check_downgrade(&target, &current, args.allow_downgrade)
+        {
+            fail(e);
         }
         let plan = aproxy::install::flow::InstallPlan {
             target_version: target,

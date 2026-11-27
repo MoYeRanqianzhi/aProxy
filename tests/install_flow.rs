@@ -780,7 +780,12 @@ fn unix_install_rolls_back_instance_to_preserved_old_binary() {
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let out = env
-        .install_cmd(&["--from", &fake.display().to_string(), "--no-skills"])
+        .install_cmd(&[
+            "--from",
+            &fake.display().to_string(),
+            "--allow-downgrade",
+            "--no-skills",
+        ])
         .output()
         .report_exit()
         .unwrap();

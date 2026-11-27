@@ -541,19 +541,23 @@ jobs:
         if: steps.plan.outputs.args != ''
         run: cargo publish --dry-run --locked --allow-dirty ${{ steps.plan.outputs.args }}
       # 检查 dry-run 实际打出的包；只发其他 crate 时没有 aproxy 包可检验。
-      # cargo 把打好的包放在 target/package/ 下，但具体在哪一层随版本变：cargo 1.100 的 dry-run
-      # 放在 target/package/tmp-crate/（2026-11-27 实测），别的版本可能直接放在 target/package/。按文件名找，恰好一个才核对
+      # cargo 把打好的包放在 target/package/ 下，但具体在哪、放几份随版本变：cargo 1.100 一次发多个
+      # crate 时，dry-run 在 target/package/tmp-crate/ 与 tmp-registry/ 各留一份（2026-11-27 实测），别的版本
+      # 可能直接放在 target/package/。按文件名找出全部，逐个核对；一个都没有就失败
       - name: Verify packaged crate skills against the release archive
         if: contains(format(' {0} ', steps.plan.outputs.args), ' -p aproxy ')
         run: |
           export APROXY_HOME="$(mktemp -d)"
           mapfile -t crates < <(find target/package -name "aproxy-$RELEASE_VERSION.crate" -type f)
-          if [[ ${#crates[@]} -ne 1 ]]; then
-            echo "::error::target/package 下应恰好有一个 aproxy-$RELEASE_VERSION.crate，实际找到 ${#crates[@]} 个：${crates[*]}"
+          if [[ ${#crates[@]} -eq 0 ]]; then
+            echo "::error::target/package 下没有 aproxy-$RELEASE_VERSION.crate"
             exit 1
           fi
-          cargo run --locked --no-default-features --bin aproxy -- skill __verify-package \
-            artifacts/aproxy-skills.zip "$RELEASE_VERSION" --packaged-crate "${crates[0]}"
+          for crate in "${crates[@]}"; do
+            echo "核对 $crate"
+            cargo run --locked --no-default-features --bin aproxy -- skill __verify-package \
+              artifacts/aproxy-skills.zip "$RELEASE_VERSION" --packaged-crate "$crate"
+          done
       - uses: rust-lang/crates-io-auth-action@v1.0.6
         if: steps.plan.outputs.args != ''
         id: crates-auth
@@ -601,16 +605,20 @@ jobs:
         if: steps.plan.outputs.args != ''
         run: cargo publish --dry-run --locked --allow-dirty ${{ steps.plan.outputs.args }}
       # 检查 dry-run 实际打出的包；只发其他 crate 时没有 aproxy 包可检验。
-      # cargo 把打好的包放在 target/package/ 下，但具体在哪一层随版本变：cargo 1.100 的 dry-run
-      # 放在 target/package/tmp-crate/（2026-11-27 实测），别的版本可能直接放在 target/package/。按文件名找，恰好一个才核对
+      # cargo 把打好的包放在 target/package/ 下，但具体在哪、放几份随版本变：cargo 1.100 一次发多个
+      # crate 时，dry-run 在 target/package/tmp-crate/ 与 tmp-registry/ 各留一份（2026-11-27 实测），别的版本
+      # 可能直接放在 target/package/。按文件名找出全部，逐个核对；一个都没有就失败
       - name: Verify packaged crate skills against the release archive
         if: contains(format(' {0} ', steps.plan.outputs.args), ' -p aproxy ')
         run: |
           export APROXY_HOME="$(mktemp -d)"
           mapfile -t crates < <(find target/package -name "aproxy-$RELEASE_VERSION.crate" -type f)
-          if [[ ${#crates[@]} -ne 1 ]]; then
-            echo "::error::target/package 下应恰好有一个 aproxy-$RELEASE_VERSION.crate，实际找到 ${#crates[@]} 个：${crates[*]}"
+          if [[ ${#crates[@]} -eq 0 ]]; then
+            echo "::error::target/package 下没有 aproxy-$RELEASE_VERSION.crate"
             exit 1
           fi
-          cargo run --locked --no-default-features --bin aproxy -- skill __verify-package \
-            artifacts/aproxy-skills.zip "$RELEASE_VERSION" --packaged-crate "${crates[0]}"
+          for crate in "${crates[@]}"; do
+            echo "核对 $crate"
+            cargo run --locked --no-default-features --bin aproxy -- skill __verify-package \
+              artifacts/aproxy-skills.zip "$RELEASE_VERSION" --packaged-crate "$crate"
+          done

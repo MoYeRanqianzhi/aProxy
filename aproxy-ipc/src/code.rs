@@ -260,7 +260,7 @@ pub const TABLE: &[Code] = &[
     plain(
         "desktop_format_fail",
         &[Family::Desktop],
-        "The program returned its own control failure.",
+        "The format program reported that the control operation failed.",
         &[req("code", T::String), req("reason", T::String)],
     ),
     plain(
@@ -395,7 +395,7 @@ pub const TABLE: &[Code] = &[
     Code {
         name: "internal",
         families: &[Family::Terminal, Family::Ipc, Family::Operation],
-        summary: "A defect in aproxy itself.",
+        summary: "A defect in aProxy itself.",
         http: Some(Http(500)),
         exit: Some(Exit(EXIT_FAILED)),
         severity: None,
@@ -423,7 +423,7 @@ pub const TABLE: &[Code] = &[
     plain(
         "upstream_read_idle_timeout",
         ATTEMPT,
-        "Too long passed between two reads of the response body.",
+        "No data arrived on the response body for too long.",
         &[
             req("timeout_ms", T::Millis),
             req("received_bytes", T::Bytes),
@@ -599,14 +599,14 @@ pub const TABLE: &[Code] = &[
         "port_in_use",
         OPERATION,
         Exit(EXIT_FAILED),
-        "The port is taken.",
+        "The port is already in use.",
         &[req("port", T::Integer), req("owner", T::String)],
     ),
     exiting(
         "start_failed",
         OPERATION,
         ChildOr(EXIT_FAILED),
-        "The daemon could not start.",
+        "The instance could not start.",
         &[opt("code", T::Integer), req("startup_log", T::StringList)],
     ),
     exiting(
@@ -713,7 +713,7 @@ pub const TABLE: &[Code] = &[
     diagnostic(
         "config_unknown_key",
         Severity::Error,
-        "A key that is not recognized.",
+        "The key is not recognized.",
         &[],
     ),
     diagnostic(
@@ -731,7 +731,7 @@ pub const TABLE: &[Code] = &[
     diagnostic(
         "config_conflict",
         Severity::Error,
-        "A combination of settings that exclude each other.",
+        "Settings that cannot be used together are both set.",
         &[],
     ),
     diagnostic(
@@ -785,7 +785,7 @@ pub const TABLE: &[Code] = &[
     diagnostic(
         "file_permissions_too_open",
         Severity::Warning,
-        "The group or others can access the home or a config file.",
+        "Other users can access the aProxy home or a configuration file.",
         &[],
     ),
     diagnostic(
@@ -840,13 +840,13 @@ pub const TABLE: &[Code] = &[
     plain(
         "record_unreadable",
         RECORD,
-        "A persistent record cannot be parsed.",
+        "A saved record cannot be read.",
         &[],
     ),
     plain(
         "record_schema_too_new",
         RECORD,
-        "A persistent record has a schema newer than this version understands.",
+        "A saved record was written by a newer aProxy version.",
         &[req("schema", T::Integer)],
     ),
     // ----- 安装码 -----

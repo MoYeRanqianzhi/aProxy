@@ -79,6 +79,11 @@ jobs:
       # 格式与特性无关，跑一遍就够
       - if: matrix.variant == 'desktop'
         run: cargo fmt --all -- --check
+      # 无界面版本不得多出任何依赖；只查本机平台，三个平台的 headless 作业合起来覆盖全部
+      - name: Assert the headless dependency tree has no UI crates
+        if: matrix.variant == 'headless'
+        shell: bash
+        run: bash .github/scripts/headless-tree.sh
       # --locked：Cargo.lock 是权威解析（windows-sys 精确钉死的历史教训——
       # 无锁重解析曾观察到直接依赖漂移到不兼容的新版本线）
       - run: cargo clippy --workspace ${{ matrix.flags }} --all-targets --locked -- -D warnings
@@ -189,15 +194,10 @@ jobs:
         run: |
           npm ci
           npm run build
-      # 无界面版本不得多出任何依赖：依赖树（全部目标平台）里不能出现桌面界面那一族
+      # 无界面版本不得多出任何依赖；只查本机平台，三个平台的 headless 作业合起来覆盖全部
       - name: Assert the headless dependency tree has no UI crates
         if: matrix.variant == 'headless'
-        run: |
-          tree=$(cargo tree -p aproxy --no-default-features -e normal --target all --prefix none --locked)
-          if grep -E '^(aproxy-desktop|tauri|tauri-[a-z-]+|wry|tao|webview2-com|webkit2gtk) ' <<<"$tree"; then
-            echo "::error::headless 的依赖树里出现了桌面界面的依赖（见上面列出的包）"
-            exit 1
-          fi
+        run: bash .github/scripts/headless-tree.sh
       # windows 上的 clippy 不编译 #[cfg(unix)] 代码，零警告纪律在这里补上 unix 面
       - run: cargo clippy --workspace ${{ matrix.flags }} --all-targets --locked -- -D warnings
       - run: cargo test --workspace ${{ matrix.flags }} --locked --no-fail-fast
@@ -325,10 +325,10 @@ jobs:
         run: |
           npm ci
           npm run build
-      # 依赖闭包的离线测试（aproxy-ipc）检查全部目标平台的依赖；在 macOS 上本机构建不会下载
-      # Windows 目标的依赖源码，先用 cargo tree 取齐，测试本身保持离线
-      - run: cargo tree --locked -p aproxy-ipc --no-default-features --target all -e normal > /dev/null
-        shell: bash
+      # 无界面版本不得多出任何依赖；只查本机平台，三个平台的 headless 作业合起来覆盖全部
+      - name: Assert the headless dependency tree has no UI crates
+        if: matrix.variant == 'headless'
+        run: bash .github/scripts/headless-tree.sh
       - run: cargo clippy --workspace ${{ matrix.flags }} --all-targets --locked -- -D warnings
       - run: cargo test --workspace ${{ matrix.flags }} --locked --no-fail-fast
       - name: Smoke-test --version (C5)

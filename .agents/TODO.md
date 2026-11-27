@@ -83,7 +83,8 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   设计见 [plan/format-chain-view.md](plan/format-chain-view.md)。
 - [ ] **`featureless_tree_stays_small` 在 Linux 上要 Windows 的包**（2026-11-26 发现）：测试用 `cargo tree --target all`，
   Linux 上也得有 `windows-sys 0.52.0` 的源码，CI 缓存没有就失败。用户 2026-11-27 定：这是测试写错了，Linux 不该下 Windows 的东西，
-  不在 CI 里补下载。改成每个平台只查自己的依赖闭包、三个平台各列一份（Codex t24 在做）。
+  不在 CI 里补下载。测试已改成每个平台只查自己的依赖闭包（d2625d5e）；CI 与发布流程里为旧测试预取全部平台依赖的步骤已删，
+  headless 不含界面依赖的检查也改为三个平台各查本机（`.github/scripts/headless-tree.sh`）。等 CI 三个平台都绿后关闭。
 ### 0.2.0 之后紧接着（近期，用户 2026-10-12）
 - [ ] **并发限制与排队**：aproxy 的排队放行 + 官方 aproxy-format 的并发/限速/额度规则（协议形状在 0.2.0 定稿，见计划 W2 的 format 定稿补充）
 - [ ] **用量与费用统计**、**按 key 限速**、**预算上限**（建在生命周期通知上）

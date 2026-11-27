@@ -62,10 +62,6 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2.9.3
       - run: cargo fmt --all -- --check
-      # 依赖闭包的离线测试（aproxy-ipc）检查全部目标平台的依赖；在 macOS 上本机构建不会下载
-      # Windows 目标的依赖源码，先用 cargo tree 取齐，测试本身保持离线
-      - run: cargo tree --locked -p aproxy-ipc --no-default-features --target all -e normal > /dev/null
-        shell: bash
       - run: cargo clippy --workspace --exclude aproxy-desktop --no-default-features --all-targets --locked -- -D warnings
       # 不带目标过滤的 cargo test 会顺带编译 examples——transform_integration
       # 依赖已编译的 examples/format-echo

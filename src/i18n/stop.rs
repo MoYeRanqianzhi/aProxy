@@ -12,6 +12,8 @@ message!(port_pid(port: &str, pid: u32), en: "Instance on port {port} (pid {pid}
 
 message!(unresponsive(who: &str), en: "{who} is running but does not respond on the control channel. Use --force to terminate it.", zh: "{who}进程仍在，但不应答控制通道，无法优雅停止；用 --force 强制结束");
 
+message!(incompatible(port: &str), en: "The instance on port {port} answered, but its reply could not be accepted: it may run another aProxy version, or it may not be the instance recorded for this port. Manage it with the aProxy version that started it. Nothing was stopped, and its desired-state record was kept.", zh: "端口 {port} 的实例应答了，但应答无法采信：它可能是别的 aProxy 版本，或者不是这个端口记录里的那个实例。请用启动它的那个版本的 aproxy 操作它。没有停止任何进程，它的期望状态记录也保留着。");
+
 message!(idle_only(cmd: &str), en: "--idle-threshold-secs requires the idle target. Example: aproxy {cmd} idle --idle-threshold-secs 600", zh: "--idle-threshold-secs 只能与目标 idle 一起用，例如: aproxy {cmd} idle --idle-threshold-secs 600");
 
 message!(forgotten(port: &str), en: "The instance on port {port} is no longer running. Its desired-state record was removed. Restore and the watchdog will not start it again.", zh: "端口 {port} 的实例已不在运行；已删除它的期望状态记录，restore 与看护者不会再拉起它。");

@@ -1822,7 +1822,7 @@ async fn incompatible_ping_refuses_targeted_commands_and_preserves_restore() {
             let out = run_cli(&home, &built_exe(), &["logs", target]);
             assert_eq!(out.status.code(), Some(1), "{out:?}");
             assert!(out.stdout.is_empty());
-            assert!(text(&out.stderr).contains("replies could not be accepted"));
+            assert!(text(&out.stderr).contains("its reply could not be accepted"));
         }
         assert_eq!(std::fs::read(&path).unwrap(), before);
         server.abort();

@@ -387,7 +387,7 @@ pub(crate) fn spawn_failure(
 pub(crate) fn incompatible_instance(port: &str, reason: &str) -> Failure {
     Failure::rendered(
         aproxy_ipc::enumerate::CODE_INSTANCE_INCOMPATIBLE,
-        |lang| status::text::incompatible(lang, 1),
+        |lang| stop::text::incompatible(lang, port),
         json!({"port":port_value(port),"reason":reason}),
     )
 }

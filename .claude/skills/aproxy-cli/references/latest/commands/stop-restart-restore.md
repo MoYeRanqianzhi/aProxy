@@ -105,7 +105,7 @@ described in [start](start.md#options-for-start), "Reason and note".
   proxy environment and `PATH`, and the log path all come from the instance's desired-state record.
   An instance without a record cannot be restarted this way: a `--foreground` instance is refused
   with
-  `Port <port> was not restarted: there is no desired-state record for this instance, so aProxy cannot restart it automatically. A foreground instance must be restarted in its own terminal. The old instance is still running.`
+  `Port <port> was not restarted: there is no desired-state record for this instance, so aProxy cannot restart it automatically. To restart a foreground instance, stop it and start it again yourself. The old instance is still running.`
   and keeps running. Stop it in its terminal and start it in the background to give it a record.
 - `--force` terminates the old instance immediately but keeps the record, so the watchdog and
   `restore` can still bring the instance back if the new one fails. The watchdog may respawn it

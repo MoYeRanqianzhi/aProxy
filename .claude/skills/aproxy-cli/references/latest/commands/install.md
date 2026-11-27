@@ -177,7 +177,7 @@ and run `aproxy install` again. An instance you stop while the install runs is s
   stay on the old version with `aproxy install <old version> --allow-downgrade`. The new binary is
   already in `<home>/bin/` at this point, so the CLI and some instances run different versions
   until you finish.
-- `Installation state was retained. Rerun the same command to resume. …`:
+- `Installation state was retained. Run the same command again to finish the installation. …`:
   run the same command again. When the error reads `The target version did not take over the installation (…)`,
   the downloaded binary exited or hung before starting;
   no instance and no file in `<home>/bin/` was changed.

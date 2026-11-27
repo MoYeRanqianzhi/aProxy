@@ -157,7 +157,7 @@
       注意 `src/i18n/data.rs` 的英文会写进 HTTP、SSE 与快照，清点时按整句比对还原，改它会让旧记录还原不出中文，不要随手改。
     - 连带：doctor 给人看的诊断现在直接显示登记表里的英文摘要（第四段的审查指出，新加的两条 forward 提示也是）；
       随这一项改成按语言显示，`--json` 里的英文不动。
-12. **tag beta.1**。
+12. **tag beta.1**。✓ 2026-11-27 打在 `b86f4afa`：Release 47 个资产，npm 两组的 `next` 与 crates.io 四个包都是 0.2.0-beta.1，tag 已加进 ci.yml 的 `PREV_VERSIONS`。打之前的演练跑了五轮：一个只在 Linux 上出现的测试竞态、一处格式问题、cargo 1.100 把打好的包放到 `target/package/tmp-crate/` 与 `tmp-registry/`（release.yml 的核对改成按文件名找、逐份核对）。
 
 ### beta.1 到 rc.1（阶段 4）
 

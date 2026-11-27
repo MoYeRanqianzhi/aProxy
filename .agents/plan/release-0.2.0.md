@@ -541,7 +541,7 @@
 - 阶段 2，契约块：✓ B0 → ✓ B1 → ✓ B2 → ✓ B3 → ✓ B4 → ✓ **tag alpha.2**（2026-11-17）→ ✓ B5 → ✓ B6 → ✓ B7 → ✓ B8 → ✓ B9 → ✓ **tag alpha.3**（2026-11-19）→
   B10a → B10b、B10c → B10d → B11 与 W2c → ✓ **tag alpha.4**（2026-11-21，打在 cf8916b；Release 47 个资产，四个 crate 已在 crates.io）。B12（文档、skill、记忆）随各块。alpha.2 之后补跨版本强制安装
   的 CI 测试（TODO 的 W2b 一条）。
-- 阶段 3：W4 `aproxy skill`、W3 i18n、W5 界面接入真实数据（前端可提前对 §6 的形状做 mock 侧的工作）→ **tag beta.1**。
+- 阶段 3：W4 `aproxy skill`、W3 i18n、W5 界面接入真实数据（前端可提前对 §6 的形状做 mock 侧的工作）→ ✓ **tag beta.1**（2026-11-27，打在 b86f4afa）。
 - 阶段 4：W6 修复（含 restart 偶发、`install --from` 降级检查）、0.1.0 skill 支线的防护（W4 一节最后一条：skills 资产换名、
   npm 包内路径换、crate 不再带 `.claude/skills/`）、性能重测与优化（[perf-0.2.0](perf-0.2.0.md)）、文档与 README 截图、W7 撤回预发布措辞与重写 SECURITY.md →
   **tag rc.1** → **v0.2.0**（aproxy-envelope 同时发 0.2.0；aproxy-format 0.2.0 随后走 format-v* 线，见 TODO 的 envelope 一条）。

@@ -22,10 +22,10 @@ How a proxied request finally ended when aproxy itself ended it. The code is in 
 | `retry_exhausted` | passthrough, else 502 | The attempts allowed by a retry rule or a per-request override are used up. | `by` (string), `last_code` (code) |
 | `retry_stopped` | passthrough, else 502 | A format's decide stage stopped the retries. | `format` (string), `last_code` (code) |
 | `format_rejected` | passthrough, else 422 | A request-side format answered fail with retry:false. | `format` (string), `stage` (string), `fail_code`? (string) |
-| `format_unavailable` | 503 | A required format's circuit is open, so a request-direction stage cannot use it. | `format` (string), `stage` (string), `kind` (string), `probe_at` (Unix milliseconds) |
-| `format_failed` | 502 | A forward request's request-side format failed or asked for a retry, and the request was not upgraded to retry. | `format` (string), `stage` (string), `kind`? (string), `fail_code`? (string) |
-| `upstream_failed` | 502 | A forward request's upstream attempt failed and the request was not upgraded to retry. | `last_code` (code) |
-| `decode_failed` | SSE event only | The stream is already committed, the upstream's content encoding cannot be carried, and decoding failed. | `encoding` (string) |
+| `format_unavailable` | 503 | The circuit breaker is temporarily blocking calls to a required request-side format program, so the request cannot proceed. | `format` (string), `stage` (string), `kind` (string), `probe_at` (Unix milliseconds) |
+| `format_failed` | 502 | In forward mode, a request-side format program failed or asked for a retry, and the request was not switched to retry mode. | `format` (string), `stage` (string), `kind`? (string), `fail_code`? (string) |
+| `upstream_failed` | 502 | In forward mode, the upstream attempt failed, and the request was not switched to retry mode. | `last_code` (code) |
+| `decode_failed` | SSE event only | Response headers had already been sent to the client without a content encoding, so the upstream body had to be decoded, and decoding failed. | `encoding` (string) |
 | `shutting_down` | 503 | The instance is shutting down. | — |
 | `internal` | 500 | A defect in aproxy itself. | — |
 
@@ -35,7 +35,7 @@ Why one upstream attempt did not succeed. By default every one of them is retrie
 
 | Code | When | `details` |
 |---|---|---|
-| `upstream_connect_failed` | Could not connect to the upstream: DNS, refused, TLS. | `reason` (string) |
+| `upstream_connect_failed` | Could not connect to the upstream server, for example because the DNS lookup failed, the connection was refused or the TLS handshake failed. | `reason` (string) |
 | `upstream_connect_timeout` | Connecting to the upstream timed out. | `timeout_ms` (milliseconds) |
 | `upstream_first_byte_timeout` | The request was sent but no response headers arrived in time. | `timeout_ms` (milliseconds) |
 | `upstream_read_idle_timeout` | Too long passed between two reads of the response body. | `timeout_ms` (milliseconds), `received_bytes` (bytes) |
@@ -60,7 +60,7 @@ The `code` of the error object an instance returns on its control endpoint.
 | `unknown_op` | There is no such op. Nothing was done. | `op` (string) |
 | `unsupported_arg` | The request carries arguments this instance does not know. | `args` (string list) |
 | `invalid_state` | Not allowed in the instance's current state. | `state` (string), `reason`? (string) |
-| `condition_not_met` | The condition of a conditional op does not hold. | `idle_ms`? (milliseconds) |
+| `condition_not_met` | The action was not performed because its condition did not hold, for example the instance had not been idle long enough to stop. | `idle_ms`? (milliseconds) |
 | `busy` | All streaming connections are in use. | `limit` (integer) |
 | `not_found` | The request, or the body asked for, cannot be retrieved. | `request_id` (string), `reason` (string), `cause`? (string) |
 
@@ -72,7 +72,7 @@ Why an operation started from the command line or the desktop window failed. Wit
 |---|---|---|---|
 | `internal` | 1 | A defect in aproxy itself. | — |
 | `usage` | 2 | A usage error found outside the argument parser. | `reason` (string) |
-| `home_invalid` | 2 | APROXY_HOME does not satisfy the home rules. | `value` (string) |
+| `home_invalid` | 2 | aProxy could not determine its home directory. Set APROXY_HOME to an absolute path. | `value` (string) |
 | `target_ambiguous` | 2 | Several instances are running and no target was given. | `ports` (integer list) |
 | `target_not_found` | 4 | The alias, port or config file does not exist. | `target` (string) |
 | `target_not_running` | 4 | The target is not running. | `target` (string) |
@@ -81,9 +81,9 @@ Why an operation started from the command line or the desktop window failed. Wit
 | `write_conflict` | 1 | The config file was modified externally while writing, and retrying still conflicted. | `file` (path) |
 | `port_in_use` | 1 | The port is taken. | `port` (integer), `owner` (string) |
 | `start_failed` | the child's code, else 1 | The daemon could not start. | `code`? (integer), `startup_log` (string list) |
-| `ready_timeout` | 1 | The instance did not reach serving within the time limit. | `timeout_ms` (milliseconds) |
+| `ready_timeout` | 1 | The instance did not become ready to accept requests within the time limit. | `timeout_ms` (milliseconds) |
 | `format_restart_failed` | 1 | The format restart operation was not completed. | `port` (integer), `reason` (string) |
-| `restart_unsupported` | 1 | The target has no desired-state record (a foreground instance). | `port` (integer) |
+| `restart_unsupported` | 1 | There is no desired-state record for this instance (for example, it runs in the foreground), so it cannot be restarted automatically. | `port` (integer) |
 | `instance_unresponsive` | 1 | The instance's process is there but it does not answer. | `port` (integer), `pid` (integer) |
 | `instance_incompatible` | 1 | The instance answered, but its protocol is incompatible or its identity does not match. | `port` (integer), `reason` (string) |
 | `stop_failed` | 1 | The instance could not be stopped. | `port` (integer), `reason` (string) |
@@ -104,12 +104,12 @@ Problems found in config.toml and settings.json. Each diagnostic is an object wi
 | `config_missing_key` | error | A required key is missing. | — |
 | `config_legacy_shape` | info | A file uses the 0.1.x configuration shape; preview its migration before writing. | — |
 | `config_unknown_key` | error | A key that is not recognized. | — |
-| `config_not_supported` | error | A form whose shape is defined but which is not implemented yet. | — |
+| `config_not_supported` | error | This version recognizes the setting but does not support it yet. | — |
 | `format_name_reserved` | error | The format name is reserved for selecting all entries. | `name` (string) |
 | `config_conflict` | error | A combination of settings that exclude each other. | — |
 | `secret_placeholder_unmatched` | error | A secret placeholder written back does not match any original value. | — |
 | `default_credential_withheld` | warning | A credential in the settings defaults was not inherited because the target differs, and this config has none of its own. | `key` (string), `reason` (string) |
-| `default_header_shared` | info | The defaults' header tables contain non-secret headers, which are sent to every target. | — |
+| `default_header_shared` | info | These default headers are sent to every target. If one carries a credential, set it only in the configurations that need it. | — |
 | `forward_default_unguarded` | warning | The default delivery is forward while the chain has a decide program or an optional request program: when they are unavailable, requests are not retried. | — |
 | `forward_response_buffered` | info | The default delivery is forward and the chain has a response program; that layer gathers each response, so those responses are not streamed. Declare stream instead where the program supports it. | `format` (string) |
 | `settings_schema_too_new` | error | settings.json has a schema newer than this version understands. | — |
@@ -140,7 +140,7 @@ Faults returned to the bundled desktop page. They do not change CLI exit codes.
 
 | Code | When | `details` |
 |---|---|---|
-| `desktop_format` | The run cannot complete a format operation. | `reason` (string) |
+| `desktop_format` | The format operation on the selected instance could not be completed. | `reason` (string) |
 | `desktop_format_fail` | The program returned its own control failure. | `code` (string), `reason` (string) |
 | `desktop_package` | Package validation or a package operation failed. | `reason` (string), `field`? (string), `path`? (path), `limit`? (string), `max`? (integer) |
 | `desktop_toml` | The desktop preferences file could not be edited. | `kind` (string), `line`? (integer), `column`? (integer), `key`? (string) |
@@ -153,7 +153,7 @@ Why an install or upgrade failed. `install --force` does not use these; it only 
 |---|---|---|---|
 | `install_in_progress` | 1 | Another install is in progress in this home. | — |
 | `install_version_not_found` | 4 | The requested version does not exist. | — |
-| `install_below_floor` | 1 | The requested version is older than the oldest one this home can be moved to. | — |
+| `install_below_floor` | 1 | The requested version is too old to use this aProxy home's file layout and control protocol. | — |
 | `install_download_failed` | 1 | Downloading the binary failed. | — |
 | `install_checksum_mismatch` | 1 | The downloaded binary does not match its checksum. | — |
 | `install_probe_failed` | 1 | The new binary did not run, or reported a version other than the one being installed. | — |

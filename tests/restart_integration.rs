@@ -1806,8 +1806,9 @@ fn enumeration_tells_the_four_kinds_of_instance_apart() {
     // 当成清点建出来的。Windows 上端点是命名管道，不在 run 目录里，不用等
     #[cfg(unix)]
     {
+        let socket = Path::new(&alien_endpoint);
         assert!(
-            wait_for(Duration::from_secs(5), || Path::new(&alien_endpoint).exists()),
+            wait_for(Duration::from_secs(5), || socket.exists()),
             "冒充端点没有建出来"
         );
     }

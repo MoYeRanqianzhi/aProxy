@@ -60,6 +60,9 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] **`start` 提示的客户端地址用的是监听地址**（2026-11-27，t25 文案审查发现）：监听 `0.0.0.0` 或 `[::]` 时，
   「Point your API client's base URL to http://{addr}」给出的地址在 Windows 上连不上、对别的主机也不是可用地址
   （`src/commands/start.rs` 与 `src/server.rs` 的显示）。应在监听全部接口时显示 `127.0.0.1`（或 `[::1]`）加端口，归 W6。
+- [ ] **macOS 界面的两处小问题**（W8 留下，见 [release-0.2.0](plan/release-0.2.0.md) 的 W8「还没做」）：菜单栏的应用名是小写的
+  `aproxy`（裸二进制取进程名，打成 .app 才有 CFBundleName）；配置页把 `/tmp/...` 规范化成 `/private/tmp/...`，与实例页不一致
+  （家目录下的配置不受影响）。rc.1 之前定修不修
 - [ ] **W6 审查发现的修复与重构**；另含 W1 留下的：`install --from` 不做降级检查（审查 CI-06，已交 t26）；以及
   `tests/restart_integration.rs:170`（`restart_after_port_change_reports_new_port`）断言失败时打印 restart 的 stdout 与
   stderr，再查 2026-10-12 演练 38291736162 的 test (windows-latest, desktop) 里那次偶发（现在只有「restart 应成功，实际

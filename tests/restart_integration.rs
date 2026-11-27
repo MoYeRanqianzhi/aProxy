@@ -1796,10 +1796,21 @@ fn enumeration_tells_the_four_kinds_of_instance_apart() {
         r#"{"schema":2,"shape":"new"}"#,
     )
     .unwrap();
+    let alien_endpoint = aproxy::daemon::endpoint_for_in(&run_dir, &alien_port.to_string());
     rt.spawn(answer_every_request_with(
-        aproxy::daemon::endpoint_for_in(&run_dir, &alien_port.to_string()),
+        alien_endpoint.clone(),
         r#"{"v":2,"ok":false,"error":{"code":"unsupported_version","message":"this instance speaks v2","details":{"supported":[2]}}}"#,
     ));
+    // Unix 上冒充端点是 run 目录里的一个 socket 文件，由上面那个任务在运行时的工作线程上
+    // 异步建出来。下面「清点前」的文件列表要等它出现之后再记，否则这个 socket 文件会被
+    // 当成清点建出来的。Windows 上端点是命名管道，不在 run 目录里，不用等
+    #[cfg(unix)]
+    {
+        assert!(
+            wait_for(Duration::from_secs(5), || Path::new(&alien_endpoint).exists()),
+            "冒充端点没有建出来"
+        );
+    }
 
     // down：只剩一份期望状态记录，配置文件已经不在
     let down_port = free_port();

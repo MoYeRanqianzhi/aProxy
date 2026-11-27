@@ -542,7 +542,7 @@ jobs:
         run: cargo publish --dry-run --locked --allow-dirty ${{ steps.plan.outputs.args }}
       # 检查 dry-run 实际打出的包；只发其他 crate 时没有 aproxy 包可检验。
       # cargo 把打好的包放在 target/package/ 下，但具体在哪一层随版本变：cargo 1.100 的 dry-run
-      # 放在 target/package/tmp-crate/，正式发布前的打包仍在 target/package/。按文件名找，恰好一个才核对
+      # 放在 target/package/tmp-crate/（2026-11-27 实测），别的版本可能直接放在 target/package/。按文件名找，恰好一个才核对
       - name: Verify packaged crate skills against the release archive
         if: contains(format(' {0} ', steps.plan.outputs.args), ' -p aproxy ')
         run: |
@@ -602,7 +602,7 @@ jobs:
         run: cargo publish --dry-run --locked --allow-dirty ${{ steps.plan.outputs.args }}
       # 检查 dry-run 实际打出的包；只发其他 crate 时没有 aproxy 包可检验。
       # cargo 把打好的包放在 target/package/ 下，但具体在哪一层随版本变：cargo 1.100 的 dry-run
-      # 放在 target/package/tmp-crate/，正式发布前的打包仍在 target/package/。按文件名找，恰好一个才核对
+      # 放在 target/package/tmp-crate/（2026-11-27 实测），别的版本可能直接放在 target/package/。按文件名找，恰好一个才核对
       - name: Verify packaged crate skills against the release archive
         if: contains(format(' {0} ', steps.plan.outputs.args), ' -p aproxy ')
         run: |

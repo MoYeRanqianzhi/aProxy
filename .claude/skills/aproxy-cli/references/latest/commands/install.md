@@ -156,7 +156,7 @@ and run `aproxy install` again. An instance you stop while the install runs is s
 
 - Exit 0 with `Installation complete: <path>. The binary is in place and the instances are running the target version.`
   means every running instance was verified on the new
-  version. Before it, `The target version has taken over the installation. Waiting for broadcast, binary replacement, rolling restarts and verification...`
+  version. Before it, `The target version has taken over the installation. Waiting while it prepares the instances, replaces the binary, restarts the instances one at a time and verifies them...`
   appears: once the download is
   verified, the downloaded binary runs the rest in a separate process while the command waits (up
   to 600 s) and then reports. A downgrade is run by the command itself and skips this line.

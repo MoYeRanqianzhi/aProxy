@@ -92,8 +92,8 @@ commands.md. During the run:
   Do not stop, restart or kill such an instance: install is about to
   restart it, and interfering makes the two fight.
 - An instance that does not acknowledge (it is in a faulty state) is restarted onto the installer's
-  version, for up to three rounds. If it still fails, install aborts with `Instances still have not acknowledged after retries and restarts: …`
-  or `Restarting the instance on port <port> to obtain its acknowledgment failed: …`
+  version, for up to three rounds. If it still fails, install aborts with `These instances still have not confirmed that the binary can be replaced, even after retries and restarts: …`
+  or `Could not restart the instance on port <port> to get its confirmation that the binary can be replaced: …`
   and kills nothing. Ask the user whether that instance may be stopped, stop
   it, and run install again.
 - If the new binary cannot bring an instance up (stricter validation of the existing config,

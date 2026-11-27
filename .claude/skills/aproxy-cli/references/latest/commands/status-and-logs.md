@@ -22,10 +22,10 @@ only when it has entries, in this order:
   watchdog on, its hang detection terminates and respawns it on its own. This is the only state
   where `--force` is the right answer.
 - `Running aProxy instances (<n>):`, described below.
-- `Instances with unverified replies (<n>): the protocol or identity differs. …`,
+- `aProxy instances whose replies cannot be trusted (<n>): their protocol version or identity does not match. …`,
   with port, pid, version and a reason code. Operate such
   an instance with the aproxy version it runs; do not `--force` it.
-- `Instances awaiting restore (<n>): …`: not running, but their
+- `Instances waiting to be restored (<n>): …`: not running, but their
   desired-state record is kept, so `aproxy restore` or the watchdog will start them again.
   `(configuration file not found)` marks one whose config file is missing; restoring it fails until the file is
   back. `aproxy stop <port>` drops the record when the instance is no longer wanted.
@@ -59,8 +59,8 @@ meaning: [start](start.md#options-for-start), "Reason and note". Extra lines can
 - `Replacing the binary during a rolling install. Do not stop or restart this instance.`:
   `aproxy install` is about to restart this instance. Leave it alone.
 - `Stopping`: it received a stop and is finishing open requests (up to 10 s).
-- `Unknown state. Use the same aProxy version as the instance.`: the instance is newer
-  than this CLI.
+- `Unknown state (the instance is newer than this CLI). …`: check it with the aproxy
+  version it runs.
 - `Instance v<x> differs from CLI v<y>. …`:
   see compatibility.md.
 

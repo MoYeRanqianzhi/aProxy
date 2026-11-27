@@ -51,7 +51,7 @@ asking.
   use. Prints `No instances have been idle for more than <n> seconds.`
   when none qualify. The instance itself re-checks its idle time
   when the stop arrives: one that received a request after it was selected is left running, with
-  `Pid <pid> on port <port> received another request (idle for <n> seconds) and was not stopped.`,
+  `Pid <pid> on port <port> received a request in the meantime (it had been idle for <n> seconds), so it is no longer idle and was not stopped.`,
   and the command still exits 0. `--force` has no such
   re-check.
 - An alias whose config is not running: `Alias <name> (configuration <path>) is not running.`; a port with no

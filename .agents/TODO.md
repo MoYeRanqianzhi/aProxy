@@ -19,10 +19,6 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] **W2 契约实现**（按设计稿 §14）：全部做完（B10a–B10d、B11、W2c 随 alpha.4 发出）；剩实现落地后重写永久接口清单
 - [ ] **性能**（用户 2026-11-20）：在服务器上严格测出基线，功能都接入之后重测，rc.1 之前做优化。见
   [plan/perf-0.2.0.md](plan/perf-0.2.0.md)
-- [ ] **已知缺口**（B9 留下，归 W6）：`start_failed` 的 `details.code` 没填、退出码也没按码表用子进程的；没有命令以
-  `instance_incompatible` 失败（只有 `status` 的逐实例原因用它）。两条连同 `install --from` 的降级检查、`start` 提示的客户端
-  地址，2026-11-27 交给 Codex 的 t26（分支 `codex/t26-w6-fixes`）。原先列的另两条核实后销账：`EditError::Io` 走通用的
-  `command_failed`，码表就是这么定的；桌面界面并不拉起强制安装（代码里没有 `--force`），stdio 为 null 的是后台续作安装，本来就没人读
 - [ ] **Windows 上 `aproxy start` 以堆损坏（`0xC0000374`）退出**：CI 上出现过一次（run 44732134169，
   `second_start_waits_for_failed_hello_and_prepare_swap_changes_nothing`），没有复现。已把启动失败的退出改成先收回运行时，
   但没能证明这就是原因。再出现时：留下那个进程的 stderr，考虑在 CI 的 Windows 任务上开 page heap 跑这一个测试
@@ -57,13 +53,13 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   Rust 侧 t10b 2026-11-23 已派出，进度见 [codex-tasks-0.2.0](plan/codex-tasks-0.2.0.md) 的 9b）
 - [ ] **README 截图**（用户 2026-10-12）：UI 完成后构造演示数据，拍中英两套截图，中文版用于 README.md，英文版用于
   README_EN.md。演示数据里不能出现真实的 key、上游地址或个人信息
-- [ ] **`start` 提示的客户端地址用的是监听地址**（2026-11-27，t25 文案审查发现）：监听 `0.0.0.0` 或 `[::]` 时，
-  「Point your API client's base URL to http://{addr}」给出的地址在 Windows 上连不上、对别的主机也不是可用地址
-  （`src/commands/start.rs` 与 `src/server.rs` 的显示）。应在监听全部接口时显示 `127.0.0.1`（或 `[::1]`）加端口，归 W6。
+- [ ] **0.1.0 的 `install --skills-only` 会装上 0.2.0 的 skill**（2026-11-27 t26 调查）：0.2.0 成为正式版之后，0.1.0 用户或其
+  agent 跑 `aproxy install --skills-only` 会把 0.2.0 的文档装到仍是 0.1.0 的机器上。堵法与代价见
+  [release-0.2.0](plan/release-0.2.0.md) W4 一节的「0.1.0 的 skill 支线」。正式版之前由用户定做不做
 - [ ] **macOS 界面的两处小问题**（W8 留下，见 [release-0.2.0](plan/release-0.2.0.md) 的 W8「还没做」）：菜单栏的应用名是小写的
   `aproxy`（裸二进制取进程名，打成 .app 才有 CFBundleName）；配置页把 `/tmp/...` 规范化成 `/private/tmp/...`，与实例页不一致
   （家目录下的配置不受影响）。rc.1 之前定修不修
-- [ ] **W6 审查发现的修复与重构**；另含 W1 留下的：`install --from` 不做降级检查（审查 CI-06，已交 t26）；以及
+- [ ] **W6 审查发现的修复与重构**；另含 W1 留下的 restart 偶发：
   `tests/restart_integration.rs:170`（`restart_after_port_change_reports_new_port`）断言失败时打印 restart 的 stdout 与
   stderr，再查 2026-10-12 演练 38291736162 的 test (windows-latest, desktop) 里那次偶发（现在只有「restart 应成功，实际
   exit 非零」，查不了原因；同一提交 458900f 的 ci.yml 里 windows 是绿的）

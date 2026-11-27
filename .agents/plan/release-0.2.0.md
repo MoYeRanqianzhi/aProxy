@@ -320,9 +320,13 @@
   - 打包：一个脚本（输入取 `git ls-files`）打出一个带清单的可复现 zip，GitHub、npm、crate 三个渠道共用；删掉没有消费者的单
     skill 包；校验规则只在 Rust 里写一份；`.gitattributes` 给 skill 文件定 `eol=lf`。
   - 现有缺陷：`--skills-only` 与安装的 skill 支线之间没有锁，共用 `.dl`/`.staging`，并发时互删半成品。
-  - **0.1.0 的 skill 支线**：0.1.0 的 `upgrade` 一开始就并行下载目标版本的 skill，结局与二进制无关，C5 只拦得住二进制。
-    0.2.0 正式版之前，skills 资产要换名、npm 包内路径要换、crate 不再带 `.claude/skills/`，让 0.1.0 的三条渠道都找不到，
-    skill 原样不动。预发布版不受影响（0.1.0 的稳定通道不选预发布）。
+  - **0.1.0 的 skill 支线**（2026-11-27 t26 调查后改写；原先「`upgrade` 一开始就并行下载 skill」的判断是错的）：0.1.0 的在线
+    `upgrade` 先下载二进制、跑 `--version` 自证，通过之后才起 skill 支线（`v0.1.0:src/commands/install.rs:333-383`）；0.2.0 的
+    版本行过不了它的探测，所以普通升级碰不到 skill。漏口只有 0.1.0 的 `aproxy install --skills-only`：它自己查通道的 latest，
+    0.1.0 的 skill 文档也教 agent 用它单独更新；0.2.0 成为正式版之后，它会把 0.2.0 的文档装到仍是 0.1.0 的机器上。堵法是三个
+    渠道的 skill 包都换坐标（调查报告在私有的 `t26-skill-pack.md`，提议 GitHub 资产与 npm 包内路径换名、crate 只带一个 zip）。
+    代价：已发布的四个 alpha 升到换名后的版本时自动更新 skill 会失败（只告警，二进制照装），要在新版本里手动
+    `aproxy skill install` 一次。**做不做、怎么取舍待用户定**；不挡 beta.1。
 
 ### W5 UI（Tauri 2，编进本体）
 - 接入真实数据（换掉演示数据）的架构、去留与分段另见 [w5-real-data](w5-real-data.md)（2026-11-19）。

@@ -110,7 +110,7 @@ commands.md. During the run:
   `<home>/install/lock`.
 - After the download is verified, the installer hands the install to the downloaded binary and waits
   for it (a downgrade is run by the installer itself). If that wait times out
-  (`Installation did not finish within N seconds. It may still be running. …`),
+  (`Could not confirm that the installation finished within N seconds. It may still be running. …`),
   check instance versions with `aproxy status`.
 - An interrupted install (crash, power loss) resumes by itself when `<home>/install/state.json` is
   left over: the watchdog, `aproxy desktop`, and every command that changes instances or settings

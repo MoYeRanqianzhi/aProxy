@@ -68,7 +68,7 @@ Each finding is one line, `[ERROR]`, `[WARN]` or `[INFO]` followed by
 `file:line:col: key: message [code]` (line, column and key appear when known; the message is in
 English). An unknown key gets a second line with the command that deletes it, `Remove this key: aproxy
 settings unset '<key>'` or `Remove this key: aproxy config --config '<file>' unset '<key>'`.
-The last line is `Results: <n> error, <m> warning, <k> info`; with nothing to
+The last line is `Results: errors <n>, warnings <m>, info <k>`; with nothing to
 report the output is `All configurations passed. No problems found.`
 
 **Exit 3 when there is at least one error, 0 otherwise**: warnings and infos never fail it. An error

@@ -122,5 +122,5 @@ What `start` checks, in order:
 - `--foreground` keeps the instance in the console: logs print there and Ctrl+C stops it. It is
   still registered, so `status` and `stop` work, but it has no desired-state record: closing the
   console ends it for good, `aproxy restore` does not bring it back, and `aproxy restart` refuses
-  it with `…this instance has no launch record. Restart foreground instances in their own terminal.` Start it again
+  it with `…there is no desired-state record for this instance, so aProxy cannot restart it automatically. A foreground instance must be restarted in its own terminal.` Start it again
   to bring it back.

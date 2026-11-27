@@ -86,8 +86,8 @@ When aProxy itself ends a request, every response has this shape:
 | `retry_stopped` | the response in hand, else 502 | A format's `decide` stage stopped the retries | `format`, `last_code` |
 | `format_rejected` | the format's response, else 422 | A request-side format answered `fail` with `retry: false` | `format`, `stage`, `fail_code`? |
 | `format_unavailable` | 503 | A required format's breaker is open at a request-side stage | `format`, `stage`, `kind`, `probe_at` (Unix ms) |
-| `format_failed` | 502 | A forward request's request-side format failed or asked for a retry, and the request was not upgraded to retry | `format`, `stage`, `kind`?, `fail_code`? |
-| `upstream_failed` | 502 | A forward request's upstream attempt failed and the request was not upgraded to retry | `last_code` |
+| `format_failed` | 502 | In forward mode, a request-side format failed or asked for a retry, and the request was not switched to retry mode | `format`, `stage`, `kind`?, `fail_code`? |
+| `upstream_failed` | 502 | In forward mode, the upstream attempt failed, and the request was not switched to retry mode | `last_code` |
 | `decode_failed` | SSE frame only | The upstream compressed the body despite `identity` and decoding failed | `encoding` |
 | `upgrade_unsupported` | 501 | A WebSocket upgrade request; it is refused on the spot, not forwarded or retried. Other upgrades such as `h2c` are ignored and proxied normally | `upgrade` |
 | `internal` | 500 | A defect in aProxy | none |

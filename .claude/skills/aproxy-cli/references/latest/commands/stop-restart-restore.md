@@ -105,7 +105,7 @@ described in [start](start.md#options-for-start), "Reason and note".
   proxy environment and `PATH`, and the log path all come from the instance's desired-state record.
   An instance without a record cannot be restarted this way: a `--foreground` instance is refused
   with
-  `Port <port> was not restarted: this instance has no launch record. Restart foreground instances in their own terminal. The old instance is still running.`
+  `Port <port> was not restarted: there is no desired-state record for this instance, so aProxy cannot restart it automatically. A foreground instance must be restarted in its own terminal. The old instance is still running.`
   and keeps running. Stop it in its terminal and start it in the background to give it a record.
 - `--force` terminates the old instance immediately but keeps the record, so the watchdog and
   `restore` can still bring the instance back if the new one fails. The watchdog may respawn it
@@ -165,7 +165,7 @@ and the `--note`, as described in [start](start.md#options-for-start), "Reason a
 | Output | Meaning |
 |---|---|
 | `No instances to restore.` | nothing to restore |
-| `Port <port> is already running. Skipping.` | already running, skipped |
+| `An instance is already running on port <port>. Skipping.` | already running, skipped |
 | `Configuration file not found for port <port> (<path>). The instance was not restored. Its record is retained. Run aproxy restore when the file is back, or aproxy stop <port> if this instance is no longer needed.` | the config file is temporarily gone (an unmounted network drive, for example); the record is kept so a later `restore` works. The same applies to a watchdog respawn |
 | `Restored pid <pid> (port <port>)` | restored. If the config now names another port, the actual port is reported and the old port's record is replaced by the new one |
 | `Restored pid <pid> (port <port>; the configured port changed from <old>, and the record now belongs to the new port)` | restored on another port |

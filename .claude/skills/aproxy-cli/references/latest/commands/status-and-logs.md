@@ -34,7 +34,7 @@ only when it has entries, in this order:
   they exist, `Log cleanup is paused: run/ contains unreadable records.` is printed too.
 - `Watchdog: pid <pid>  v<version>  last scan <age> ago`, or
   `no scan for <age> (it may be unresponsive)`.
-- `Other aProxy processes in the ledger (<n>):`: pid, role and version
+- `Other aProxy processes registered in this home (<n>):`: pid, role and version
   of processes that belong to no instance or watchdog, such as the desktop window or instances
   started by a version before 0.2.0.
 

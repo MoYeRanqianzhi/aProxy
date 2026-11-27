@@ -24,7 +24,7 @@ message!(forgot_config(path: std::path::Display<'_>, ports: &str), en: "The inst
 
 message!(none_idle(idle_secs: u64), en: "No instances have been idle for more than {idle_secs} seconds.", zh: "没有闲置超过 {idle_secs} 秒的实例。");
 
-message!(not_idle(pid: u32, port: &str, idle_secs: u64), en: "Pid {pid} on port {port} received another request (idle for {idle_secs} seconds) and was not stopped.", zh: "pid {pid}（端口 {port}）刚才又收到了请求（已闲置 {idle_secs} 秒），不再算闲置，未停止");
+message!(not_idle(pid: u32, port: &str, idle_secs: u64), en: "Pid {pid} on port {port} received a request in the meantime (it had been idle for {idle_secs} seconds), so it is no longer idle and was not stopped.", zh: "pid {pid}（端口 {port}）刚才又收到了请求（已闲置 {idle_secs} 秒），不再算闲置，未停止");
 
 message!(cleaned(ports: &str), en: "Removed desired-state records left by stopped instances (ports {ports}).", zh: "已删除不在运行的实例留下的期望状态记录（端口 {ports}）。");
 
@@ -42,6 +42,6 @@ message!(still_running(pid: u32, port: &str), en: "Pid {pid} received the stop r
 
 message!(no_reply(pid: u32, port: &str, error: &str), en: "Pid {pid} did not respond to the stop request ({error}). To terminate it, run aproxy stop {port} --force.", zh: "pid {pid} 不应答停止请求（{error}），可用 aproxy stop {port} --force 强制结束");
 
-message!(restore_error(port: &str, werr: &str), en: "Could not restore the record for port {port}: {werr}\n", zh: "放回端口 {port} 的恢复记录失败: {werr}\n");
+message!(restore_error(port: &str, werr: &str), en: "Could not put back the desired-state record for port {port}: {werr}\n", zh: "放回端口 {port} 的期望状态记录失败: {werr}\n");
 
 message!(kill_error(pid: u32, error: &str), en: "Could not terminate pid {pid}: {error}", zh: "强制终止 pid {pid} 失败: {error}");

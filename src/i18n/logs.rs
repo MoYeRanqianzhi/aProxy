@@ -24,7 +24,7 @@ message!(file(path: std::path::Display<'_>), en: "Log file: {path}", zh: "日志
 
 message!(multi_live(n: usize), en: "There are {n} running instances. Specify a port or configuration alias to read one log:", zh: "有 {n} 个实例在运行，必须指定端口号或配置别名（一次只读一个实例的日志）：");
 
-message!(multi_stopped(n: usize), en: "There are no running instances and {n} saved records. Specify a port to read its last log:", zh: "没有运行中的实例；有 {n} 个实例留下了期望状态记录，指定端口查看它上次运行的日志：");
+message!(multi_stopped(n: usize), en: "No instances are running, and {n} have desired-state records. Specify a port to read the log from its last run:", zh: "没有运行中的实例；有 {n} 个实例留下了期望状态记录，指定端口查看它上次运行的日志：");
 
 message!(no_file(), en: "The instance exited without creating a log file.", zh: "实例已退出，日志文件未生成。");
 

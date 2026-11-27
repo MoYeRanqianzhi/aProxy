@@ -17,7 +17,7 @@ message!(busy(), en: "Another process is installing skills. Try again later.", z
 
 message!(workspace_key(), en: "aProxy could not confirm that the temporary skill directory belongs to its skill installer. Move skills/ aside and run aproxy skill install.", zh: "无法确认 skill 的临时目录属于 aproxy 的 skill 安装程序；请移走 skills/ 后执行 aproxy skill install");
 
-message!(workspace_contents(), en: "Unexpected files in the skill workspace.", zh: "skill 工作区内容异常");
+message!(workspace_contents(), en: "The temporary skill directory contains unexpected files. Move skills/ aside and run aproxy skill install.", zh: "skill 的临时目录里有意外的文件；请移走 skills/ 后执行 aproxy skill install");
 
 message!(manifest(), en: "Invalid skill manifest.", zh: "skill 清单无效");
 

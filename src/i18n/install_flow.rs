@@ -65,9 +65,9 @@ message!(no_fallback(), en: "No old binary is available.", zh: "没有可用的�
 
 message!(not_prepared(state: &aproxy_ipc::wire::InstanceState), en: "The instance did not enter the replacement phase (state {state:?})", zh: "实例没有进入更换阶段（状态 {state:?}）");
 
-message!(converge(port: &str, e: &str), en: "Restarting the instance on port {port} to obtain its acknowledgment failed: {e}", zh: "实例 {port} 收敛重启失败: {e}");
+message!(converge(port: &str, e: &str), en: "Could not restart the instance on port {port} to get its confirmation that the binary can be replaced: {e}", zh: "为让实例 {port} 确认可以替换二进制而重启它，重启失败: {e}");
 
-message!(unacked(unacked: &[String]), en: "Instances still have not acknowledged after retries and restarts: {unacked:?}", zh: "实例未表达（已按重试/restart 收敛）: {unacked:?}");
+message!(unacked(unacked: &[String]), en: "These instances still have not confirmed that the binary can be replaced, even after retries and restarts: {unacked:?}", zh: "重试并重启之后，这些实例仍未确认可以替换二进制: {unacked:?}");
 
 message!(rolling(port: &str, e: &str), en: "Rolling restart failed for the instance on port {port}: {e}", zh: "实例 {port} 滚动重启失败: {e}");
 

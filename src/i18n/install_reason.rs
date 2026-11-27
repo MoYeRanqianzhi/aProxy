@@ -39,7 +39,7 @@ message!(local_variant(path:&str, got:&str, want:&str), en: "{path} is a {got} b
 
 message!(unknown_variant(), en: "unknown variant", zh: "未知变体");
 
-message!(not_installed_image(), en: "Run this command from the installed binary in this home’s bin directory.", zh: "请从这个 home 的 bin 目录运行已安装的二进制。");
+message!(not_installed_image(), en: "Run this command from the installed binary in this home's bin directory.", zh: "请从这个 home 的 bin 目录运行已安装的二进制。");
 message!(self_exe(e:&str), en: "Cannot locate the current executable: {e}", zh: "无法定位自身可执行文件: {e}");
 
 message!(cannot_run(e:&str), en: "The downloaded file cannot run: {e}", zh: "下载产物不可运行: {e}");
@@ -54,7 +54,7 @@ message!(unknown(), en: "unknown", zh: "未知");
 
 message!(asset_failed(asset:&str,e:&str), en: "{asset} cannot run on this system ({e})", zh: "{asset} 在本机不可运行（{e}）");
 
-message!(cannot_abort(phase:InstallPhase), en: "The installation has reached binary replacement (phase {phase:?}) and cannot roll back. Some instances may already run the target version. Interrupted installations resume automatically. For manual recovery, follow the skill’s manual update instructions.", zh: "安装已进入交换阶段（phase {phase:?}），无法回滚——实例可能已开始滚动到新版本。\n中断的安装会自动续作完成；如需手动干预，按 skill 的手动更新兜底路径操作。");
+message!(cannot_abort(phase:InstallPhase), en: "The installation has reached binary replacement (phase {phase:?}) and cannot roll back. Some instances may already run the target version. Interrupted installations resume automatically. For manual recovery, follow the manual update instructions in the aproxy-cli skill.", zh: "安装已进入交换阶段（phase {phase:?}），无法回滚——实例可能已开始滚动到新版本。\n中断的安装会自动续作完成；如需手动干预，按 skill 的手动更新兜底路径操作。");
 
 /// 安装接手者留下的私有排版参数，不是事件码，也不进入公开的 details。
 #[derive(Clone, Debug, Serialize, Deserialize)]

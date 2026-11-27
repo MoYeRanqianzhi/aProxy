@@ -9,7 +9,7 @@ message!(checking(channel: &str), en: "Checking the latest version in the {chann
 
 message!(empty_channel(), en: "no release in this channel", zh: "通道内无版本");
 
-message!(npm_fallback(gh_err: &str, version: &str), en: "GitHub query failed ({gh_err}). npm fallback: {version}", zh: "github 查询失败（{gh_err}），npm 兜底结果：{version}");
+message!(npm_fallback(gh_err: &str, version: &str), en: "Could not query GitHub ({gh_err}); latest version on npm: {version}", zh: "查询 GitHub 失败（{gh_err}），改查 npm 的最新版本：{version}");
 
 message!(proxy_hint(), en: "Use --download-proxy <URL> to try another download proxy.", zh: "可尝试：--download-proxy <URL> 更换出口。");
 
@@ -41,7 +41,7 @@ message!(headless(), en: "Installing the headless variant. The proxy and CLI are
 
 message!(install_variant(target: &str, installed_variant: &str), en: "Installing aProxy {target} ({installed_variant})...", zh: "开始安装 aProxy {target}（{installed_variant}）...");
 
-message!(handoff(), en: "The target version has taken over the installation. Waiting for broadcast, binary replacement, rolling restarts and verification...", zh: "新版本进程已接手安装（广播、交换、滚动重启、终验），等待其完成...");
+message!(handoff(), en: "The target version has taken over the installation. Waiting while it prepares the instances, replaces the binary, restarts the instances one at a time and verifies them...", zh: "新版本进程已接手安装（让实例做好准备、替换二进制、逐个重启实例、最后核验），等待其完成...");
 
 message!(done(path: std::path::Display<'_>), en: "Installation complete: {path}. The binary is in place and the instances are running the target version.", zh: "安装完成：{path}（二进制已落位，实例已滚动到新版本）");
 

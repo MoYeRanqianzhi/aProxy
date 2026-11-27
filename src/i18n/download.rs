@@ -39,7 +39,7 @@ Client { e: String }, en: "Could not build the HTTP client: {e}", zh: "HTTP 客�
 Request { e: String }, en: "Request failed: {e}", zh: "请求失败: {e}";
 Http { status: String }, en: "HTTP {status}", zh: "HTTP {status}";
 Create { path: String, e: String }, en: "Could not create {path}: {e}", zh: "{path} 创建失败: {e}";
-Limit, en: "Document download exceeds the size limit.", zh: "文档下载大小超限";
+Limit, en: "The documentation download exceeds the size limit.", zh: "文档下载大小超限";
 Interrupted { e: String }, en: "Download interrupted: {e}", zh: "下载中断: {e}";
 Write { e: String }, en: "Write failed: {e}", zh: "写入失败: {e}";
 Flush { e: String }, en: "Flush failed: {e}", zh: "flush 失败: {e}";

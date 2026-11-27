@@ -247,7 +247,7 @@ reasons! {
         en: "`idle` is reserved: `aproxy stop idle` and `aproxy restart idle` select idle instances, and `aproxy status --idle` lists them",
         zh: "\"idle\" 是 stop 与 restart 的保留目标（选中空闲实例，可用 `aproxy status --idle` 列出）";
     AliasDefault,
-        en: "it is reserved for the default config",
+        en: "`default` is reserved: it refers to the default configuration file",
         zh: "\"default\" 指代默认配置文件（settings 的 default_config），是保留字";
     AliasTypo,
         en: "`defult` is reserved because it is a common misspelling of `default`",
@@ -337,7 +337,7 @@ reasons! {
         en: "config file cannot be read: {error}",
         zh: "无法读取配置文件：{error}";
     FilePermissions { who: String },
-        en: "the group or others can access this file ({who})",
+        en: "other users can access this file ({who})",
         zh: "同组或其他用户可以访问此文件（{who}）";
     SharedPort { port: u16, files: String },
         en: "port {port} is also used by {files}; these configs cannot run at the same time",
@@ -349,7 +349,7 @@ reasons! {
         en: "other users can access the aProxy home directory ({who}); aProxy will restrict its permissions the next time it writes there",
         zh: "同组或其他用户可以访问主目录（{who}）；aproxy 将在下次写入时收紧权限";
     OtherHome { who: String },
-        en: "the group or others can access the home ({who}); it belongs to another user, so aproxy leaves it alone",
+        en: "other users can access the aProxy home directory ({who}); it belongs to another user, so aProxy leaves it alone",
         zh: "同组或其他用户可以访问主目录（{who}）；目录属于其他用户，aproxy 不会修改其权限";
     ExposedKey { addr: String },
         en: "listen_addr {addr} is not a loopback address: any host that can reach this port can use the proxy, and the API key it injects",

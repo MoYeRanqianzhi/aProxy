@@ -8,11 +8,11 @@ message!(active(), en: "active", zh: "活跃");
 
 message!(filtered(which: &str, idle_threshold_secs: u64), en: "No {which} aProxy instances (threshold: {idle_threshold_secs} s).", zh: "没有{which}的 aProxy 实例（阈值 {idle_threshold_secs} 秒）。");
 
-message!(incompatible(n: usize), en: "Instances with unverified replies ({n}): the protocol or identity differs. Use the same aProxy version as the instance.", zh: "无法采信应答的 aProxy 实例 ({n})——协议版本不同或身份对不上，用与实例同版本的 aproxy 操作它:");
+message!(incompatible(n: usize), en: "aProxy instances whose replies cannot be trusted ({n}): their protocol version or identity does not match. Manage each one with the aProxy version it runs:", zh: "无法采信应答的 aProxy 实例 ({n})——协议版本不同或身份对不上，用与实例同版本的 aproxy 操作它:");
 
 message!(incompatible_row(port: u16, pid: &str, version: &str, code: &str), en: "  Port {port}  pid {pid}  v{version}  reason {code}", zh: "  端口 {port}  pid {pid}  v{version}  原因 {code}");
 
-message!(pending(n: usize), en: "Instances awaiting restore ({n}): not running. aproxy restore or the watchdog can start them from their records.", zh: "等待恢复的实例 ({n})——没在运行，留着期望状态记录，aproxy restore 或看护者会拉起它:");
+message!(pending(n: usize), en: "Instances waiting to be restored ({n}): not running, but their desired-state records are kept, so aproxy restore or the watchdog will start them:", zh: "等待恢复的实例 ({n})——没在运行，留着期望状态记录，aproxy restore 或看护者会拉起它:");
 
 message!(missing(port: u16), en: "  Port {port} (configuration file not found)", zh: "  端口 {port}（配置文件找不到）");
 
@@ -82,7 +82,7 @@ message!(swapping(), en: "    Replacing the binary during a rolling install. Do 
 
 message!(stopping(), en: "    Stopping", zh: "    正在退出");
 
-message!(unknown(), en: "    Unknown state. Use the same aProxy version as the instance.", zh: "    状态未知（实例比当前 CLI 新，用同版本的 aproxy 查看）");
+message!(unknown(), en: "    Unknown state (the instance is newer than this CLI). Check it with the aProxy version it runs.", zh: "    状态未知（实例比当前 CLI 新，用同版本的 aproxy 查看）");
 
 message!(version(version: &str, cli_version: &str, port: &str), en: "    Instance v{version} differs from CLI v{cli_version}. After replacing the binary, run aproxy restart {port} to finish the upgrade.", zh: "    注意: 实例版本 v{version} 与当前 CLI v{cli_version} 不同，替换二进制后执行 aproxy restart {port} 可完成升级");
 

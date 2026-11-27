@@ -25,7 +25,7 @@ message!(failed_count(total: usize, failed: usize), en: "\nRestart failed for {f
 
 message!(state(port: &str, state: &str), en: "  Port {port}: {state}", zh: "  端口 {port}：{state}");
 
-message!(starting(port: &str), en: "Instance on port {port} is still starting; retry after it begins serving.", zh: "端口 {port} 的实例仍在启动；开始提供服务后再试。");
+message!(starting(port: &str), en: "Instance on port {port} is still starting; retry once it is ready to accept requests.", zh: "端口 {port} 的实例仍在启动；开始提供服务后再试。");
 
 message!(unsupported(port: &str), en: "Port {port} was not restarted: there is no desired-state record for this instance, so aProxy cannot restart it automatically. A foreground instance must be restarted in its own terminal. The old instance is still running.", zh: "端口 {port} 未重启：这个实例没有可用来重新拉起它的记录（前台运行的实例要在它自己的终端里重启），旧实例保持运行。");
 
@@ -37,7 +37,7 @@ message!(unreadable(reason: &str), en: "Cannot read the desired-state record for
 
 message!(missing(path: std::path::Display<'_>), en: "Configuration file no longer exists ({path})", zh: "配置文件已不存在（{path}）");
 
-message!(taken(pid: u32, port: &str), en: "An aProxy instance (pid {pid}) is already running on the new configuration’s listening port {port}.", zh: "新配置的监听端口 {port} 上已有 aProxy 实例（pid {pid}）在运行");
+message!(taken(pid: u32, port: &str), en: "An aProxy instance (pid {pid}) is already running on the new configuration's listening port {port}.", zh: "新配置的监听端口 {port} 上已有 aProxy 实例（pid {pid}）在运行");
 
 message!(format_flags(), en: "Do not combine --format with --force or --idle-threshold-secs.", zh: "--format 不能与 --force 或 --idle-threshold-secs 同用。");
 message!(format_selection(), en: "Use --format all alone, or specify one or more format names.", zh: "请单独使用 --format all，或指定一个或多个 format 条目名。");

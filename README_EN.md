@@ -59,8 +59,8 @@ by keepalive ends with a terminal SSE error event; see Configuration.)
 - **Multi-instance** — Every config.toml is its own instance, each on its own
   port, coexisting without interference.
 - **Self-healing** — After a crash, power loss, or reboot, `aproxy restore`
-  brings everything back in one command. Nothing to restore? It exits
-  silently — safe for login autostart. An instance's desired-state record (its
+  brings everything back in one command. Nothing to restore? It prints one
+  line and exits successfully — safe for login autostart. An instance's desired-state record (its
   launch spec: config file, override flags, pinned port, launch-time proxy
   environment and PATH, log path) is deleted only by `stop`; a failed restart
   leaves it in place, so `restore` or the watchdog can still bring the instance
@@ -371,7 +371,7 @@ timeout (for Claude Code, `API_TIMEOUT_MS`).
 | `aproxy stop [PORT\|all\|alias]` | Stop instances; multi-instance requires a port, `all`, or an alias; `--force` kills instantly (the watchdog will not revive it); a target that already crashed has its desired-state record deleted |
 | `aproxy restart [PORT\|all\|alias]` | Restart running instances (restart-only, never starts); the new config is pre-checked before the old instance is stopped, and a failed check leaves it running; a failed start keeps the record, so `restore` or the watchdog can bring it back; `--force` kills instantly; `--format all\|<name>` restarts only format programs, leaving the instance and its in-flight requests alone |
 | `aproxy logs [PORT\|ALIAS]` | Print the instance's most recent 200 log lines and exit; `-n N` sets the count, `-f` keeps following; `all` not supported |
-| `aproxy restore` | Revive instances from their desired-state records; a temporarily missing config file keeps the record and is reported; exits silently if none |
+| `aproxy restore` | Revive instances from their desired-state records; a temporarily missing config file keeps the record and is reported; prints one line and exits successfully if none |
 | `aproxy alias add\|remove\|list` | Manage config aliases (stored in settings.json) |
 | `aproxy doctor` | Check settings.json and every config by the rules `start` applies, plus home and config permissions and unreadable records; exits 3 when it finds an error |
 | `aproxy find [keyword]` | Discover all configs in configured directories; `--aliased/--unaliased --port PORT` filters |
@@ -460,8 +460,8 @@ stays human-readable and may exist in many parallel copies.
 ## Login autostart (optional)
 
 Point a "run at logon" scheduled task at `aproxy.exe` with the argument
-`restore`. Instances that were running come back; if none were, it exits
-silently.
+`restore`. Instances that were running come back; if none were, it prints one
+line and exits successfully.
 
 ## Configuration
 
@@ -470,7 +470,7 @@ silently.
 ```toml
 base_url = "https://api.anthropic.com"   # upstream address
 listen_addr = "127.0.0.1:12345"          # local listener (port 0 = OS-assigned; the first port is pinned, so restart/restore return to it)
-# api_key = "sk-..."                     # quick auth (overrides Authorization: Bearer)
+# api_key = "sk-..."                     # quick auth (overrides Authorization: Bearer and x-api-key)
 # proxy = "http://127.0.0.1:7890"        # forward via proxy (socks5 supported)
 # extra_headers / override_headers       # append/override request headers (tables, e.g. extra_headers = { "x-title" = "..." })
 # max_request_mb = 128                   # request body cap (MB; 0 = unlimited; defaults to settings.json defaults.max_request_mb)

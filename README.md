@@ -192,7 +192,7 @@ Codex 的 `stream_idle_timeout_ms` 默认 300000（5 分钟），按 SSE 事件�
 | `aproxy stop [PORT\|all\|别名]` | 停止实例；多实例必须指定端口、`all` 或别名；`--force` 立即强杀（不会被看门狗复活）；目标已崩溃时删掉它留下的期望状态记录 |
 | `aproxy restart [PORT\|all\|别名]` | 重启运行中的实例（只重启不启动；改配置生效用）；停旧实例前先预检新配置，不通过则旧实例保持运行；失败时记录保留，`restore` 或看门狗可拉回；`--force` 立即强杀重启；`--format all\|<名字>` 只重启 format 程序，实例与在途请求不受影响 |
 | `aproxy logs [PORT\|别名]` | 打印实例日志最近 200 行后退出；`-n N` 改行数，`-f` 持续跟随；不支持 `all` |
-| `aproxy restore` | 恢复崩溃/重启前在运行的实例（按期望状态记录）；配置文件暂时找不到时保留记录并说明；无实例则静默结束（开机自启友好） |
+| `aproxy restore` | 恢复崩溃/重启前在运行的实例（按期望状态记录）；配置文件暂时找不到时保留记录并说明；无实例则只打印一行提示、正常退出（开机自启友好） |
 | `aproxy alias add\|remove\|list` | 管理配置别名（存于 settings.json） |
 | `aproxy doctor` | 配置体检：settings.json 与每份配置都按 `start` 的规则检查，另查 home 与配置文件的权限、读不懂的记录；有 error 时以 3 结束 |
 | `aproxy find [关键字]` | 从配置目录发现全部配置；`--aliased/--unaliased --port PORT` 过滤 |
@@ -238,7 +238,7 @@ aproxy alias list
 
 ## 开机自启（可选）
 
-任务计划程序创建「登录时运行」任务，操作指向 `aproxy.exe`，参数 `restore`。之前在运行的实例自动恢复；之前全关了则静默结束，无副作用。
+任务计划程序创建「登录时运行」任务，操作指向 `aproxy.exe`，参数 `restore`。之前在运行的实例自动恢复；之前全关了则只打印一行提示、正常退出，无副作用。
 
 ## 配置文件
 
@@ -247,7 +247,7 @@ aproxy alias list
 ```toml
 base_url = "https://api.anthropic.com"   # 上游地址
 listen_addr = "127.0.0.1:12345"          # 本地监听（端口 0 = 系统分配；首次拿到的端口会被钉住，重启/恢复回到同一端口）
-# api_key = "sk-..."                     # 快捷鉴权（等效覆盖 Authorization: Bearer）
+# api_key = "sk-..."                     # 快捷鉴权（同时覆盖 Authorization: Bearer 与 x-api-key）
 # proxy = "http://127.0.0.1:7890"        # 上游经代理转发（支持 socks5，可配用户名密码）
 # extra_headers / override_headers       # 追加/覆盖请求头（表：extra_headers = { "x-title" = "..." }）
 # max_request_mb = 128                   # 请求体上限（MB；0 = 不设限。未设时取 settings.json 的 defaults.max_request_mb）

@@ -541,12 +541,19 @@ jobs:
         if: steps.plan.outputs.args != ''
         run: cargo publish --dry-run --locked --allow-dirty ${{ steps.plan.outputs.args }}
       # 检查 dry-run 实际打出的包；只发其他 crate 时没有 aproxy 包可检验。
+      # cargo 把打好的包放在 target/package/ 下，但具体在哪一层随版本变：cargo 1.100 的 dry-run
+      # 放在 target/package/tmp-crate/，正式发布前的打包仍在 target/package/。按文件名找，恰好一个才核对
       - name: Verify packaged crate skills against the release archive
         if: contains(format(' {0} ', steps.plan.outputs.args), ' -p aproxy ')
         run: |
           export APROXY_HOME="$(mktemp -d)"
+          mapfile -t crates < <(find target/package -name "aproxy-$RELEASE_VERSION.crate" -type f)
+          if [[ ${#crates[@]} -ne 1 ]]; then
+            echo "::error::target/package 下应恰好有一个 aproxy-$RELEASE_VERSION.crate，实际找到 ${#crates[@]} 个：${crates[*]}"
+            exit 1
+          fi
           cargo run --locked --no-default-features --bin aproxy -- skill __verify-package \
-            artifacts/aproxy-skills.zip "$RELEASE_VERSION" --packaged-crate "target/package/aproxy-$RELEASE_VERSION.crate"
+            artifacts/aproxy-skills.zip "$RELEASE_VERSION" --packaged-crate "${crates[0]}"
       - uses: rust-lang/crates-io-auth-action@v1.0.6
         if: steps.plan.outputs.args != ''
         id: crates-auth
@@ -594,9 +601,16 @@ jobs:
         if: steps.plan.outputs.args != ''
         run: cargo publish --dry-run --locked --allow-dirty ${{ steps.plan.outputs.args }}
       # 检查 dry-run 实际打出的包；只发其他 crate 时没有 aproxy 包可检验。
+      # cargo 把打好的包放在 target/package/ 下，但具体在哪一层随版本变：cargo 1.100 的 dry-run
+      # 放在 target/package/tmp-crate/，正式发布前的打包仍在 target/package/。按文件名找，恰好一个才核对
       - name: Verify packaged crate skills against the release archive
         if: contains(format(' {0} ', steps.plan.outputs.args), ' -p aproxy ')
         run: |
           export APROXY_HOME="$(mktemp -d)"
+          mapfile -t crates < <(find target/package -name "aproxy-$RELEASE_VERSION.crate" -type f)
+          if [[ ${#crates[@]} -ne 1 ]]; then
+            echo "::error::target/package 下应恰好有一个 aproxy-$RELEASE_VERSION.crate，实际找到 ${#crates[@]} 个：${crates[*]}"
+            exit 1
+          fi
           cargo run --locked --no-default-features --bin aproxy -- skill __verify-package \
-            artifacts/aproxy-skills.zip "$RELEASE_VERSION" --packaged-crate "target/package/aproxy-$RELEASE_VERSION.crate"
+            artifacts/aproxy-skills.zip "$RELEASE_VERSION" --packaged-crate "${crates[0]}"

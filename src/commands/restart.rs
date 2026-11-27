@@ -17,7 +17,7 @@ use aproxy_ipc::i18n::{Lang, current};
 use serde_json::json;
 
 use super::stop::{
-    ambiguous, fail_unresponsive_skipped, require_idle_for_threshold, stop_failure, stopped_line,
+    ambiguous, fail_skipped, require_idle_for_threshold, stop_failure, stopped_line,
     unknown_target, unresponsive,
 };
 use super::{Failure, Results, port_value, say};
@@ -91,6 +91,12 @@ pub(crate) async fn handle_restart_cmd(
             return not_running(Some(&port), |lang| restart_text::no_port(lang, &port))
                 .report(json);
         }
+        Err(SelectError::Incompatible { port, reason }) => {
+            let failure = super::incompatible_instance(&port, &reason);
+            eprintln!("{}", failure.terminal());
+            results.failed(&port, "failed", &failure);
+            return results.finish(json);
+        }
         Err(SelectError::Unresponsive { target, port, pid }) => {
             let failure = unresponsive(target.as_deref(), &port, pid);
             eprintln!("{}", failure.terminal());
@@ -98,7 +104,7 @@ pub(crate) async fn handle_restart_cmd(
             return results.finish(json);
         }
     };
-    fail_unresponsive_skipped(&selection, &mut results);
+    fail_skipped(&selection, &mut results);
     match selection.empty {
         // 没写目标却一个运行中的实例都没有：要重启的那个实例不存在
         Some(Empty::NoneRunning)

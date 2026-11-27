@@ -101,7 +101,10 @@ pub fn live_record_in(run_dir: &Path, port: &str) -> Option<InstanceRecord> {
 
 /// 一个端口上有没有本 home 的实例进程：应答控制通道的，或不应答但进程经核验仍在的。
 pub async fn port_has_instance_in(run_dir: &Path, port: &str) -> bool {
-    ipc_ping_in(run_dir, port).await.is_ok() || live_record_in(run_dir, port).is_some()
+    match ipc_ping_in(run_dir, port).await {
+        Ok(_) => true,
+        Err(e) => e.incompatible_ping_reason().is_some() || live_record_in(run_dir, port).is_some(),
+    }
 }
 
 /// 实例记录的文件名后缀：文件是 `<端口>.instance.json`。
@@ -120,6 +123,9 @@ pub struct InstanceSurvey {
     /// 取自注册表记录（启动时刻的快照）。aproxy 无法经 IPC 优雅停止它们，只能
     /// `stop --force`（终止前同样核验身份）
     pub unresponsive: Vec<InstanceRecord>,
+    /// A ping answered but could not be trusted. An identity-verified disk record may also
+    /// occur in `unresponsive` for inventory; it is not authority to act on this endpoint.
+    pub incompatible: BTreeMap<String, (InstanceRecord, String)>,
 }
 
 /// Return only responsive records from the supplied registry.
@@ -135,10 +141,12 @@ pub async fn list_instances_in(dir: &std::path::Path) -> Vec<InstanceStatus> {
 pub async fn survey_instances_in(dir: &std::path::Path) -> InstanceSurvey {
     let mut out = Vec::new();
     let mut unresponsive = Vec::new();
+    let mut incompatible = BTreeMap::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return InstanceSurvey {
             responsive: out,
             unresponsive,
+            incompatible,
         };
     };
     for entry in entries.flatten() {
@@ -172,7 +180,10 @@ pub async fn survey_instances_in(dir: &std::path::Path) -> InstanceSurvey {
                     unresponsive.push(info);
                 }
             }
-            Err(_) => {
+            Err(error) => {
+                if let Some(reason) = error.incompatible_ping_reason() {
+                    incompatible.insert(port, (info.clone(), reason));
+                }
                 if record_identity(info.pid, &info.start) == RecordIdentity::Alive {
                     unresponsive.push(info);
                 }
@@ -184,6 +195,7 @@ pub async fn survey_instances_in(dir: &std::path::Path) -> InstanceSurvey {
     InstanceSurvey {
         responsive: out,
         unresponsive,
+        incompatible,
     }
 }
 

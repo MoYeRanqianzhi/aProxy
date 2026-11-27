@@ -1709,7 +1709,11 @@ fn stop_idle_only_stops_instances_that_are_idle_long_enough() {
 
 /// 在 `endpoint` 上冒充一个只懂别的协议版本的实例：读一行请求，回一行 `reply`，循环。
 /// 在调用方的运行时里跑，随运行时结束。
-async fn answer_every_request_with(endpoint: String, reply: &'static str) {
+async fn answer_every_request_with(
+    endpoint: String,
+    reply: &'static str,
+    ready: tokio::sync::oneshot::Sender<()>,
+) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     async fn serve<S>(stream: S, reply: &str)
     where
@@ -1729,6 +1733,7 @@ async fn answer_every_request_with(endpoint: String, reply: &'static str) {
             .first_pipe_instance(true)
             .create(&endpoint)
             .expect("建冒充端点失败");
+        let _ = ready.send(());
         loop {
             server.connect().await.expect("等待连接失败");
             let connected = std::mem::replace(
@@ -1743,10 +1748,87 @@ async fn answer_every_request_with(endpoint: String, reply: &'static str) {
     #[cfg(unix)]
     {
         let listener = tokio::net::UnixListener::bind(&endpoint).expect("建冒充端点失败");
+        let _ = ready.send(());
         loop {
             let (stream, _) = listener.accept().await.expect("等待连接失败");
             serve(stream, reply).await;
         }
+    }
+}
+
+/// 启动前的 IPC 拒绝与不可信应答都不能触发强制终止、删除期望记录或读取旧日志。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incompatible_ping_refuses_targeted_commands_and_preserves_restore() {
+    let home = TestHome::new();
+    let run = home.path().join("run");
+    let cfg = home.path().join("target.toml");
+    let log = home.path().join("old.log");
+    std::fs::write(&log, "old log").unwrap();
+    let port = free_port();
+    let p = port.to_string();
+    write_cfg(&cfg, &format!("127.0.0.1:{port}"));
+    let spec = aproxy::spec::capture(Some(&cfg), Default::default(), &log);
+    aproxy::spec::write_restore_in(&run, &p, &spec).unwrap();
+    let path = aproxy::spec::restore_path_in(&run, &p);
+    let before = std::fs::read(&path).unwrap();
+    let record = aproxy::daemon::InstanceRecord {
+        pid: u32::MAX,
+        start: String::new(),
+        instance_id: "disk".into(),
+        version: "0.2.0".into(),
+        listen_addr: format!("127.0.0.1:{port}"),
+        config_path: Some(cfg.display().to_string()),
+        base_url: String::new(),
+        started_at: 1,
+        log_path: Some(log.display().to_string()),
+        foreground: false,
+        launch_reason: String::new(),
+        launch_note: String::new(),
+    };
+    aproxy::daemon::write_instance_file_in(&run, &record).unwrap();
+    for (reply, reason) in [
+        (r#"{"v":2,"ok":true}"#, "the reply could not be trusted"),
+        (
+            r#"{"v":1,"ok":false,"error":{"code":"unknown_op","message":"ping"}}"#,
+            "ping rejected: unknown_op",
+        ),
+        (
+            r#"{"v":2,"ok":false,"error":{"code":"unsupported_version","message":"v2","details":{"supported":[2]}}}"#,
+            "ping rejected: unsupported_version",
+        ),
+    ] {
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let endpoint = aproxy::daemon::endpoint_for_in(&run, &p);
+        let server = tokio::spawn(answer_every_request_with(endpoint.clone(), reply, ready));
+        started.await.unwrap();
+        for target in [p.as_str(), cfg.to_str().unwrap()] {
+            for mut args in [
+                vec!["stop", target],
+                vec!["stop", target, "--force"],
+                vec!["restart", target],
+                vec!["restart", target, "--format", "all"],
+            ] {
+                args.push("--json");
+                let out = run_cli(&home, &built_exe(), &args);
+                assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+                let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+                let error = &doc["results"][0]["error"];
+                assert_eq!(error["code"], "instance_incompatible", "{doc}");
+                assert_eq!(
+                    error["details"],
+                    serde_json::json!({"port":port,"reason":reason})
+                );
+            }
+            let out = run_cli(&home, &built_exe(), &["logs", target]);
+            assert_eq!(out.status.code(), Some(1), "{out:?}");
+            assert!(out.stdout.is_empty());
+            assert!(text(&out.stderr).contains("replies could not be accepted"));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        #[cfg(unix)]
+        std::fs::remove_file(endpoint).unwrap();
     }
 }
 
@@ -1796,22 +1878,15 @@ fn enumeration_tells_the_four_kinds_of_instance_apart() {
         r#"{"schema":2,"shape":"new"}"#,
     )
     .unwrap();
-    let alien_endpoint = aproxy::daemon::endpoint_for_in(&run_dir, &alien_port.to_string());
+    let (ready, started) = tokio::sync::oneshot::channel();
     rt.spawn(answer_every_request_with(
-        alien_endpoint.clone(),
+        aproxy::daemon::endpoint_for_in(&run_dir, &alien_port.to_string()),
         r#"{"v":2,"ok":false,"error":{"code":"unsupported_version","message":"this instance speaks v2","details":{"supported":[2]}}}"#,
+        ready,
     ));
-    // Unix 上冒充端点是 run 目录里的一个 socket 文件，由上面那个任务在运行时的工作线程上
-    // 异步建出来。下面「清点前」的文件列表要等它出现之后再记，否则这个 socket 文件会被
-    // 当成清点建出来的。Windows 上端点是命名管道，不在 run 目录里，不用等
-    #[cfg(unix)]
-    {
-        let socket = Path::new(&alien_endpoint);
-        assert!(
-            wait_for(Duration::from_secs(5), || socket.exists()),
-            "冒充端点没有建出来"
-        );
-    }
+    // 冒充端点绑定之后才发就绪信号。Unix 上端点是 run 目录里的 socket 文件，要等它建好
+    // 再记下「清点前」的文件列表，否则这个文件会被当成清点建出来的
+    rt.block_on(started).unwrap();
 
     // down：只剩一份期望状态记录，配置文件已经不在
     let down_port = free_port();
@@ -1829,19 +1904,7 @@ fn enumeration_tells_the_four_kinds_of_instance_apart() {
         names
     };
     let before = listing(&run_dir);
-    // 冒充端点在另一个任务里建：等它建好再清点
-    let mut found = rt.block_on(enumerate_in(home));
-    for _ in 0..50 {
-        if found
-            .instances
-            .iter()
-            .any(|item| item.liveness == Liveness::Incompatible)
-        {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-        found = rt.block_on(enumerate_in(home));
-    }
+    let found = rt.block_on(enumerate_in(home));
     assert_eq!(listing(&run_dir), before, "清点不删、不建任何文件");
 
     let of = |port: u16| {

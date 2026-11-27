@@ -103,8 +103,13 @@ async fn locate(target: Option<&str>) -> Result<Source, Failure> {
         // 端口：直接按端口 IPC 定位，不依赖注册表（与 stop 相同）
         Some(target) if target.parse::<u16>().is_ok() => {
             let port = daemon::port_of(target).to_string();
-            if let Ok(info) = daemon::ipc_ping(&port).await {
-                return Ok(Source::Running(Box::new(info)));
+            match daemon::ipc_ping(&port).await {
+                Ok(info) => return Ok(Source::Running(Box::new(info))),
+                Err(e) => {
+                    if let Some(reason) = e.incompatible_ping_reason() {
+                        return Err(super::incompatible_instance(&port, &reason));
+                    }
+                }
             }
             match records.iter().find(|entry| entry.port == port) {
                 Some(entry) => Ok(stopped(entry)),
@@ -121,14 +126,21 @@ async fn locate(target: Option<&str>) -> Result<Source, Failure> {
                 return Err(super::stop::unknown_target(target));
             };
             let key = config_path_key(&cfg_path.display().to_string());
-            let instances = daemon::list_instances().await;
-            if let Some(info) = instances.into_iter().find(|i| {
+            let survey = daemon::survey_instances().await;
+            if let Some(info) = survey.responsive.into_iter().find(|i| {
                 i.instance
                     .config_path
                     .as_deref()
                     .is_some_and(|path| config_path_key(path) == key)
             }) {
                 return Ok(Source::Running(Box::new(info)));
+            }
+            if let Some((port, (_, reason))) = survey.incompatible.iter().find(|(_, (i, _))| {
+                i.config_path
+                    .as_deref()
+                    .is_some_and(|p| config_path_key(p) == key)
+            }) {
+                return Err(super::incompatible_instance(port, reason));
             }
             // 同一份配置留下的记录不止一条时（端口改过），取最近写下的那条
             let record = records
@@ -152,11 +164,13 @@ async fn locate(target: Option<&str>) -> Result<Source, Failure> {
         }
         // 省略：只有一个实例在运行时就是它；一个都没有时，只有一条记录就读那条
         None => {
-            let mut instances = daemon::list_instances().await;
-            if instances.len() > 1 {
+            let survey = daemon::survey_instances().await;
+            let mut instances = survey.responsive;
+            if instances.len() + survey.incompatible.len() > 1 {
                 let ports: Vec<String> = instances
                     .iter()
                     .map(|info| daemon::port_of(&info.instance.listen_addr).to_string())
+                    .chain(survey.incompatible.keys().cloned())
                     .collect();
                 return Err(ambiguous(
                     |lang| text::multi_live(lang, ports.len()),
@@ -165,6 +179,9 @@ async fn locate(target: Option<&str>) -> Result<Source, Failure> {
             }
             if let Some(info) = instances.pop() {
                 return Ok(Source::Running(Box::new(info)));
+            }
+            if let Some((port, (_, reason))) = survey.incompatible.first_key_value() {
+                return Err(super::incompatible_instance(port, reason));
             }
             match records.as_slice() {
                 [] => Err(Failure::rendered(
@@ -226,7 +243,12 @@ async fn print_log_file(
         if path.exists() {
             break;
         }
-        if daemon::ipc_ping(port).await.is_err() {
+        if let Err(e) = daemon::ipc_ping(port).await {
+            if let Some(reason) = e.incompatible_ping_reason() {
+                return Err(super::incompatible_instance(port, &reason)
+                    .terminal()
+                    .to_owned());
+            }
             return Err(text::no_file(current()).to_string());
         }
         if std::time::Instant::now() > wait_deadline {
@@ -274,7 +296,14 @@ async fn print_log_file(
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
         polls += 1;
-        if polls.is_multiple_of(PING_EVERY) && daemon::ipc_ping(port).await.is_err() {
+        if polls.is_multiple_of(PING_EVERY)
+            && let Err(e) = daemon::ipc_ping(port).await
+        {
+            if let Some(reason) = e.incompatible_ping_reason() {
+                return Err(super::incompatible_instance(port, &reason)
+                    .terminal()
+                    .to_owned());
+            }
             // 实例已退出（ping 内部含判死重试）：冲掉残余半行后结束
             if !pending.is_empty() {
                 let _ = out.write_all(&pending);

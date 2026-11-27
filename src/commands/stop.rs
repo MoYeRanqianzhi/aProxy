@@ -62,9 +62,14 @@ pub(crate) fn unresponsive(alias: Option<&str>, port: &str, pid: u32) -> Failure
     )
 }
 
-/// 选中目标时被跳过的不应答实例，逐个记为失败：命令要处理它们而没能处理，不能报成成功。
+/// 选中目标时被跳过的不应答或协议不兼容的实例，逐个记为失败：命令要处理它们而没能处理，不能报成成功。
 /// stop 与 restart 共用。
-pub(crate) fn fail_unresponsive_skipped(selection: &Selection, results: &mut Results) {
+pub(crate) fn fail_skipped(selection: &Selection, results: &mut Results) {
+    for (port, reason) in &selection.incompatible_skipped {
+        let failure = super::incompatible_instance(port, reason);
+        eprintln!("{}", failure.terminal());
+        results.failed(port, "failed", &failure);
+    }
     for info in &selection.unresponsive_skipped {
         let port = daemon::port_of(&info.listen_addr);
         let failure = unresponsive(None, port, info.pid);
@@ -150,6 +155,12 @@ pub(crate) async fn handle_stop_cmd(
             }
             return results.finish(json);
         }
+        Err(SelectError::Incompatible { port, reason }) => {
+            let failure = super::incompatible_instance(&port, &reason);
+            eprintln!("{}", failure.terminal());
+            results.failed(&port, "failed", &failure);
+            return results.finish(json);
+        }
         Err(SelectError::Unresponsive { target, port, pid }) => {
             let failure = unresponsive(target.as_deref(), &port, pid);
             eprintln!("{}", failure.terminal());
@@ -157,7 +168,7 @@ pub(crate) async fn handle_stop_cmd(
             return results.finish(json);
         }
     };
-    fail_unresponsive_skipped(&selection, &mut results);
+    fail_skipped(&selection, &mut results);
     match selection.empty {
         Some(Empty::NoneRunning) if selection.unresponsive_skipped.is_empty() => {
             say(json, super::status::text::none(current()))

@@ -35,6 +35,8 @@ pub struct Selection {
     /// 进程仍在、却不应答控制通道，因而**没有**纳入清单的实例（只在不带 `force`、
     /// target 省略或为 `all` 时收集）。它们只能强制结束；调用方把它们报成没处理成的那几个
     pub unresponsive_skipped: Vec<InstanceRecord>,
+    /// 收到不能采信的应答，不用盘上的身份代替对端；按端口报告失败。
+    pub incompatible_skipped: Vec<(String, String)>,
 }
 
 /// 清单为空、但不算错误的两种情形。
@@ -58,6 +60,8 @@ pub enum SelectError {
     },
     /// 指定端口上没有本 home 的实例
     NothingOnPort { port: String },
+    /// 回复表明协议或身份不符，不得退回到强制结束或删除记录。
+    Incompatible { port: String, reason: String },
     /// 找到了实例，但它不应答控制通道，没带 `force` 就停不了。`target` 是用户写的别名
     /// （按端口指定时为 None）
     Unresponsive {
@@ -95,7 +99,7 @@ pub async fn select(
         return Ok(Selection {
             instances,
             empty,
-            unresponsive_skipped: Vec::new(),
+            ..Default::default()
         });
     }
 
@@ -113,15 +117,27 @@ pub async fn select(
         let key = config_path_key(&cfg_path.display().to_string());
         let survey = daemon::survey_instances().await;
         // 没有配置文件的实例（config_path 为 null）不会被任何配置路径选中
-        let matches = |i: &&InstanceRecord| {
+        let matches = |i: &InstanceRecord| {
             i.config_path
                 .as_deref()
                 .is_some_and(|path| config_path_key(path) == key)
         };
-        if let Some(info) = survey.responsive.iter().map(|s| &s.instance).find(matches) {
+        if let Some(info) = survey
+            .responsive
+            .iter()
+            .map(|s| &s.instance)
+            .find(|i| matches(i))
+        {
             return Ok(Selection::of(vec![info.clone()]));
         }
-        return match survey.unresponsive.iter().find(matches) {
+        if let Some((port, (_, reason))) = survey.incompatible.iter().find(|(_, (i, _))| matches(i))
+        {
+            return Err(SelectError::Incompatible {
+                port: port.clone(),
+                reason: reason.clone(),
+            });
+        }
+        return match survey.unresponsive.iter().find(|i| matches(i)) {
             Some(info) if force => Ok(Selection::of(vec![info.clone()])),
             Some(info) => Err(SelectError::Unresponsive {
                 target: Some(target.to_string()),
@@ -142,41 +158,58 @@ pub async fn select(
         let port = daemon::port_of(target).to_string();
         return match daemon::ipc_ping(&port).await {
             Ok(status) => Ok(Selection::of(vec![status.instance])),
-            Err(_) => match aproxy_ipc::registry::live_record_in(&daemon::run_dir(), &port) {
-                Some(info) if force => Ok(Selection::of(vec![info])),
-                Some(info) => Err(SelectError::Unresponsive {
-                    target: None,
-                    port,
-                    pid: info.pid,
-                }),
-                None => Err(SelectError::NothingOnPort { port }),
-            },
+            Err(e) => {
+                if let Some(reason) = e.incompatible_ping_reason() {
+                    return Err(SelectError::Incompatible { port, reason });
+                }
+                match aproxy_ipc::registry::live_record_in(&daemon::run_dir(), &port) {
+                    Some(info) if force => Ok(Selection::of(vec![info])),
+                    Some(info) => Err(SelectError::Unresponsive {
+                        target: None,
+                        port,
+                        pid: info.pid,
+                    }),
+                    None => Err(SelectError::NothingOnPort { port }),
+                }
+            }
         };
     }
 
     let survey = daemon::survey_instances().await;
     let mut instances: Vec<InstanceRecord> =
         survey.responsive.into_iter().map(|s| s.instance).collect();
+    let unresponsive = survey.unresponsive.into_iter().filter(|i| {
+        !survey
+            .incompatible
+            .contains_key(daemon::port_of(&i.listen_addr))
+    });
     let mut unresponsive_skipped = Vec::new();
     if force {
-        instances.extend(survey.unresponsive);
+        instances.extend(unresponsive);
     } else {
-        unresponsive_skipped = survey.unresponsive;
+        unresponsive_skipped.extend(unresponsive);
     }
     // target 省略时只接受唯一的那个实例
-    if target.is_none() && instances.len() > 1 {
+    if target.is_none() && instances.len() + survey.incompatible.len() > 1 {
         return Err(SelectError::Ambiguous {
             ports: instances
                 .iter()
                 .map(|i| daemon::port_of(&i.listen_addr).to_string())
+                .chain(survey.incompatible.keys().cloned())
                 .collect(),
         });
     }
-    let empty = instances.is_empty().then_some(Empty::NoneRunning);
+    let empty =
+        (instances.is_empty() && survey.incompatible.is_empty()).then_some(Empty::NoneRunning);
     Ok(Selection {
         instances,
         empty,
         unresponsive_skipped,
+        incompatible_skipped: survey
+            .incompatible
+            .into_iter()
+            .map(|(p, (_, reason))| (p, reason))
+            .collect(),
     })
 }
 
@@ -185,7 +218,7 @@ impl Selection {
         Selection {
             instances,
             empty: None,
-            unresponsive_skipped: Vec::new(),
+            ..Default::default()
         }
     }
 }

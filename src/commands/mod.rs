@@ -383,6 +383,15 @@ pub(crate) fn spawn_failure(
     }
 }
 
+/// 操作码描述整个命令的失败；状态清点仍保留对端声明的协议版本。
+pub(crate) fn incompatible_instance(port: &str, reason: &str) -> Failure {
+    Failure::rendered(
+        aproxy_ipc::enumerate::CODE_INSTANCE_INCOMPATIBLE,
+        |lang| status::text::incompatible(lang, 1),
+        json!({"port":port_value(port),"reason":reason}),
+    )
+}
+
 /// 监听地址绑定不了：被占用是 `port_in_use`；无权限、地址不可用是这个地址本来就起不来，
 /// 归 `start_failed`。
 pub(crate) fn bind_failure(listen_addr: &str, error: &std::io::Error) -> Failure {

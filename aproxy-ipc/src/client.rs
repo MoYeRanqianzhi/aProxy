@@ -121,6 +121,18 @@ impl std::fmt::Display for IpcError {
 impl std::error::Error for IpcError {}
 
 impl IpcError {
+    /// Machine evidence that a ping received an unusable reply, rather than no reply.
+    /// Only ping rejections imply incompatibility; other operations can be legitimately refused.
+    pub fn incompatible_ping_reason(&self) -> Option<String> {
+        match self {
+            Self::Remote { code, .. } => Some(format!("ping rejected: {code}")),
+            Self::Protocol(_) | Self::RunChanged | Self::LineTooLong => {
+                Some("the reply could not be trusted".into())
+            }
+            Self::Unreachable(_) | Self::Transient(_) => None,
+        }
+    }
+
     /// Render at the reader. Unknown remote errors retain the peer's evidence; never
     /// classify a future peer's failure by matching the prose it sent.
     pub fn render(&self, lang: Lang) -> String {

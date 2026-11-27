@@ -20,7 +20,7 @@
 
 | 任务 | 做什么 | 状态（2026-11-20） |
 |---|---|---|
-| t19-launch-reason | 启动来由与备注（`--reason`、`--note`，实例记录的 `launch_reason`、`launch_note`），见 TODO 与 plugins 计划 | 2026-11-26 派出，分支 `codex/t19-launch-reason`，工作区 `.worktrees/codex-t19` |
+| t19-launch-reason | 启动来由与备注（`--reason`、`--note`，实例记录的 `launch_reason`、`launch_note`），见 TODO 与 plugins 计划 | 做完并合入（2026-11-26，连同桌面一侧的 t19b，`2beb00da` 移出 TODO）。之后的 t20 到 t25b 也都已合入 master，正在跑的任务现在没有 |
 | t06-format | format 一线到 alpha.4：九个阶段（B10a、B10b、B10c、B10d、B11、W2c 的四段） | 第一段到第五段（B10a、B10b decide、B10c stream 与 forward 过链、B10d 按请求选投递方式与 notify、B11 官方 aproxy-format 改说协议 1 并删去旧信封）做完，gate 过了，第六段（W2c：convert 的流式转换与 heartbeat，连同第四、第五段审查的修复）与第七段（W2c：keys、route、rewrite，含混合渠道的协议选择）第八段（W2c：policy、adaptive、按请求覆盖）与第九段（W2c：`init`、`check`、`try`，连同第六到第八段审查的修复）也做完；**九段全部做完**（2026-11-21，完整 gate：headless 全量 1094 通过、三种 clippy 干净），都已挑进 master 并推送，main 的门槛任务全绿。还差最后两份审查（v18、v19）的结论与修复。原会话 2026-11-20 被接口报错打断且续不上，换了新会话接手（Revision 17） |
 | p01-perf-hw1 | 在服务器上给 0.2.0-alpha.3 与 0.1.0 测性能基线，交出能重跑的测量脚本 | 做完（2026-11-21）：八组场景，995 次有效试验；数字与发现在 [perf-0.2.0](perf-0.2.0.md)。启动与命令快了很多，处理请求的 CPU 多约三成，跑过请求之后的内存是 0.1.0 的 5.7 倍，小请求高负载下容易撞上内存上限 |
 | v18、v19 | 审查第九段的工具子命令；逐条复核 Revision 23 到 26 的修复 | 做完（2026-11-21）。五十来条，裁定写进 t06 的 Revision 27：产品里的崩溃与无界工作全修；`check` 说明查了什么没查什么并加 `--home`；`try` 的规则是「要么与实例一致，要么停下说明不模拟」；`init` 成功时列出文件与下一步、生成可读的 TOML；每个子命令有 `--help`。拒绝一条（init 输出目录的替换竞态）。发版线带上 aproxy-ipc 由主代理改了。P1 修完不再派新一轮。**修完并合入**（2026-11-21，Codex 的 811393f，57 个代码提交）：headless 全量 1132 通过、0 失败、11 忽略，三种 clippy 干净，离线 SDK 16 组都过 |
@@ -137,7 +137,8 @@
      一律不交给 Codex 写，只能让它审查，所以 t14 由主代理自己改文案；Codex 只跑门槛、把钉住旧文案的测试照搬成新文案，
      并审查改后的文字。**做完（2026-11-27，推到 main 的 `856dbf71`）**：v26 的 49 条、其余命令行英文的通读、错误码说明的
      通读都由主代理改；Codex 的 t25、t25b 对齐测试并两轮审查（57 条，成立的约 40 条由主代理改，其余裁定不改，理由写在
-     `t25b-text-tests.md`）。
+     `t25b-text-tests.md`）。桌面界面的字符串表（`aproxy-desktop/ui/src/lib/i18n.ts`）随后也由主代理通读：改了二十来条说错或说过头的，
+     删掉 24 个没有引用的键（`b9df872a`）；README、架构文档与一条命令行提示里「升级对客户端无感」的说法改成 10 秒宽限的实情（`7479461a`）。
 9a. **随 t10b 顺带**：`cargo update -p url`（到 ≥2.5.9）。RUSTSEC-2026-0592（`Url::origin()` 对嵌套
    `blob:` 递归、栈溢出），2026-11-22 起 main 的 Review 工作流（cargo-deny）因此失败；aproxy-format 的 convert/keys/route
    对配置与上游地址调用 `origin()`，都不是客户端给的输入，风险低。只动 Cargo.lock，验收是 cargo-deny 过、两个变体全量过。

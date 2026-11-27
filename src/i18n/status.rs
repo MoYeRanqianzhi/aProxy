@@ -30,7 +30,7 @@ message!(watchdog(pid: u32, version: &str, since_scan: &str), en: "Watchdog: pid
 
 message!(watchdog_stale(pid: u32, version: &str, since_scan: &str), en: "Watchdog: pid {pid}  v{version}  no scan for {since_scan} (it may be unresponsive)", zh: "看护者: pid {pid}  v{version}  已 {since_scan} 没有扫描（可能卡住了）");
 
-message!(processes(n: usize), en: "Other aProxy processes in the ledger ({n}):", zh: "台账里的其他 aProxy 进程 ({n}):");
+message!(processes(n: usize), en: "Other aProxy processes registered in this home ({n}):", zh: "这个主目录登记的其他 aProxy 进程 ({n}):");
 
 message!(running(n: usize), en: "Running aProxy instances ({n}):", zh: "运行中的 aProxy 实例 ({n}):");
 

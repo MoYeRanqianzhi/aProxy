@@ -68,7 +68,7 @@ message!(local_hosts(), en: "built-in default: loopback listeners allow only loc
 
 message!(no_origins(), en: "built-in default: reject all browser requests with an Origin header", zh: "内置默认：拒绝一切携带 Origin 的浏览器请求");
 
-message!(log_path(), en: " (random name under ~/.aproxy/logs/ at startup; see aproxy status for the path)", zh: "（~/.aproxy/logs/ 下按启动随机命名，实际路径看 aproxy status）");
+message!(log_path(), en: " (random name under ~/.aproxy/logs/ at startup; run aproxy logs <port> to see the path)", zh: "（~/.aproxy/logs/ 下按启动随机命名，实际路径用 aproxy logs <端口> 查看）");
 
 message!(no_bodies(), en: "do not retain request or response bodies", zh: "不保留请求体与响应体");
 
@@ -100,17 +100,17 @@ message!(rules(n: usize), en_one: "{n} rule", en_other: "{n} rules", zh: "{n} �
 
 message!(after(n: u32), en: "pass through after failure {n}", zh: "第 {n} 次失败后透传");
 
-message!(stage(name: &str, stage: &str), en: "format \"{name}\" ({stage} stages):", zh: "format \"{name}\"（{stage} 阶段）:");
+message!(stage(name: &str, stage: &str), en: "format \"{name}\" (stages: {stage}):", zh: "format \"{name}\"（{stage} 阶段）:");
 
 message!(env_names(keys: &str), en: "  env              = {keys} (values hidden)", zh: "  env              = {keys}（值不显示）");
 
 message!(spawn(), en: "  process          = spawn (one process per message)", zh: "  process          = spawn（每条消息起一个进程）");
 
-message!(pool(n: u32, idle: &str), en: "  process          = persistent (pool_max={n}, idle: {idle})", zh: "  process          = persistent（进程池 pool_max={n}，空闲 {idle}）");
+message!(pool(n: u32, idle: &str), en: "  process          = persistent (pool_max={n}, idle workers: {idle})", zh: "  process          = persistent（进程池 pool_max={n}，空闲 {idle}）");
 
-message!(never(), en: "never reap", zh: "永不回收");
+message!(never(), en: "kept running", zh: "永不回收");
 
-message!(reap(secs: u64), en: "reap after {secs}s", zh: "{secs}s 后回收");
+message!(reap(secs: u64), en: "stopped after {secs}s", zh: "{secs}s 后回收");
 
 message!(empty_table(table: &str), en: "{table:<26} = (empty)", zh: "{table:<26} = (空)");
 

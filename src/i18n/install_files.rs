@@ -46,7 +46,7 @@ VerifiedRollback { e: Reason }, en: "Verification after placement failed; the or
 FailedRollback { e: Reason, back: Reason }, en: "Verification after placement failed ({e}); restoring the original binary also failed: {back}", zh: "落位后核对失败（{e}），换回原来的二进制也失败: {back}";
 Copy { source: Text, path: Text, e: Text }, en: "Cannot copy {source} to {path}: {e}", zh: "{source} 复制到 {path} 失败: {e}";
 Collision { dir: Text }, en: "Cannot allocate a unique temporary name in {dir}", zh: "{dir} 里取不到不冲突的中间文件名";
-Retire { e: Text }, en: "Cannot move the old binary aside (a handle may deny shared deletion); bin is unchanged: {e}", zh: "旧二进制让位失败（被不带共享删除权限的句柄占着？），bin 未改动: {e}";
+Retire { e: Text }, en: "Cannot move the old binary aside; another program may have it open. bin/ is unchanged: {e}", zh: "旧二进制让位失败（可能被别的程序打开着），bin/ 未改动: {e}";
 Retain { e: Text }, en: "Cannot retain the old binary for rollback if the new version fails to start; bin is unchanged: {e}", zh: "旧二进制保留失败（没有它，实例在新版本下起不来时无从回滚），bin 未改动: {e}";
 MoveAside { e: Text }, en: "Cannot move the new binary aside: {e}", zh: "挪开新二进制失败: {e}";
 RestoreBoth { e: Text, old: Text, aside: Text }, en: "Cannot restore the old binary: {e}; old binary: {old}; new binary: {aside}", zh: "旧二进制改回失败: {e}；旧二进制在 {old}，新二进制在 {aside}";

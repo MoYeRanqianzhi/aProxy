@@ -16,7 +16,7 @@ message!(idle_only(cmd: &str), en: "--idle-threshold-secs requires the idle targ
 
 message!(forgotten(port: &str), en: "The instance on port {port} is no longer running. Its desired-state record was removed. Restore and the watchdog will not start it again.", zh: "端口 {port} 的实例已不在运行；已删除它的期望状态记录，restore 与看护者不会再拉起它。");
 
-message!(no_port(port: &str), en: "No running aProxy instance on port {port}.\nAnother program using this port is not managed by aProxy.", zh: "端口 {port} 上没有运行中的 aProxy 实例。\n（若该端口被其他程序占用，与本工具无关）");
+message!(no_port(port: &str), en: "No running aProxy instance on port {port}.\nIf another program is using this port, aProxy does not manage it.", zh: "端口 {port} 上没有运行中的 aProxy 实例。\n（若该端口被其他程序占用，与本工具无关）");
 
 message!(no_alias(target: &str, path: std::path::Display<'_>), en: "Alias {target} (configuration {path}) is not running.", zh: "别名 {target}（配置 {path}）当前未在运行。");
 

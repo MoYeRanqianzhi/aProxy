@@ -6,7 +6,7 @@ message!(skip(path: std::path::Display<'_>, reason: &str), en: "Skipping unreada
 
 message!(none(), en: "No instances to restore.", zh: "没有需要恢复的实例。");
 
-message!(running(port: &str), en: "Port {port} is already running. Skipping.", zh: "端口 {port} 已在运行，跳过。");
+message!(running(port: &str), en: "An instance is already running on port {port}. Skipping.", zh: "端口 {port} 的实例已在运行，跳过。");
 
 message!(missing(port: &str, config: &str), en: "Configuration file not found for port {port} ({config}). The instance was not restored. Its record is retained. Run aproxy restore when the file is back, or aproxy stop {port} if this instance is no longer needed.", zh: "端口 {port} 的配置文件找不到（{config}），这次没有恢复；记录已保留，文件回来之后再执行 aproxy restore。不再需要这个实例时执行 aproxy stop {port}");
 

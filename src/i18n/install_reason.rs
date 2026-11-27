@@ -15,21 +15,21 @@ message!(precheck(port: u16), en: "Precheck failed for the instance on port {por
 
 message!(no_reason(), en: "reason not recorded", zh: "原因未记录");
 
-message!(successor_missing(), en: "The successor reported a failure without a reason.", zh: "接手进程报告失败（原因未记录）");
+message!(successor_missing(), en: "The installer that took over reported a failure but gave no reason.", zh: "接手进程报告失败（原因未记录）");
 
 message!(aborted(), en: "Installation was aborted (--abort).", zh: "安装已被中止（--abort）");
 
 message!(halted(cause: &str), en: "The last installation stopped after an instance failed and will not retry automatically ({cause}). Correct the problem and run aproxy install again.", zh: "上次安装因实例级失败已中止，不自动重试（{cause}）。排除原因后重新执行 aproxy install");
 
-message!(owner(pid: u32, phase: InstallPhase, reason: &str), en: "The successor (pid {pid}) exited during {phase:?}: {reason}. Run aproxy install again to resume.", zh: "接手进程（pid {pid}）已退出但安装停在 {phase:?}：{reason}；重新执行 aproxy install 即可接着装完");
+message!(owner(pid: u32, phase: InstallPhase, reason: &str), en: "The installer that took over (pid {pid}) exited with the installation still in phase {phase:?}: {reason}. Run aproxy install again to resume.", zh: "接手进程（pid {pid}）已退出但安装停在 {phase:?}：{reason}；重新执行 aproxy install 即可接着装完");
 
-message!(timeout(secs: u64), en: "Installation did not finish within {secs} seconds. It may still be running. Use aproxy status to check instance versions.", zh: "{secs} 秒内未确认安装完成（可能仍在后台进行）；可用 aproxy status 查看实例版本");
+message!(timeout(secs: u64), en: "Could not confirm that the installation finished within {secs} seconds. It may still be running. Use aproxy status to check instance versions.", zh: "{secs} 秒内未确认安装完成（可能仍在后台进行）；可用 aproxy status 查看实例版本");
 
 message!(panic_at(location: &str), en: "installer panic at {location}", zh: "安装进程在 {location} 意外终止");
 
-message!(no_terminal(status: &str), en: "no terminal state; {status}", zh: "未记录终态；{status}");
+message!(no_terminal(status: &str), en: "no final installation result was recorded; {status}", zh: "未记录终态；{status}");
 
-message!(saving(code: &str, cause: &str, error: &str), en: "{code}: {cause}; saving install/state.json: {error}", zh: "{code}：{cause}；保存 install/state.json 失败：{error}");
+message!(saving(code: &str, cause: &str, error: &str), en: "{code}: {cause}; could not save install/state.json: {error}", zh: "{code}：{cause}；保存 install/state.json 失败：{error}");
 
 message!(exit_status(code: u32), en: "exit status {code} (0x{code:08x})", zh: "退出状态 {code} (0x{code:08x})");
 

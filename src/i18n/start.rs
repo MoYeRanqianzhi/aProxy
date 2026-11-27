@@ -18,7 +18,7 @@ message!(started(), en: "aProxy started in the background", zh: "aProxy 已在�
 
 message!(listen(addr: &str), en: "  Listening: http://{addr}", zh: "  监听: http://{addr}");
 
-message!(client(addr: &str), en: "  Set the API base URL to http://{addr}", zh: "  提示: 将你的 API base URL 指向 http://{addr}");
+message!(client(addr: &str), en: "  Point your API client's base URL to http://{addr}", zh: "  提示: 将你的 API base URL 指向 http://{addr}");
 
 message!(upstream(base: &str), en: "        Paths and query parameters are forwarded unchanged to {base}/<path>?<query>", zh: "        上游路径与查询参数将完整透传到 {base}/<path>?<query>");
 

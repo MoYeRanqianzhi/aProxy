@@ -241,16 +241,16 @@ reasons! {
         en: "a number is read as a port",
         zh: "别名不能是纯数字（会与端口号解析冲突）";
     AliasAll,
-        en: "it is a reserved target of stop and status",
-        zh: "\"all\" 是 stop 的保留目标（停止全部实例）";
+        en: "`all` is reserved: `aproxy stop all` and `aproxy restart all` select every instance",
+        zh: "\"all\" 是 stop 与 restart 的保留目标（选中全部实例）";
     AliasIdle,
-        en: "it is a reserved target of stop and status",
-        zh: "\"idle\" 是 stop/status 的保留目标（空闲实例筛选）";
+        en: "`idle` is reserved: `aproxy stop idle` and `aproxy restart idle` select idle instances, and `aproxy status --idle` lists them",
+        zh: "\"idle\" 是 stop 与 restart 的保留目标（选中空闲实例，可用 `aproxy status --idle` 列出）";
     AliasDefault,
         en: "it is reserved for the default config",
         zh: "\"default\" 指代默认配置文件（settings 的 default_config），是保留字";
     AliasTypo,
-        en: "it is reserved for the default config",
+        en: "`defult` is reserved because it is a common misspelling of `default`",
         zh: "\"defult\" 是 \"default\" 的常见笔误，两者都保留以免混淆";
     AliasReserved { why: Nested },
         en: "{why}",
@@ -346,7 +346,7 @@ reasons! {
         en: "{message} (alias {aliases})",
         zh: "{message}（别名 {aliases}）";
     OwnedHome { who: String },
-        en: "the group or others can access the home ({who}); aproxy tightens it on its next write",
+        en: "other users can access the aProxy home directory ({who}); aProxy will restrict its permissions the next time it writes there",
         zh: "同组或其他用户可以访问主目录（{who}）；aproxy 将在下次写入时收紧权限";
     OtherHome { who: String },
         en: "the group or others can access the home ({who}); it belongs to another user, so aproxy leaves it alone",

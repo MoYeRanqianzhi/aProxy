@@ -12,6 +12,6 @@ message!(unset_config(file: &str, key: &str), en: "    Remove this key: aproxy c
 
 message!(paused(), en: "Log cleanup is paused: run/ contains unreadable records.", zh: "日志清理已暂停：run/ 里有读不懂的记录。");
 
-message!(summary(errors: usize, warnings: usize, infos: usize), en: "Results: {errors} error, {warnings} warning, {infos} info", zh: "检查结果: {errors} error, {warnings} warning, {infos} info");
+message!(summary(errors: usize, warnings: usize, infos: usize), en: "Results: errors {errors}, warnings {warnings}, info {infos}", zh: "检查结果: {errors} error, {warnings} warning, {infos} info");
 
 message!(cannot_start(), en: "Instances cannot start with configuration errors. Most commands cannot run with errors in settings.json. Warnings and informational messages do not block startup.", zh: "有 error 的配置不能用来启动；settings.json 有 error 时多数命令不能运行。warning 与 info 仅供参考。");

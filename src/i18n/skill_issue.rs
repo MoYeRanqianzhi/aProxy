@@ -15,7 +15,7 @@ message!(lock_links(), en: "The skill lock file has other hard links.", zh: "ski
 
 message!(busy(), en: "Another process is installing skills. Try again later.", zh: "另一个进程正在安装 skill，请稍后重试");
 
-message!(workspace_key(), en: "The skill workspace credentials are invalid. Move skills/ aside and run aproxy skill install.", zh: "skill 工作区凭据无效；请移走 skills/ 后执行 aproxy skill install");
+message!(workspace_key(), en: "aProxy could not confirm that the temporary skill directory belongs to its skill installer. Move skills/ aside and run aproxy skill install.", zh: "无法确认 skill 的临时目录属于 aproxy 的 skill 安装程序；请移走 skills/ 后执行 aproxy skill install");
 
 message!(workspace_contents(), en: "Unexpected files in the skill workspace.", zh: "skill 工作区内容异常");
 

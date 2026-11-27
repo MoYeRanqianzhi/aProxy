@@ -254,7 +254,7 @@ pub const TABLE: &[Code] = &[
     plain(
         "desktop_format",
         &[Family::Desktop],
-        "The run cannot complete a format operation.",
+        "The format operation on the selected instance could not be completed.",
         &[req("reason", T::String)],
     ),
     plain(
@@ -354,7 +354,7 @@ pub const TABLE: &[Code] = &[
     terminal(
         "format_unavailable",
         Http(503),
-        "A required format's circuit is open, so a request-direction stage cannot use it.",
+        "The circuit breaker is temporarily blocking calls to a required request-side format program, so the request cannot proceed.",
         &[
             req("format", T::String),
             req("stage", T::String),
@@ -365,7 +365,7 @@ pub const TABLE: &[Code] = &[
     terminal(
         "format_failed",
         Http(502),
-        "A forward request's request-side format failed or asked for a retry, and the request was not upgraded to retry.",
+        "In forward mode, a request-side format program failed or asked for a retry, and the request was not switched to retry mode.",
         &[
             req("format", T::String),
             req("stage", T::String),
@@ -376,13 +376,13 @@ pub const TABLE: &[Code] = &[
     terminal(
         "upstream_failed",
         Http(502),
-        "A forward request's upstream attempt failed and the request was not upgraded to retry.",
+        "In forward mode, the upstream attempt failed, and the request was not switched to retry mode.",
         &[req("last_code", T::Code)],
     ),
     terminal(
         "decode_failed",
         SseOnly,
-        "The stream is already committed, the upstream's content encoding cannot be carried, and decoding failed.",
+        "Response headers had already been sent to the client without a content encoding, so the upstream body had to be decoded, and decoding failed.",
         &[req("encoding", T::String)],
     ),
     terminal(
@@ -405,7 +405,7 @@ pub const TABLE: &[Code] = &[
     plain(
         "upstream_connect_failed",
         ATTEMPT,
-        "Could not connect to the upstream: DNS, refused, TLS.",
+        "Could not connect to the upstream server, for example because the DNS lookup failed, the connection was refused or the TLS handshake failed.",
         &[req("reason", T::String)],
     ),
     plain(
@@ -519,7 +519,7 @@ pub const TABLE: &[Code] = &[
     plain(
         "condition_not_met",
         IPC,
-        "The condition of a conditional op does not hold.",
+        "The action was not performed because its condition did not hold, for example the instance had not been idle long enough to stop.",
         &[opt("idle_ms", T::Millis)],
     ),
     plain(
@@ -550,7 +550,7 @@ pub const TABLE: &[Code] = &[
         "home_invalid",
         OPERATION,
         Exit(EXIT_USAGE),
-        "APROXY_HOME does not satisfy the home rules.",
+        "aProxy could not determine its home directory. Set APROXY_HOME to an absolute path.",
         &[req("value", T::String)],
     ),
     exiting(
@@ -613,7 +613,7 @@ pub const TABLE: &[Code] = &[
         "ready_timeout",
         OPERATION,
         Exit(EXIT_FAILED),
-        "The instance did not reach serving within the time limit.",
+        "The instance did not become ready to accept requests within the time limit.",
         &[req("timeout_ms", T::Millis)],
     ),
     exiting(
@@ -627,7 +627,7 @@ pub const TABLE: &[Code] = &[
         "restart_unsupported",
         OPERATION,
         Exit(EXIT_FAILED),
-        "The target has no desired-state record (a foreground instance).",
+        "There is no desired-state record for this instance (for example, it runs in the foreground), so it cannot be restarted automatically.",
         &[req("port", T::Integer)],
     ),
     exiting(
@@ -719,7 +719,7 @@ pub const TABLE: &[Code] = &[
     diagnostic(
         "config_not_supported",
         Severity::Error,
-        "A form whose shape is defined but which is not implemented yet.",
+        "This version recognizes the setting but does not support it yet.",
         &[],
     ),
     diagnostic(
@@ -749,7 +749,7 @@ pub const TABLE: &[Code] = &[
     diagnostic(
         "default_header_shared",
         Severity::Info,
-        "The defaults' header tables contain non-secret headers, which are sent to every target.",
+        "These default headers are sent to every target. If one carries a credential, set it only in the configurations that need it.",
         &[],
     ),
     diagnostic(
@@ -868,7 +868,7 @@ pub const TABLE: &[Code] = &[
         "install_below_floor",
         INSTALL,
         Exit(EXIT_FAILED),
-        "The requested version is older than the oldest one this home can be moved to.",
+        "The requested version is too old to use this aProxy home's file layout and control protocol.",
         &[],
     ),
     exiting(

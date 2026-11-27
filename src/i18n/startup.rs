@@ -15,7 +15,7 @@ message!(bad_settings(), en: "settings.json contains errors. The instance was no
 message!(settings_hint(path: &str), en: "\n\nRun aproxy settings show to inspect the settings, or aproxy settings unset <key> to remove an invalid key. Delete {path} to return to the built-in defaults.", zh: "\n\n用 aproxy settings show 查看，aproxy settings unset <键> 删掉出问题的键；也可以删除 {path} 回到内置默认");
 message!(read(path: &str, error: &str), en: "Cannot read the configuration file: {error}\nFile: {path}", zh: "读取配置文件失败: {error}\n文件: {path}");
 message!(bad_config(), en: "Configuration errors:", zh: "配置错误:");
-message!(config_hint(), en: "\n\nCorrect the configuration and try again. To set the upstream address:\n  aproxy config set base_url https://api.anthropic.com", zh: "\n\n请修改后重试。上游地址可以这样设置:\n  aproxy config set base_url https://api.anthropic.com");
+message!(config_hint(), en: "\n\nCorrect the configuration and try again. To set the upstream address:\n  aproxy config set base_url https://api.anthropic.com\n  (for a file other than the default configuration, add --config <file> after config)", zh: "\n\n请修改后重试。上游地址可以这样设置:\n  aproxy config set base_url https://api.anthropic.com\n  （不是默认配置文件时，在 config 后加 --config <文件>）");
 message!(edit(path: &str), en: "\n  Or edit {path} manually", zh: "\n  或手动编辑 {path}");
 message!(in_use(addr: &str), en: "Another program is using {addr}. The instance cannot start.", zh: "端口 {addr} 被其他程序占用，无法启动");
 message!(denied(addr: &str), en: "Cannot bind {addr}: permission denied or the port is reserved. On Windows, check Hyper-V/WinNAT exclusions with netsh interface ipv4 show excludedportrange protocol=tcp.", zh: "端口 {addr} 无法绑定：无权限或端口被系统保留（如 Hyper-V/WinNAT 排除区间，可用 netsh interface ipv4 show excludedportrange protocol=tcp 查看）");

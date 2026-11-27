@@ -38,7 +38,7 @@ crate::message!(peer_pid(), en: "cannot verify peer pid", zh: "无法核验对�
 
 crate::message!(pipe_owner(), en: "cannot verify pipe server owner", zh: "无法核验管道服务端的属主");
 
-crate::message!(run_changed(), en: "instance run changed", zh: "实例已重新启动，不再是原来那次运行");
+crate::message!(run_changed(), en: "the instance restarted after it was selected", zh: "实例已重新启动，不再是原来那次运行");
 
 crate::message!(refused(code: &str, message: &str), en: "Instance refused the request ({code}): {message}", zh: "实例拒绝了请求（{code}）：{message}");
 

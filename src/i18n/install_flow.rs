@@ -5,13 +5,13 @@ use serde::{Deserialize, Serialize};
 
 message!(lock_open(path: &str, e: &str), en: "Cannot open installation lock {path}: {e}", zh: "安装锁 {path} 打开失败: {e}");
 
-message!(locked(path: &str, secs: u64), en: "Another process held installation lock {path} for {secs} seconds. Another installation may be changing bin.", zh: "安装锁 {path} 被别的进程持有，{secs} 秒内没有等到（另一个安装正在修改 bin/？）");
+message!(locked(path: &str, secs: u64), en: "Timed out after {secs} seconds waiting for installation lock {path}. Another installation may still be changing bin/.", zh: "安装锁 {path} 被别的进程持有，{secs} 秒内没有等到（另一个安装正在修改 bin/？）");
 
 message!(lock_failed(path: &str, e: &str), en: "Cannot acquire installation lock {path}: {e}", zh: "安装锁 {path} 加锁失败: {e}");
 
 message!(lock_task(e: &str), en: "The task waiting for the installation lock ended unexpectedly: {e}", zh: "等安装锁的任务异常结束: {e}");
 
-message!(jurisdiction(port: &str, dir: &str, image: &str), en: "The binary for the instance on port {port} is outside the installation directory ({dir}): {image}.\nUpgrade it through its original package manager, npm, or cargo, or run `aproxy install --adopt` to move it to the standard location.", zh: "实例 {port} 的二进制不在安装管辖目录（{dir}）下：{image}。\n\
+message!(jurisdiction(port: &str, dir: &str, image: &str), en: "The binary for the instance on port {port} is outside the installation directory ({dir}): {image}.\nUpgrade it with the tool that installed it (for example npm or Cargo), or run `aproxy install --adopt` to move it to the standard location.", zh: "实例 {port} 的二进制不在安装管辖目录（{dir}）下：{image}。\n\
                  该实例由其他渠道安装（包管理器/npm/cargo），请用对应渠道升级，\
                  或执行 `aproxy install --adopt` 显式收编到标准位置");
 
@@ -38,15 +38,15 @@ message!(both_missing(), en: "Both the staged binary and the --from source are m
 
 message!(takeover(e: &str), en: "The target version did not take over the installation ({e}); the instances and the binary in bin are unchanged.", zh: "目标版本没有接手安装（{e}）；实例与 bin 里的二进制都未改动");
 
-message!(prepare(e: &str), en: "PrepareSwap broadcast failed ({e}).\nStop the affected instances and retry the installation. They were not forcibly terminated to avoid a service interruption.", zh: "PrepareSwap 广播终失败（{e}）。\n\
-                 问题实例有隐患，处置指引：将其关闭后重试安装（不强杀——避免服务中断）");
+message!(prepare(e: &str), en: "Not all instances confirmed they were ready for the binary to be replaced ({e}).\nStop the affected instances and retry the installation. They were not forcibly terminated, to avoid interrupting service.", zh: "有实例没有确认已准备好替换二进制（{e}）。\n\
+                 请先停掉这些实例再重试安装（没有强制结束它们，以免中断服务）");
 
-message!(fresh(e: &str), en: "An instance started after the broadcast failed to acknowledge it: {e}", zh: "广播后新启实例 ACK 失败: {e}");
+message!(fresh(e: &str), en: "A newly started instance did not confirm it was ready for the binary to be replaced: {e}", zh: "新启动的实例没有确认已准备好替换二进制: {e}");
 
-message!(rolled_back(reason: &str, path: &str, pid: u32), en: "The new version failed to start ({reason}). The old binary {path} restored the instance with its original configuration (pid {pid}). Rolling restarts stopped; remaining instances are unchanged.", zh: "新版本启动失败（{reason}）；已用旧二进制 {path} 按原来的规格拉回实例（pid {pid}），\
-                 滚动已中止，其余实例未动");
+message!(rolled_back(reason: &str, path: &str, pid: u32), en: "The new version failed to start ({reason}). The old binary {path} restored the instance with its original configuration (pid {pid}). Rolling restarts stopped; instances not yet reached are unchanged.", zh: "新版本启动失败（{reason}）；已用旧二进制 {path} 按原来的规格拉回实例（pid {pid}），\
+                 滚动已中止，尚未轮到的实例未动");
 
-message!(down(reason: &str, fallback_error: &str), en: "The new version failed to start ({reason}), and the old binary could not restore the instance ({fallback_error}). The instance is offline. Its desired state was retained; correct the cause and run `aproxy restore`.", zh: "新版本启动失败（{reason}），旧二进制拉回也失败（{fallback_error}）；\
+message!(down(reason: &str, fallback_error: &str), en: "The new version failed to start ({reason}), and the old binary could not restore the instance ({fallback_error}). The instance is offline. Its desired-state record was kept; correct the cause and run `aproxy restore`.", zh: "新版本启动失败（{reason}），旧二进制拉回也失败（{fallback_error}）；\
                  实例当前下线，期望状态记录已保留，排除原因后执行 `aproxy restore` 恢复");
 
 message!(no_restore(port: &str), en: "The instance on port {port} has no desired-state record (it may be a foreground instance).", zh: "实例 {port} 没有期望状态记录（前台实例？）");

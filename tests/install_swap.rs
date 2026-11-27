@@ -333,7 +333,7 @@ mod windows_swap {
         )
         .unwrap_err();
         assert_eq!(err.code, "install_swap_failed");
-        assert!(err.message.contains("bin is unchanged"), "{err}");
+        assert!(err.message.contains("bin/ is unchanged"), "{err}");
         drop(handle);
         assert_eq!(
             std::fs::read(swap::bin_path_in(home.path())).unwrap(),

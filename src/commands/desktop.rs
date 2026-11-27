@@ -308,7 +308,7 @@ mod tests {
             .render_long_help()
             .to_string();
         assert_eq!(
-            help.contains("Open the desktop interface"),
+            help.contains("Open the desktop window"),
             cfg!(feature = "desktop"),
             "{help}"
         );

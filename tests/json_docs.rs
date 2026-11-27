@@ -658,7 +658,7 @@ fn doctor_json_document() {
     for fragment in [
         "[ERROR] ",
         "Remove this key: aproxy config --config '",
-        "Results: 1 error,",
+        "Results: errors 1,",
         "Instances cannot start with configuration errors",
     ] {
         assert!(stdout.contains(fragment), "{stdout}");

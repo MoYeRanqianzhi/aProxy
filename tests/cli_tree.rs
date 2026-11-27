@@ -755,7 +755,7 @@ fn english_force_guidance_discloses_downgrade_and_process_scope() {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(
-        help.contains("latest, cannot be older than the running version")
+        help.contains("latest is installed, and it must not be older than the running version")
             && help.contains("never below 0.2.0"),
         "{help}"
     );

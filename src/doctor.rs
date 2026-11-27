@@ -639,7 +639,7 @@ mod tests {
             d.message.to_string().contains("mode 0750")
                 && d.message
                     .to_string()
-                    .contains("tightens it on its next write")
+                    .contains("aProxy will restrict its permissions the next time it writes there")
         );
         let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o750, "体检不改权限");

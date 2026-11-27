@@ -164,11 +164,13 @@ the headless one; check them against their `.sha256` or the release manifest
 `aproxy-manifest.json`. When the npm desktop build cannot start on Linux for missing libraries,
 its launcher suggests `@meowo/aproxy-headless` instead.
 
-Upgrades: `aproxy install` replaces the binary and rolling-restarts running
-instances one by one without client-visible downtime (`--from <path>` installs
+Upgrades: `aproxy install` replaces the binary and restarts running instances
+one at a time (`--from <path>` installs
 a local binary, `--adopt` takes over a copy installed elsewhere: it moves it into
 `<home>/bin`, adds that to your `PATH` and, for the desktop build, adds an app menu
 entry that opens the window; `--no-path` and `--no-shortcut` skip those two steps).
+Each restart gives requests in progress up to 10 seconds to finish and cuts off
+longer ones, such as long streams or requests waiting to retry.
 - **Update channel**: the default `latest` picks the highest version inside a
   channel. If the current version is a stable release only stable releases are
   considered (you are never carried onto a pre-release); if it is a

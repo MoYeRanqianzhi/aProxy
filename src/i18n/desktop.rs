@@ -9,14 +9,14 @@ message!(musl(), en: "This headless build of aproxy has no desktop interface. On
 #[cfg(any(test, not(feature = "desktop")))]
 message!(linux(), en: "This headless build of aproxy has no desktop interface. To install the desktop build, run:\n  aproxy install --variant desktop\nAs with an upgrade, instances restart one at a time. The desktop build requires WebKitGTK 2.40 or later (libwebkit2gtk-4.1-0 on Debian and Ubuntu) and a graphical session to open a window. The installer reports why if this machine cannot run the desktop build.", zh: "这是无界面的 headless 版本的 aproxy，没有桌面界面。要用桌面界面，换装带界面的版本：\n  \
          aproxy install --variant desktop\n\
-         它和升级一样逐个重启实例，不中断服务。带界面的版本需要 WebKitGTK 2.40 或更新\
+         它和升级一样逐个重启实例。带界面的版本需要 WebKitGTK 2.40 或更新\
          （Debian / Ubuntu：libwebkit2gtk-4.1-0），打开窗口还要图形会话；本机跑不了带界面的版本\
          时，安装会报错并说明原因。");
 
 #[cfg(any(test, not(feature = "desktop")))]
 message!(headless(), en: "This headless build of aproxy has no desktop interface. To install the desktop build, run:\n  aproxy install --variant desktop\nAs with an upgrade, instances restart one at a time.", zh: "这是无界面的 headless 版本的 aproxy，没有桌面界面。要用桌面界面，换装带界面的版本：\n  \
          aproxy install --variant desktop\n\
-         它和升级一样逐个重启实例，不中断服务。");
+         它和升级一样逐个重启实例。");
 
 #[cfg(all(feature = "desktop", not(test), windows))]
 message!(panic(info: &std::panic::PanicHookInfo<'_>), en: "An internal error closed the desktop interface. Proxy instances are unaffected.\n\n{info}", zh: "桌面界面遇到内部错误，即将关闭（代理实例不受影响）。\n\n{info}");

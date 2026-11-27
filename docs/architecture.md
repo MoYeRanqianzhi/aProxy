@@ -702,7 +702,8 @@ CLI 覆盖、settings 注入、validate）干跑一遍，换监听地址时再�
 
 ## 安装与升级（install）
 
-`aproxy install` 把二进制安全落位到 `~/.aproxy/bin/`，对客户端 ≈ 无感。
+`aproxy install` 把二进制安全落位到 `~/.aproxy/bin/`，再逐个重启实例；
+每次重启沿用优雅停止的 10 秒宽限，超过 10 秒的在途请求会被中断，新进程就绪前的新连接可能失败。
 四条铁律：先标记（状态文件先于一切动作，崩溃可识别；它是 `<home>/install/state.json`，
 代码与文档里习称 install.state）、先下载后
 rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC PrepareSwap

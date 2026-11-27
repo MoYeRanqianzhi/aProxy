@@ -71,7 +71,7 @@ cargo binstall aproxy --pkg-url '{ repo }/releases/download/v{ version }/{ name 
 
 手动下载：带界面的是 `aproxy-<target>[-v3]`，无界面的是 `aproxy-headless-<target>[-v3]`，Releases 页的 `.sha256` 与发布清单 `aproxy-manifest.json` 可供核对。npm 装的带界面版本在 Linux 上缺库起不来时，启动器会提示改装 `@meowo/aproxy-headless`。
 
-升级：`aproxy install`（在线下载链条自动滚动重启，逐实例无感；`--from <路径>` 本地安装、`--adopt` 收编既有安装）。
+升级：`aproxy install`（在线下载，替换二进制后逐个重启实例；`--from <路径>` 本地安装、`--adopt` 收编既有安装）。每个实例重启时给在途请求最多 10 秒收尾，更长的请求（长流式、还在等待重试的请求）会被中断。
 - **更新通道**：`install` 默认的 `latest` 在「通道」内取版本号最大者。当前是正式版则只取正式版（不会被带到预发布）；当前是预发布（如 alpha）则默认就在预发布通道；`--pre` 显式让预发布参与选择。只认 `vX.Y.Z` / `vX.Y.Z-(alpha|beta|rc).N`，按版本号而非创建时间比较，`format-v*` 与历史测试 tag 不参与。通道内没有更新版本时提示「已是最新」或「暂无可用版本」并保持现状，不会偷偷换通道。指定具体版本号（`aproxy install 0.2.0`）不受通道影响；低于当前版本的目标默认拒绝，需 `--allow-downgrade`；低于 0.2.0 的版本一律不装。
 - **从 0.1.x 升级**：0.1.x 与 0.2.0 起的版本互相控制不了对方的实例，0.1.x 的 `aproxy install` 装不上 0.2.0（下载后报 `--version 输出无版本号` 退出，什么都不改）。按 [CHANGELOG](CHANGELOG.md) 的「从 0.1.x 迁移」停掉实例、重新安装，再用 `aproxy migrate` 把 settings.json 与配置文件转换成 0.2.0 的写法（先 `--dry-run` 预览，原文留 `.0.1.bak` 备份）；0.2.0 现在只有预发布，重装时一键脚本要加 `--pre`，否则装回的还是 0.1.x。
 - **下载渠道与代理**：在线安装按 github → npm → cargo-binstall → cargo 的顺序尝试，settings.json 的 `update.download_chain` 可以调整次序、加镜像（url 模板）；下载走代理用 `--download-proxy <URL>` 或 settings.json 的 `update.download_proxy`，与上游请求代理无关。字段说明见 skill 文档 [settings-json.md](.claude/skills/aproxy-cli/references/latest/settings-json.md)。强制安装不读 settings.json，只用命令行的 `--download-proxy`（没给就走系统环境代理）。

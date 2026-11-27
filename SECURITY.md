@@ -23,13 +23,14 @@ aProxy 是**本机单用户**的 API 代理：
 - 被这两项拒绝的请求在本地返回 403：不转发上游、不注入密钥、不进入重试。配置语法与例外见 README 的「入站来源校验」。
 - 上游请求不跟随重定向（避免把密钥与请求体带到 3xx 指向的任意主机）。
 - 日志、`status` 与桌面窗口对凭据打码：URL 的 userinfo、查询串的值、`api_key` 与头值；`config show` 对 `[[format]]` 的 `env` 只列名字，不显示值。
-- 控制通道（命名管道 / Unix socket）不占用代理端口，不经 HTTP 暴露；其访问控制取决于操作系统默认权限与 `~/.aproxy` 目录权限。
+- 控制通道（Windows 上是命名管道，Linux 与 macOS 上是 Unix socket）不占用代理端口，也不经 HTTP 暴露。它只接受启动实例的那个用户（以及 SYSTEM 或 root）：Windows 上管道的访问控制列表只有这个用户与 SYSTEM；Unix 上 socket 的权限是 0600，每个连接还要核对对端的 uid。
+- aProxy 的主目录（默认 `~/.aproxy`，可用 `APROXY_HOME` 另指）里有明文密钥（配置、settings.json、期望状态记录）、日志与落盘的请求内容。aproxy 建这个目录时只让属主访问（Unix 上是 0700；Windows 上只有当前用户、SYSTEM 与 Administrators），属于你而权限过宽的主目录会被收紧；不属于当前用户的主目录不动，由 `aproxy doctor` 报告出来。
 
 **不在防护范围内**
 
 - **本机上的其他进程与其他用户**：回环端口对本机所有用户可连。多用户共享的机器上，同机其他用户可以使用你的代理。
 - **把监听地址暴露到网络**：`listen_addr` 设为 `0.0.0.0` 或局域网地址后，同网段任何主机都能免鉴权使用你的密钥。启动、`startup.log` 与 `aproxy doctor` 会对此告警，但不会阻止——**请勿这样做**，除非网络完全可信。
-- **磁盘上的明文密钥**：`api_key` 以明文保存在 `config.toml`。请收紧文件权限（Linux/macOS：`chmod 600`；Windows：仅当前用户可读写），并避免把它提交进版本库或放进云同步目录。`--api-key` 命令行参数可被本机其他进程枚举，长期使用请写进配置文件。
+- **磁盘上的明文密钥**：`api_key` 以明文保存在 `config.toml`。主目录之外的配置文件不受上面的目录保护，请收紧文件权限（Linux/macOS：`chmod 600`；Windows：仅当前用户可读写），并避免把它提交进版本库或放进云同步目录。`--api-key` 命令行参数可被本机其他进程枚举，长期使用请写进配置文件。
 - **format 程序是配置驱动的命令执行**：`[[format]]` 条目会以实例的权限启动 `command`（不经 shell，按 argv 执行），按它声明的阶段把请求与响应交给它（头里可能带着凭据，正文给多少由它自己要），它还可以提供 control 方法，供桌面扩展调用。只配置你信任的程序，也不要让他人能修改你的 `config.toml`。拿不准时，让你的 agent 用随 aProxy 发布的 `aproxy-audit-format` skill 先审一遍。
 - **桌面窗口的主题与扩展不在沙箱里**：启用的扩展是在主窗口里运行的 JavaScript，能做窗口能做的一切——读请求历史与正文（已打码）、启停实例、改配置（包括密钥与 format 的 `command`，等于能让实例执行任意程序）、安装更新，也能联网。主题的样式表可以加载网络资源，也能遮住或改写界面上的提示。aProxy 不限制这些，而是在安装之前把适用的风险逐条讲清（闭源、与 GitHub release 的摘要对不上、仓库星数很少、核对不了），每条都要用户确认。只装你信任的包，拿不准时先用 `aproxy-audit-extension` 或 `aproxy-audit-theme` skill 审一遍。
 - **安装脚本的校验**：一键安装脚本校验下载文件的 SHA256，该校验值与二进制出自同一个 GitHub release——能发现传输损坏，但不是独立的发布者签名验证。
@@ -64,13 +65,14 @@ aProxy is a **local, single-user** API proxy:
 - A request rejected by either check gets a local 403: it is not forwarded, no key is injected, no retry happens. See "Inbound origin checks" in the README for syntax and exceptions.
 - Upstream requests do not follow redirects (so the key and body are never sent to an arbitrary host named by a 3xx).
 - Logs, `status` and the desktop window mask credentials: URL userinfo, query-string values, `api_key` and header values; `config show` lists only the names in a `[[format]]` entry's `env`, never the values.
-- The control channel (named pipe / Unix socket) never uses the proxy port and is not exposed over HTTP; its access control depends on OS defaults and the permissions of `~/.aproxy`.
+- The control channel (a named pipe on Windows, a Unix socket on Linux and macOS) never uses the proxy port and is not exposed over HTTP. It accepts only the user who started the instance (plus SYSTEM or root): on Windows the pipe's access list names only that user and SYSTEM; on Unix the socket's mode is 0600 and every connection's peer uid is checked.
+- aProxy's home directory (`~/.aproxy` by default, or wherever `APROXY_HOME` points) holds plain-text keys (configs, settings.json, desired-state records), logs and request bodies written to disk. aproxy creates it accessible to its owner only (mode 0700 on Unix; on Windows only the current user, SYSTEM and Administrators) and tightens a home you own that is more open than that. A home owned by another user is left as it is, and `aproxy doctor` reports it.
 
 **Out of scope**
 
 - **Other processes and other users on the same machine**: a loopback port is reachable by every local user. On a shared machine, other users can use your proxy.
 - **Exposing the listen address to a network**: with `listen_addr` set to `0.0.0.0` or a LAN address, any host on that network can use your key without authentication. Start-up, `startup.log` and `aproxy doctor` warn about this but do not block it — **do not do it** unless the network is fully trusted.
-- **Plain-text key on disk**: `api_key` lives in plain text in `config.toml`. Restrict the file's permissions (Linux/macOS: `chmod 600`; Windows: current user only) and keep it out of version control and cloud-synced folders. The `--api-key` command-line flag can be enumerated by other local processes; use the config file for anything long-lived.
+- **Plain-text key on disk**: `api_key` lives in plain text in `config.toml`. A config file outside the home directory is not covered by the protection above; restrict the file's permissions (Linux/macOS: `chmod 600`; Windows: current user only) and keep it out of version control and cloud-synced folders. The `--api-key` command-line flag can be enumerated by other local processes; use the config file for anything long-lived.
 - **Format programs are configuration-driven command execution**: a `[[format]]` entry launches `command` with the instance's privileges (no shell, argv execution) and hands it requests and responses at the stages it declares (headers may carry credentials; it chooses how much of the body it receives). It can also offer control methods that desktop extensions call. Only configure programs you trust, and do not let others modify your `config.toml`. When in doubt, have your agent review the program first with the `aproxy-audit-format` skill that ships with aProxy.
 - **Desktop themes and extensions are not sandboxed**: an enabled extension is JavaScript running in the main window and can do anything the window can: read request history and bodies (redacted), start and stop instances, change configs (including keys and a format's `command`, which amounts to making an instance run any program), install updates, and use the network. A theme's stylesheet can load network resources and can hide or reword what the window shows. aProxy does not restrict this; before installing, it explains each risk that applies (closed source, a digest that does not match the GitHub release, a repository with few stars, nothing to check against) and asks the user to confirm each one. Install only packages you trust, and when in doubt review them first with the `aproxy-audit-extension` or `aproxy-audit-theme` skill.
 - **Installer verification**: the one-line install scripts check the SHA256 of what they download; that checksum comes from the same GitHub release as the binary, so it catches corruption in transit but is not an independent publisher-signature check.

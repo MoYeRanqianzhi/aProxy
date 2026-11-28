@@ -1,5 +1,7 @@
 //! 判定完整上游响应是否携带错误；内存实体与大实体的增量扫描分别遵循实例的边界。
 
+use std::collections::VecDeque;
+
 /// 内存驻留阈值：缓冲超过即溢写磁盘（disk_cache 开启时）。
 /// 1 MiB：覆盖真实 agent 流量（SSE/JSON 错误体 KB 级）使其零磁盘开销，
 /// 大请求体/大响应才进入磁盘路径。
@@ -114,8 +116,7 @@ pub fn stream_content_type(ct: &str) -> bool {
     lower.contains("text/event-stream") || lower.contains("application/x-ndjson")
 }
 
-/// 扫描器可依赖的行长度上界：错误 JSON 行远小于此；超出即截断该行（丢一行
-/// 启发式判定正确性，换内存上界恒定）。
+/// 尚未找到行尾时最多保留的字节数。错误 JSON 行远小于此；完整行不受这个缓存上界限制。
 const SCAN_MAX_LINE: usize = 512 * 1024;
 
 /// 磁盘模式的流式错误扫描器：增量逐行判定（SSE data 行 / NDJSON 行），
@@ -123,8 +124,8 @@ const SCAN_MAX_LINE: usize = 512 * 1024;
 /// 流尾 error 事件必须命中、CRLF/前导空格变体兼容）。
 #[derive(Default)]
 pub struct StreamErrorScanner {
-    /// 跨 chunk 的未成行尾巴
-    tail: Vec<u8>,
+    /// 跨块保留未成行的后缀；环形缓冲让超长行每多到一字节也不必搬移已有的后缀。
+    tail: VecDeque<u8>,
     /// 已判定出现 data 行（SSE 模式锁定）
     saw_data_line: bool,
     /// SSE 模式下的判定结果（锁定后不再改写）
@@ -139,7 +140,7 @@ impl StreamErrorScanner {
     /// 按每次上游尝试独立累计行，不保留前一次结果。
     pub fn new() -> Self {
         Self {
-            tail: Vec::new(),
+            tail: VecDeque::new(),
             saw_data_line: false,
             sse_has_error: false,
             decided: false,
@@ -152,24 +153,37 @@ impl StreamErrorScanner {
         if self.decided {
             return;
         }
-        self.tail.extend_from_slice(chunk);
-        // 行缓存上界：超出即剪裁（丢判定正确性，换内存上界恒定）
-        if self.tail.len() > SCAN_MAX_LINE {
-            let drain = self.tail.len() - SCAN_MAX_LINE;
-            self.tail.drain(..drain);
-        }
-        while let Some(pos) = self.tail.iter().position(|&b| b == b'\n') {
-            let mut line: Vec<u8> = self.tail.drain(..=pos).collect();
-            line.pop(); // 去 \n
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            self.scan_line(&line);
+        let mut start = 0;
+        let mut tail = std::mem::take(&mut self.tail);
+        for end in memchr::memchr_iter(b'\n', chunk) {
+            let part = &chunk[start..end];
+            let line = if tail.is_empty() {
+                part
+            } else {
+                // 仅跨块的首行需要拼接，包括 CR 与 LF 分在两块的情况。
+                tail.extend(part);
+                tail.make_contiguous()
+            };
+            self.scan_line(line.strip_suffix(b"\r").unwrap_or(line));
             if self.decided {
-                self.tail.clear();
                 return;
             }
+            if !tail.is_empty() {
+                tail.clear();
+                // 拼成的完整行可能远超上界；不用为接下来的一小段残行保留那块分配。
+                if tail.capacity() > SCAN_MAX_LINE {
+                    tail = VecDeque::new();
+                }
+            }
+            start = end + 1;
         }
+
+        // 只裁剪最后一个换行符之后的残行。若新到的字节已占满窗口，旧尾巴可全部丢弃。
+        let rest = &chunk[start.max(chunk.len().saturating_sub(SCAN_MAX_LINE))..];
+        let discard = tail.len().saturating_sub(SCAN_MAX_LINE - rest.len());
+        tail.drain(..discard);
+        tail.extend(rest);
+        self.tail = tail;
     }
 
     fn scan_line(&mut self, line: &[u8]) {
@@ -206,8 +220,8 @@ impl StreamErrorScanner {
         // 未成行的最后一行按行扫描（is_stream_error_body 的 lines() 同样
         // 会产出无换行结尾的最后一行）
         if !self.tail.is_empty() {
-            let tail = std::mem::take(&mut self.tail);
-            self.scan_line(&tail);
+            let mut tail = std::mem::take(&mut self.tail);
+            self.scan_line(tail.make_contiguous());
         }
         if self.saw_data_line {
             self.sse_has_error
@@ -315,6 +329,137 @@ mod tests {
             }
             object.push('}');
             check(object.as_bytes());
+        }
+    }
+
+    // 对照组先把块追加到缓冲，再裁剪、逐行 drain；判定不使用字节筛选。
+    fn draining_scan<'a>(chunks: impl Iterator<Item = &'a [u8]>) -> bool {
+        let (mut saw_data, mut sse_error, mut ndjson_error) = (false, false, false);
+        let mut scan = |line: &[u8]| {
+            let Ok(text) = std::str::from_utf8(line) else {
+                return false;
+            };
+            let t = text.trim();
+            if let Some(data) = t.strip_prefix("data:").or_else(|| t.strip_prefix("data :")) {
+                saw_data = true;
+                let data = data.trim();
+                sse_error =
+                    !data.is_empty() && data != "[DONE]" && parsed_error_body(data.as_bytes());
+            } else if t.starts_with('{') {
+                ndjson_error = parsed_error_body(t.as_bytes());
+            }
+            sse_error || ndjson_error
+        };
+        let mut tail = Vec::new();
+        for chunk in chunks {
+            tail.extend_from_slice(chunk);
+            if tail.len() > SCAN_MAX_LINE {
+                tail.drain(..tail.len() - SCAN_MAX_LINE);
+            }
+            while let Some(end) = tail.iter().position(|&b| b == b'\n') {
+                let mut line: Vec<_> = tail.drain(..=end).collect();
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                if scan(&line) {
+                    return true;
+                }
+            }
+        }
+        if !tail.is_empty() {
+            scan(&tail);
+        }
+        if saw_data { sse_error } else { ndjson_error }
+    }
+
+    #[test]
+    fn scanner_agrees_across_chunk_boundaries() {
+        let ok = b"data: {\"type\":\"delta\",\"text\":\"ok\"}\n\n".as_slice();
+        let err = b"data: {\"type\":\"error\"}\n\n".as_slice();
+        let mut state = 0x39ed02;
+        for body in [
+            [err, ok, ok].concat(),
+            [ok, err, ok].concat(),
+            [ok, ok, err].concat(),
+            b"\r\n: comment\r\n  data : {\"\\u0065rror\":1}\r\n".to_vec(),
+            b"data:\n\ndata: [DONE]\r\n:event\n".to_vec(),
+            b"".to_vec(),
+            b"\n{}\n# comment\n{\"error\":null}\n".to_vec(),
+            b"\n# comment\r\n{}\r\n{\"type\":\"\\u0065rror\"}".to_vec(),
+            b"data: {\"error\": [1]}".to_vec(),
+            b"data: {\"message\":\"\xe4\xbd\xa0\"}".to_vec(),
+            b"data: \xff\n{\"error\":1}\n".to_vec(),
+            b"\xff\r\ndata:{\"error\":1}\n".to_vec(),
+            b"data: {}\n{\"error\":1}".to_vec(),
+            b"{\"error\":1}\ndata: {}\n".to_vec(),
+            [ok.repeat(120), err.to_vec()].concat(),
+        ] {
+            let expected = draining_scan(std::iter::once(body.as_slice()));
+            let resident = is_stream_error_body(&body);
+            let check = |cuts: &[usize]| {
+                let starts = std::iter::once(0).chain(cuts.iter().copied());
+                let ends = cuts.iter().copied().chain(std::iter::once(body.len()));
+                let chunks = starts.zip(ends).map(|(start, end)| &body[start..end]);
+                let mut scanner = StreamErrorScanner::new();
+                for chunk in chunks.clone() {
+                    scanner.feed(chunk);
+                }
+                let actual = scanner.finish();
+                assert_eq!(actual, draining_scan(chunks), "cuts {cuts:?}");
+                if expected == resident {
+                    assert_eq!(actual, resident, "cuts {cuts:?}");
+                }
+            };
+            if body.len() < 2048 {
+                for cut in 0..=body.len() {
+                    check(&[cut]);
+                }
+            }
+            // 允许切在同一点（空块）以及多字节字符、转义或 CRLF 的中间。
+            for _ in 0..300 {
+                let mut cuts: Vec<_> = (0..2 + sample(&mut state, 18))
+                    .map(|_| sample(&mut state, body.len() + 1))
+                    .collect();
+                cuts.sort_unstable();
+                check(&cuts);
+            }
+        }
+    }
+
+    #[test]
+    fn large_feed_keeps_complete_lines() {
+        let error = b"\ndata: {\"error\":1}\n";
+        for mut body in [
+            b"data: {}\n".repeat(SCAN_MAX_LINE / 9 + 1),
+            vec![b'x'; SCAN_MAX_LINE + 1],
+        ] {
+            body.extend_from_slice(error);
+            // 错误行既不在块开头，也不在最后的缓存窗口内；整块裁剪会漏判。
+            body.resize(body.len() + SCAN_MAX_LINE, b'x');
+            let mut scanner = StreamErrorScanner::new();
+            scanner.feed(&body);
+            assert!(scanner.finish());
+        }
+    }
+
+    #[test]
+    fn unterminated_line_retains_only_its_suffix() {
+        // 遗弃的前缀会使整行不是 JSON；环绕后的后缀本身则是合法的 SSE 错误行。
+        for terminated in [false, true] {
+            let mut scanner = StreamErrorScanner::new();
+            scanner.feed(&vec![b'x'; SCAN_MAX_LINE + 71]);
+            assert_eq!(scanner.tail.len(), SCAN_MAX_LINE);
+            let end = b"data: {\"error\":true}";
+            scanner.feed(&vec![b' '; SCAN_MAX_LINE - end.len()]);
+            for b in end {
+                scanner.feed(std::slice::from_ref(b));
+            }
+            assert_eq!(scanner.tail.len(), SCAN_MAX_LINE);
+            if terminated {
+                scanner.feed(b"\r\n");
+            }
+            assert!(scanner.finish());
         }
     }
 }

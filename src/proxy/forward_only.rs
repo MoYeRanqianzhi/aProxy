@@ -184,7 +184,7 @@ enum PassiveCheck {
     Lines(StreamErrorScanner),
 }
 impl PassiveCheck {
-    /// 只有跨过界限时才付逐行扫描的成本；分小段喂前缀，不把一大块误当成一条过长的行。
+    /// 只有跨过界限时才付逐行扫描的成本；先交出缓存的前缀，再从当前块接着扫。
     fn feed(&mut self, bytes: &[u8]) {
         if let Self::Resident(prefix) = self {
             if bytes.len() <= RESIDENT_LIMIT - prefix.len() {
@@ -192,15 +192,11 @@ impl PassiveCheck {
                 return;
             }
             let mut lines = StreamErrorScanner::new();
-            for piece in prefix.chunks(16 * 1024) {
-                lines.feed(piece);
-            }
+            lines.feed(prefix);
             *self = Self::Lines(lines);
         }
         if let Self::Lines(lines) = self {
-            for piece in bytes.chunks(16 * 1024) {
-                lines.feed(piece);
-            }
+            lines.feed(bytes);
         }
     }
     /// 只有 HTTP 实体完整时才判伪成功；中断可能截在合法 JSON 当中，不能被误报为错误体。

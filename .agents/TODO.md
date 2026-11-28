@@ -214,7 +214,9 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   `proxy::tests::spool_chunk_dropped_mid_disk_transition_leaves_no_file`（run 45710095430，`src/proxy/tests.rs:510`
   「迁移不应在文件出现前就一次完成」：逐次 poll 时迁移在文件出现前就完成了，测试前提依赖阻塞池的时序）；
   `proxy_integration` 的 `restore_recovers_crashed_daemon_and_is_idempotent`（run 45716490850，`:5641`「restore 应成功」，
-  restore 退出 1，断言没打印 stdout 与 stderr，原因查不了，先让它打印）
+  restore 退出 1，断言没打印 stdout 与 stderr，原因查不了，先让它打印）。2026-11-28 本机 Windows 全量跑又见一条，单跑即过：
+  `install_cli` 的 `continuation_fails_before_broadcast_with_foreground_instances`（`tests/install_cli.rs:302`），停掉前台
+  实例之后的本地安装在暂存复制时撞上共享冲突（Windows 错误 32，`src/install/staging.rs:259`），像是被停的进程还没放开文件
 - [ ] **看门狗二期（可选）**：挂死不杀进程原地救（scoped runtime 注入 spike）、实例数极大时线程池死亡等待（unix 死亡等待已实装为轮询，见 unix-testing.md）
 
 ## macOS 支持（必须完成——用户 2026-09-12 定调）

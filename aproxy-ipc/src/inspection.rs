@@ -15,6 +15,13 @@ pub const RESIDENT_LIMIT: usize = 1024 * 1024;
 /// - body 必须能解析为 JSON 对象
 /// - 且包含 `error` 键（值为对象或字符串）或 `type == "error"`，则判定为错误内容
 pub fn is_error_body(body: &[u8]) -> bool {
+    // 命中要求键名或字符串解码后含 error；JSON 中这五个字母只能是原文或 \u 转义。
+    // 这里只排除不可能的体，重复键、转义与不合法的输入仍由 JSON 解析器裁决。
+    if memchr::memmem::find(body, b"error").is_none()
+        && memchr::memmem::find(body, br"\u").is_none()
+    {
+        return false;
+    }
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
         return false;
     };
@@ -206,6 +213,108 @@ impl StreamErrorScanner {
             self.sse_has_error
         } else {
             self.ndjson_error
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 对照组不经字节筛选，总是构建完整的 JSON 值。
+    fn parsed_error_body(body: &[u8]) -> bool {
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return false;
+        };
+        let Some(obj) = v.as_object() else {
+            return false;
+        };
+        if obj.contains_key("error") {
+            // error: null 视为未携带有效错误——某些上游成功体会带 error:null 字段，
+            // 若判为错误会导致 200 成功响应被无限重试
+            if !obj.get("error").map(|v| v.is_null()).unwrap_or(false) {
+                return true;
+            }
+        }
+        obj.get("type").and_then(|t| t.as_str()) == Some("error")
+    }
+
+    // 固定种子让生成的输入与切分点可以复现，不依赖系统的随机源。
+    fn sample(state: &mut u32, limit: usize) -> usize {
+        *state ^= *state << 13;
+        *state ^= *state >> 17;
+        *state ^= *state << 5;
+        *state as usize % limit
+    }
+
+    #[test]
+    fn byte_filter_agrees_with_full_parse() {
+        let check = |body: &[u8]| {
+            assert_eq!(is_error_body(body), parsed_error_body(body), "{body:?}");
+        };
+        for body in [
+            br#"{"error": "overloaded"}"#.as_slice(),
+            br#"{"error": {"message": "x"}}"#,
+            br#"{"type": "error", "message": "x"}"#,
+            br#"{"content": "hello"}"#,
+            br#"{"error": []}"#,
+            br#"{"error": null}"#,
+            br#"{"error": null, "ok": true}"#,
+            br#"{"type": "Error"}"#,
+            br#"{"data":{"error":"x"}}"#,
+            br#"{"\u0065rror":1}"#,
+            br#"{"type":"\u0065rror"}"#,
+            br#"{"err\u006fr":null}"#,
+            br#"{"error":1,"error":null}"#,
+            br#"{"type":"error","type":"x"}"#,
+            b"not json",
+            b"error outside JSON",
+            b"[]",
+            br#"[{"error":1}]"#,
+            b"null",
+            b"42",
+            br#""hello""#,
+            br#"{"error":1"#,
+            b"\xff",
+            b"{\"error\":\"\xff\"}",
+        ] {
+            check(body);
+        }
+
+        // 手工拼 JSON 源码：序列化一个 map 会先折叠重复键，也保不住指定字母的转义。
+        let keys = [
+            "error",
+            r"\u0065rror",
+            r"err\u006fr",
+            "type",
+            r"typ\u0065",
+            "data",
+            "other",
+        ];
+        let values = [
+            "null",
+            "false",
+            "1",
+            "[]",
+            r#""x""#,
+            r#""error""#,
+            r#""\u0065rror""#,
+            r#""\\u0065rror""#,
+            r#"{"error":"x"}"#,
+        ];
+        let mut state = 0xa30d51;
+        for _ in 0..2048 {
+            let mut object = String::from("{");
+            for i in 0..sample(&mut state, 7) {
+                if i != 0 {
+                    object.push(',');
+                }
+                let key = keys[sample(&mut state, keys.len())];
+                let value = values[sample(&mut state, values.len())];
+                object.push_str(&format!(r#""{key}":{value}"#));
+            }
+            object.push('}');
+            check(object.as_bytes());
         }
     }
 }

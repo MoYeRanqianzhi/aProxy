@@ -166,6 +166,9 @@
     （64、16、0）对内存的影响、挂 format 的吞吐（新场景 S9，含 B10d 的门槛）、带符号构建的 CPU 剖析。用 p01 交出的测量脚本，对 beta.1 的构建跑同一套场景，同 p01 的基线逐项对比；
     format 链（官方 aproxy-format 的各个角色）是新增的场景。见 [perf-0.2.0](perf-0.2.0.md)。
 14. **t12：性能优化**。依据 p01、p02 的发现，一项一项做，每项先有会失败的测量、后有改动、再有重测。见 [perf-0.2.0](perf-0.2.0.md)。
+    - t28（2026-11-28 派出，任务书 `.agents/codex.local/t28-scanner-cost.md`）：响应错误检查的扫描器改成线性、事件行先排除
+      不可能是错误的再解析 JSON。起因是 p02 测到大请求的 forward 每请求 CPU 是 alpha.3 的十倍。先在本机测改前改后，
+      服务器上的复测等 p02 做完再派。
 15. **t13：W6 修复**。restart 的偶发失败（先让失败的断言打印 stdout 与 stderr，再查）、`install --from` 的降级检查、
     0.1.x 的 settings.json 迁移、0.1.0 skill 支线的防护（skills 资产换名、npm 包内路径换、crate 不带 `.claude/skills/`），
     以及 TODO 里「已知缺口」的各条。
